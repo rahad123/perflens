@@ -1,0 +1,14 @@
+{
+  "name": "perflens",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.12.4",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test:smoke": "node apps/demo-api/test/smoke.mjs",
+    "postinstall": "pnpm --filter @perflens/cli build",
+    "perflens": "node packages/cli/bin/perflens.cjs",
+    "test": "pnpm --filter @perflens/cli test"
+  }
+}

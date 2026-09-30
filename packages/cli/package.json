@@ -1,0 +1,28 @@
+{
+  "name": "@perflens/cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend Performance Audit CLI",
+  "bin": {
+    "perflens": "bin/perflens.cjs"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm build && node --test test/*.test.cjs"
+  },
+  "dependencies": {
+    "commander": "15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.2"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "project": {
+    "name": "demo-api"
+  },
+  "target": {
+    "baseUrl": "http://localhost:3000"
+  },
+  "observability": {
+    "serviceName": "perflens-demo-api"
+  }
+}
