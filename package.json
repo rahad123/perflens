@@ -7,8 +7,8 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test:smoke": "node apps/demo-api/test/smoke.mjs",
-    "postinstall": "pnpm --filter @perflens/cli build",
+    "postinstall": "pnpm -r build",
     "perflens": "node packages/cli/bin/perflens.cjs",
-    "test": "pnpm --filter @perflens/cli test"
+    "test": "pnpm -r test"
   }
 }

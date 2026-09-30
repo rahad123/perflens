@@ -20,6 +20,7 @@
     "test": "pnpm build && node --test test/*.test.cjs"
   },
   "dependencies": {
+    "@perflens/analysis-engine": "workspace:*",
     "commander": "15.0.0"
   },
   "devDependencies": {
