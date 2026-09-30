@@ -9,4 +9,5 @@ load-tests/results/
 
 # PerfLens generated working artifacts (configuration stays tracked)
 .perflens/
+perflens.phase3.local.json
 .pnpm-store/

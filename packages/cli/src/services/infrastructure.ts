@@ -73,7 +73,7 @@ export class Infrastructure {
         const owned = containers.some(c => c.Service === service && c.State === 'running' && c.Publishers?.some(p => p.PublishedPort === port && p.URL === host));
         if (owned) checks.push(`Port ${port} used by this PerfLens ${LABELS[service]} container`);
         else if (await this.portAvailable(port, host)) checks.push(`Port ${port} available`);
-        else throw new CliError(`Port ${port} is occupied by another process.`, 'Stop that process or change GRAFANA_PORT/PROMETHEUS_PORT in the infrastructure .env.');
+        else throw new CliError(`Port ${port} is occupied by another process.`, 'Stop that process or change GRAFANA_PORT, PROMETHEUS_PORT, or TEMPO_PORT in the infrastructure .env.');
       }
     }
     return checks;

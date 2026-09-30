@@ -39,8 +39,8 @@ test('executable help/version work outside checkout and advertise only implement
   const dir = await fixture(t);
   const help = cli(['--help'], dir, { PATH: '' });
   assert.equal(help.status, 0); assert.match(help.stdout, /Backend Performance Audit CLI/);
-  for (const name of ['init', 'doctor', 'infra', 'audit', 'runs']) assert.match(help.stdout, new RegExp(name));
-  assert.doesNotMatch(help.stdout, /\n\s+(analyze|report)\b/);
+  for (const name of ['init', 'doctor', 'infra', 'audit', 'runs', 'analyze']) assert.match(help.stdout, new RegExp(name));
+  assert.doesNotMatch(help.stdout, /\n\s+report\b/);
   const result = cli(['--version'], dir, { PATH: '' });
   assert.equal(result.status, 0); assert.equal(result.stdout.trim(), version);
 });
