@@ -53,6 +53,8 @@ services:
     volumes:
       - ./infra/tempo/tempo.yaml:/etc/tempo.yaml:ro
       - tempo-data:/var/tempo
+    ports:
+      - "127.0.0.1:${TEMPO_PORT:-3200}:3200"
   prometheus:
     image: ${PROMETHEUS_IMAGE}
     command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=7d]
