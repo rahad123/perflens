@@ -17,7 +17,7 @@ Run from the repository root:
 cp .env.example .env
 docker compose up --build -d
 docker compose ps
-curl --fail http://localhost:3000/health
+curl --fail http://localhost:3002/health
 ```
 
 Wait for `demo-api` to become healthy. Its first startup applies a migration and seeds 2,000 customers, 500 products, 20,000 orders, and 80,000 order items. Subsequent starts preserve data and skip seeding when customers exist. Initial image downloads can take several minutes.
@@ -35,8 +35,8 @@ Stop with `docker compose down`; named volumes persist. **Destructive reset:** `
 
 | Service | Default URL | Purpose |
 | --- | --- | --- |
-| Demo API | http://localhost:3000 | API and `/health` |
-| Metrics | http://localhost:3000/metrics | Prometheus text exposition |
+| Demo API | http://localhost:3002 | API and `/health` |
+| Metrics | http://localhost:3002/metrics | Prometheus text exposition |
 | Grafana | http://localhost:3001 | Anonymous local Explore access; no login |
 | Prometheus | http://localhost:9090 | Queries and target status |
 
@@ -59,9 +59,9 @@ Ports can be changed in `.env`; adjust host-side commands accordingly. PostgreSQ
 All deliberately inefficient application code is in the performance controller or its private dependency fixture. The fixture binds only to `127.0.0.1:4001` inside the API container and has no public route or Compose service. Its delay is a configured simulation, not a benchmark result.
 
 ```sh
-curl --fail http://localhost:3000/orders
-curl --fail http://localhost:3000/orders/1
-curl --fail -X POST http://localhost:3000/orders \
+curl --fail http://localhost:3002/orders
+curl --fail http://localhost:3002/orders/1
+curl --fail -X POST http://localhost:3002/orders \
   -H 'Content-Type: application/json' \
   -d '{"customerId":1,"items":[{"productId":1,"quantity":2},{"productId":2,"quantity":1}]}'
 ```
@@ -73,10 +73,10 @@ Prices use integer cents. Unknown customers/products return 400. Payloads reject
 1. Generate requests:
 
    ```sh
-   curl --fail http://localhost:3000/orders/1
-   curl --fail http://localhost:3000/performance/slow-query
-   curl --fail http://localhost:3000/performance/n-plus-one
-   curl --fail http://localhost:3000/performance/external-call
+   curl --fail http://localhost:3002/orders/1
+   curl --fail http://localhost:3002/performance/slow-query
+   curl --fail http://localhost:3002/performance/n-plus-one
+   curl --fail http://localhost:3002/performance/external-call
    ```
 
 2. Open http://localhost:3001/explore and select **Tempo**.
@@ -120,7 +120,7 @@ A 5xx series does not exist until the first server error; an empty error-ratio r
 With k6 installed:
 
 ```sh
-k6 run -e BASE_URL=http://localhost:3000 load-tests/baseline.js
+k6 run -e BASE_URL=http://localhost:3002 load-tests/baseline.js
 ```
 
 Or with Docker, using the existing Compose network (works across host platforms):
