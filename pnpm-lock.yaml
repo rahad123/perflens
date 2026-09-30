@@ -86,9 +86,21 @@ importers:
       '@perflens/analysis-engine':
         specifier: workspace:*
         version: link:../analysis-engine
+      '@perflens/reporting':
+        specifier: workspace:*
+        version: link:../reporting
       commander:
         specifier: 15.0.0
         version: 15.0.0
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.19.0
+      typescript:
+        specifier: ~5.9.2
+        version: 5.9.3
+
+  packages/reporting:
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
