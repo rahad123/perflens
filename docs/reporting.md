@@ -1,0 +1,15 @@
+# PerfLens reporting
+
+`perflens report [run-id]` converts an already completed audit and its persisted Phase 3 analysis into a normalized JSON model and client-readable Markdown/HTML files. With no run ID, it selects the newest completed run that has valid analysis, findings, and evidence artifacts. It never runs an audit, reanalyzes a run, queries Tempo, or collects new metrics. If analysis is missing, run `perflens analyze <run-id>` first.
+
+By default, reports are written to `.perflens/runs/<run-id>/report/` as `report.json`, `report.md`, and `report.html`. `report.json` is the intermediate model consumed by both renderers. Use `--format markdown` or `--format html` to select a renderer; the JSON model is still saved. PDF is not supported.
+
+The model contains run and target metadata, configured workload profiles, observed request measurements, Phase 3 findings and their existing evidence, telemetry snapshot coverage/truncation, and limitations. It preserves each finding's severity, confidence, rule ID, evidence and metrics. Findings are sorted by P0/P1/P2 and stable rule/category/title keys. The report layer does not have detection rules and never infers recommendations or root causes. A valid run with no findings produces a report stating that no evidence-backed finding met the configured thresholds; it does not claim the system has no performance problems.
+
+The Markdown renderer escapes table/control syntax in untrusted text. The self-contained HTML renderer uses semantic HTML and inline CSS, with no JavaScript, frontend framework, or CDN requirement; it is responsive for desktop reading and has print styles. Both renderers consume only the normalized model.
+
+Run endpoints are reduced to method and sanitized path; the target URL is reduced to scheme and host. Sensitive artifact fields (authorization, cookies, credentials, secrets, tokens, and request bodies) are excluded, and common inline credentials, bearer values, query strings, and SQL literals are redacted before output. Report files are written with restricted local permissions. Report generation does not modify Phase 2 results or Phase 3 analysis artifacts.
+
+The report records the unsupported evidence and limitations from Phase 3, including unavailable telemetry/resource measurements where present. It also makes clear that only configured test targets and the executed profiles were measured. It does not substitute local synthetic load for production traffic or present configured VUs as observed throughput.
+
+Rebuilding the model with the same run artifacts yields the same finding/profile ordering and report body, except for the intentionally variable `generatedAt` field. HTML and Markdown output are self-contained snapshots of the persisted run; after Phase 3 has saved its evidence snapshot, report generation does not depend on live Tempo retention.
