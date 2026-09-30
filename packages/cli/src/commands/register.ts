@@ -1,5 +1,6 @@
 import { dirname } from 'node:path';
 import { analyze } from '../analysis/service';
+import { report } from '../report/service';
 import { audit } from '../audit/service';
 import { listRuns } from '../audit/storage';
 import { loadProject } from '../config/project';
@@ -34,6 +35,11 @@ export function registerCommands(program: Command): void {
     .option('--offline', 'Use a previously saved telemetry evidence snapshot; do not query Tempo')
     .action(async (runId: string | undefined, options: { offline?: boolean }) => {
       await analyze({ ...program.opts<Options>(), ...options }, runId);
+    });
+  program.command('report [run-id]').description('Generate Markdown and HTML from a completed run and its persisted Phase 3 analysis')
+    .option('--format <format>', 'Output format: all, markdown, or html', 'all')
+    .action(async (runId: string | undefined, options: { format?: string }) => {
+      await report({ ...program.opts<Options>(), ...options }, runId);
     });
   const infra = program.command('infra').description('Control local audit infrastructure; target application remains separate');
   async function service(): Promise<Infrastructure> {
