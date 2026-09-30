@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@perflens/analysis-engine": "workspace:*",
+    "@perflens/reporting": "workspace:*",
     "commander": "15.0.0"
   },
   "devDependencies": {

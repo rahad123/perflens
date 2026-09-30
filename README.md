@@ -16,14 +16,14 @@ The audit command records what happened. The analysis command looks for specific
 
 ## Current capabilities
 
-- Local CLI commands: `doctor`, `infra`, `audit`, `runs`, and `analyze`.
+- Local CLI commands: `doctor`, `infra`, `audit`, `runs`, `analyze`, and `report`.
 - Existing Docker-based OpenTelemetry Collector, Tempo, Prometheus, and Grafana stack, controlled by the CLI.
 - k6-based bounded, concurrent profiles and immutable run directories.
 - Run/profile correlation headers for targets that capture the documented OpenTelemetry attributes.
-- Deterministic analysis of completed results and sanitized, correlated traces.
+- Deterministic analysis of completed results and sanitized, correlated traces; Markdown and HTML audit reports from persisted findings.
 - Intentional slow-query, repeated-query, and external-call examples in the separate demo API.
 
-Phase 3 analysis currently supports measured latency, error-rate, and throughput changes across comparable profiles, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. Profile comparison uses VUs only for the supported constant-VU model when endpoint, pacing, timeout, and test semantics match; otherwise it skips the comparison. Repeated-query detection is separate from impact severity, and dependency contribution is aggregated per request. It does not recommend code changes or generate reports. See [analysis methodology](docs/analysis-methodology.md) for thresholds and limits.
+Phase 3 analysis currently supports measured latency, error-rate, and throughput changes across comparable profiles, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. Profile comparison uses VUs only for the supported constant-VU model when endpoint, pacing, timeout, and test semantics match; otherwise it skips the comparison. Repeated-query detection is separate from impact severity, and dependency contribution is aggregated per request. Phase 4 formats saved findings as Markdown and HTML; it performs no new diagnosis or recommendations. See [analysis methodology](docs/analysis-methodology.md) and [reporting](docs/reporting.md).
 
 ## Intended workflow
 
@@ -61,10 +61,15 @@ pnpm perflens runs
 pnpm perflens analyze
 pnpm perflens analyze <run-id>
 pnpm perflens analyze <run-id> --offline
+pnpm perflens report
+pnpm perflens report <run-id>
+pnpm perflens report <run-id> --format markdown
 pnpm perflens infra down
 ```
 
 `analyze` selects the latest completed run by default. The first analysis queries local Tempo for the run/profile windows and writes a sanitized `analysis/evidence.json` snapshot. Later analyses reuse that snapshot; `--offline` explicitly requires it and never contacts Tempo. Analysis never starts a load test.
+
+`report` selects the latest completed run with valid Phase 3 analysis by default. It never starts an audit, reruns analysis, or queries Tempo. The default `all` format writes `report.json`, `report.md`, and `report.html` under `.perflens/runs/<run-id>/report/`. Use `--format markdown` or `--format html` to select one rendered format; the normalized JSON model is always saved. Run `perflens analyze <run-id>` first when analysis is missing.
 
 ## Quick start
 
@@ -164,6 +169,7 @@ PerfLens currently runs its observability stack locally and does not export tele
 apps/demo-api/              NestJS test target and intentional bottlenecks
 packages/cli/                Executable PerfLens CLI and orchestration
 packages/analysis-engine/    Framework-independent deterministic rules
+packages/reporting/          Framework-independent JSON, Markdown, and HTML reports
 infra/                       Existing local telemetry/metrics configuration
 load-tests/                  Original Phase 1 k6 smoke test
 docs/                        Architecture, methodology, verification records
@@ -174,9 +180,10 @@ docker-compose.yml            Local target and observability stack
 
 - **Phase 1 — Observe:** local telemetry infrastructure, demo target, and CLI control.
 - **Phase 2 — Measure:** bounded concurrent audits and stored results.
-- **Phase 3 — Analyze:** deterministic findings from measured load and correlated traces (current phase).
-- **Phase 4 — Report:** reporting and richer recommendations are future work.
+- **Phase 3 — Analyze:** deterministic findings from measured load and correlated traces.
+- **Phase 4 — Report:** client-readable Markdown and HTML from saved findings (current phase).
+- **Phase 5 — Remediation:** evidence-backed recommendations remain future work.
 
-There is no automatic remediation, PDF/HTML report, before/after comparison, SaaS, authentication, billing, hosted dashboard, production stress mode, or non-Node instrumentation. The trace query currently snapshots at most 500 traces per profile. Data beyond that cap is marked truncated and findings describe only the captured sample. Tempo retention is finite; analyze while traces remain available, then reruns can use the saved evidence offline.
+There is no automatic remediation, PDF report, before/after comparison, SaaS, authentication, billing, hosted dashboard, production stress mode, or non-Node instrumentation. The trace query currently snapshots at most 500 traces per profile. Data beyond that cap is marked truncated and findings describe only the captured sample. Tempo retention is finite; analyze while traces remain available, then reruns can use the saved evidence offline.
 
 See [architecture](docs/architecture/architecture.md), [analysis methodology](docs/analysis-methodology.md), [audit methodology](docs/audit-methodology.md), and [verification history](docs/architecture/verification.md).
