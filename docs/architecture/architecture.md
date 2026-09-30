@@ -1,8 +1,8 @@
 # PerfLens architecture
 
-PerfLens is an installable Backend Performance Audit CLI / Developer Toolkit. This repository is its early, checkout-based foundation. The demo backend is a test target, not the product. The CLI controls infrastructure, validates projects, and runs bounded local k6 audits. It does not automatically instrument arbitrary applications or diagnose root causes.
+PerfLens is an installable Backend Performance Audit CLI / Developer Toolkit. This repository is its early, checkout-based foundation. The demo backend is a test target, not the product. The CLI controls infrastructure, validates projects, runs bounded local k6 audits, and analyzes completed runs using deterministic, evidence-backed rules. It does not automatically instrument arbitrary applications or edit source.
 
-## Preserved Phase 1 and current Phase 2 — implemented
+## Preserved Phase 1, Phase 2, and Phase 3 — implemented
 
 ```mermaid
 flowchart TB
@@ -31,6 +31,10 @@ flowchart TB
     CLI --> Windows[Run/profile metadata and time windows]
     Results --> Runs[Unique local run directory]
     Windows --> Runs
+    CLI -->|loopback TraceQL query, scoped by run/profile| Tempo
+    Runs --> Analysis[Framework-independent analysis engine]
+    Analysis --> Evidence[Sanitized analysis evidence + findings]
+    Evidence --> Runs
 ```
 
 ### Boundaries
@@ -39,8 +43,8 @@ flowchart TB
 - `apps/demo-api` owns all NestJS/TypeORM code, migrations, synthetic seed data, and intentionally slow demo endpoints. The CLI does not import it, build it during `infra up`, or require it to probe infrastructure.
 - `infra` and `docker-compose.yml` remain the only infrastructure definitions. No generated or duplicated Compose template is introduced.
 - Metrics flow directly from the target to Prometheus. Tempo stores traces, not the application's Prometheus metrics.
-- `packages/cli/src/audit` owns bounded profile validation, preflight, child execution, k6 integration, normalization, and run storage. Command handlers orchestrate services and cancellation; no command-specific shell parser is introduced.
-- `.perflens/runs/<run-id>` holds current and historical evidence, raw data, normalized results, telemetry metadata, and logs. Top-level `results`/`logs` directories created by Phase 1 init remain reserved. No findings or reports are generated.
+- `packages/cli/src/audit` owns bounded profile validation, preflight, child execution, k6 integration, normalization, and run storage. `packages/cli/src/analysis` resolves runs, retrieves trace snapshots from Tempo, and renders results. `packages/analysis-engine` owns reusable evidence validation and deterministic rules; it has no CLI or NestJS dependency.
+- `.perflens/runs/<run-id>` holds current and historical evidence, raw data, normalized results, telemetry metadata, logs, and an `analysis` directory with sanitized evidence, structured findings, and analysis metadata. Top-level `results`/`logs` directories created by Phase 1 init remain reserved. No reports are generated.
 
 ### Configuration and resolution
 
@@ -52,7 +56,7 @@ Doctor, audit, and runs find project config in the current directory or its pare
 
 ### Lifecycle and readiness
 
-The infrastructure service allowlist is Collector, Tempo, Prometheus, and Grafana. `infra up` checks rendered Compose config and port conflicts, starts the allowlist using Compose health waits, then verifies service endpoints. The existing Prometheus image supplies `wget` for internal-network probes, avoiding a helper image or dependency on the demo.
+The infrastructure service allowlist is Collector, Tempo, Prometheus, and Grafana. `infra up` checks rendered Compose config and port conflicts, starts the allowlist using Compose health waits, then verifies service endpoints. The existing Prometheus image supplies `wget` for internal-network probes, avoiding a helper image or dependency on the demo. Tempo's query API is additionally published only on loopback so the independent CLI can collect correlated evidence.
 
 `infra status` reports absent/stopped/running-not-ready/ready states and fails for crashed/unhealthy services. `infra down` uses `compose stop` only for the allowlist and verifies stopped states. It retains containers, networks, volumes, PostgreSQL, and target services. This deliberate meaning of `down` is documented in command help.
 
@@ -60,7 +64,7 @@ Doctor is read-only. Ports owned by the matching service in the selected Compose
 
 ### Safety and network behavior
 
-Shell-free argument arrays, local Docker checks, loopback bindings, bounded process timeouts, and nonzero errors form the preserved safety baseline. Audit adds bounded VUs/duration/request timeouts/pacing, explicit high-load selection, no redirects, and a project lock. There are no automatic database operations, source changes, findings, or reports. Remote target URLs remain rejected without an override; CI cannot implicitly authorize remote load.
+Shell-free argument arrays, local Docker checks, loopback bindings, bounded process timeouts, and nonzero errors form the preserved safety baseline. Audit adds bounded VUs/duration/request timeouts/pacing, explicit high-load selection, no redirects, and a project lock. Analysis only reads completed run artifacts and local Tempo, stores allowlisted sanitized spans, and does not mutate application or database state. Reports are not implemented. Remote target URLs remain rejected without an override; CI cannot implicitly authorize remote load.
 
 Grafana and Tempo anonymous reporting is disabled. Grafana automatic preinstallation, plugin updates, update checks, and public-key downloads are disabled; required datasources are already bundled. Images and dependencies still require explicit registry downloads at installation/startup. These configuration guarantees are not a network firewall or a security review of third-party software.
 
@@ -72,11 +76,11 @@ The k6 script executes concurrent constant-VU GET requests with pacing and expli
 
 `RunStore` uses exclusive run-directory creation, atomic state writes, and finalization. Later commands never resume or overwrite a completed directory. This is application-level immutability, not OS protection against file owners. Raw evidence stays local; filesystem history needs no database.
 
-Incoming demo server spans capture allowlisted audit run/profile headers. Existing trace IDs, context propagation, pg instrumentation, and Prometheus collection remain unchanged. Metadata records exact TraceQL plus UTC windows/service identity for future queries. Metric correlation is temporal, with no high-cardinality run labels. No trace export, metrics snapshot, or root-cause analysis occurs.
+Incoming demo server spans capture allowlisted audit run/profile headers. Existing trace IDs, context propagation, pg instrumentation, and Prometheus collection remain unchanged. Analysis queries Tempo by service, run ID, profile, and profile UTC window, then stores only normalized span evidence needed by rules. PostgreSQL interval contribution uses span-window union to avoid overlap double counting. Prometheus metric snapshots and resource-saturation findings are unsupported because Phase 2 does not persist reliable per-run system metrics.
 
-The full contract, limits, and schemas are in [audit methodology](../audit-methodology.md).
+The full measurement contract is in [audit methodology](../audit-methodology.md); Phase 3 rules and thresholds are in [analysis methodology](../analysis-methodology.md).
 
-## Intended end-to-end workflow — future portions NOT IMPLEMENTED
+## Intended end-to-end workflow — reporting and richer integrations remain future work
 
 ```mermaid
 flowchart TB
@@ -85,11 +89,11 @@ flowchart TB
     Instrument --> Observe[Observability infrastructure]
     Observe --> Load[Local controlled k6 audits: implemented]
     Load --> Collect[Stored measurements and telemetry correlation: implemented]
-    Collect --> Analyze[Analysis engine: future]
-    Analyze --> Findings[P0 / P1 / P2 findings: future]
+    Collect --> Analyze[Analysis engine: implemented]
+    Analyze --> Findings[Evidence-backed P0 / P1 / P2 findings: implemented]
     Findings --> Report[Performance audit report: future]
 ```
 
-Future commands may include `analyze` and `report`; `audit` is implemented for local GET targets. Future analysis should consume validated run artifacts and correlated telemetry, rather than NestJS controllers or demo-specific SQL. Language-specific instrumentation belongs behind explicit, separately tested integrations when authorized. No Python/Java/Go/.NET adapter exists now.
+`analyze` consumes validated run artifacts and correlated telemetry, rather than NestJS controllers or demo-specific SQL. `audit` currently targets local GET endpoints. Language-specific instrumentation belongs behind explicit, separately tested integrations when authorized. No Python/Java/Go/.NET adapter exists now. Phase 4 reporting and richer recommendations are future work.
 
-The next phase can build an evidence-driven analysis contract on this run schema and explicitly handle missing/expired telemetry. Analysis, findings, and reporting are not hidden in audit execution. Phase 3 has not started.
+Analysis remains separate from audit execution; offline replay uses the saved evidence snapshot. Missing optional trace evidence is reported explicitly, and unsupported resource rules do not infer saturation from latency.

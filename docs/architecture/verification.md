@@ -526,3 +526,51 @@ The first stricter test run failed because its fake summary omitted k6 metric ty
 No linter or `actionlint` is installed; CI syntax was checked with Ruby's YAML parser. GitHub Actions itself was not run locally. The public PR page confirms it remains open with no reviews; GitHub's checks tab could not be fetched and the CLI has no credentials, so hosted check/required-check status remains unverified.
 
 After verification, all six Compose containers were stopped with exit code 0. The four named volumes remain; no database reset was performed. Generated `.perflens` run evidence and smoke-created orders remain local.
+
+## Phase 3 — evidence-based analysis verification — 2026-09-30
+
+Phase 3 analysis was added without changing the Phase 2 audit/k6/run-storage contract or the existing demo endpoints. `@perflens/analysis-engine` is framework- and CLI-independent. `perflens analyze [run-id]` selects the newest completed run by default, reads normalized profile results, and collects Tempo traces by service name, exact audit run ID, profile, and that profile's UTC window. The first analysis stores sanitized trace evidence; subsequent analysis, including `--offline`, replays that snapshot. Tempo's query API is exposed only at the loopback `TEMPO_PORT` (default `3200`) so the CLI can fetch traces without depending on the demo container.
+
+### Checks
+
+The following completed successfully after the final source changes:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm build
+pnpm typecheck
+pnpm test
+pnpm perflens --help
+pnpm perflens --version
+pnpm perflens doctor
+pnpm perflens infra up
+pnpm perflens infra status
+docker compose config --quiet
+```
+
+The frozen install postinstall built all three workspaces. Build/typecheck passed for the demo API, analysis engine, and CLI. **53 tests passed:** 16 analysis-engine tests and 37 CLI tests, including offline run-artifact integration, TraceQL scoping, Tempo span normalization, privacy sanitization, sample guards, false-positive cases, and all existing Phase 1/2 CLI and audit tests. No lint script is configured in these workspaces. No Docker dependency was added to the automated test suite.
+
+The full existing local stack started ready. The API `/health` returned `{"status":"ok","database":"up"}`. Grafana health returned HTTP 200 and listed provisioned `Prometheus` and `Tempo` datasources. Prometheus readiness returned HTTP 200 and `perflens_http_requests_total` returned four series. Tempo `/ready` returned HTTP 200. The demo target, PostgreSQL spans, collector, and run-correlated trace search were all exercised by the analyses below.
+
+### Actual local audits and findings
+
+All runs used the existing k6 2.3.0 adapter and the conservative configured `baseline` (1 VU, 10 seconds) and `normal` (3 VUs, 15 seconds) profiles against the local demo only. RPS and latency are observations from this workstation and are not benchmark claims.
+
+| Target | Run | Baseline requests / RPS / p50 / p95 / p99 | Normal requests / RPS / p50 / p95 / p99 | Observed analysis |
+| --- | --- | --- | --- | --- |
+| `GET /orders` | `pfl_20260930T103520872Z_e90e1db0-ccf6-44a5-aab1-aed55131dcab` | 20 / 2.00 / 3.35 / 5.27 / 7.02 ms | 90 / 5.99 / 5.82 / 14.52 / 20.60 ms | No finding; 110 correlated request traces, 222 PostgreSQL spans, no external HTTP spans. The measured p95 increase was below the configured absolute threshold. |
+| `GET /performance/n-plus-one` | `pfl_20260930T104003569Z_96168e94-4ce1-4678-af14-a86e2cb9547a` | 20 / 2.00 / 6.84 / 16.69 / 19.45 ms | 90 / 5.99 / 15.73 / 33.08 / 41.61 ms | One repeated-operation finding across baseline and normal, HIGH confidence. Tempo snapshot: 110 request traces and 4,622 PostgreSQL-related spans. 20/20 baseline and 90/90 normal traces had a median 21 query-shaped operations/request. |
+| `GET /performance/slow-query` | `pfl_20260930T104056317Z_eddf8d0a-cb5e-4677-8491-fea78c4f1386` | 19 / 1.83 / 526.51 / 616.17 / 645.61 ms | 87 / 5.64 / 528.46 / 553.43 / 579.32 ms | One recurring slow database-operation finding across baseline and normal, HIGH overall confidence (19 baseline traces provide MEDIUM support; 87 normal traces HIGH). PostgreSQL span median duration was 525.6 ms / 527.6 ms respectively; no repeated-query/N+1 finding. |
+| `GET /performance/external-call` | `pfl_20260930T104151112Z_66f1ccb2-8e6f-4d1e-a976-79a04217f2e0` | 14 / 1.32 / 754.44 / 756.24 / 756.32 ms | 60 / 3.96 / 755.94 / 763.42 / 763.92 ms | One external-dependency finding across baseline and normal, HIGH overall confidence. `127.0.0.1/dependency` median span duration 752.5 ms / 753.7 ms, occupying 99.9% of the request window. Baseline support is MEDIUM, normal support HIGH; zero PostgreSQL spans and no database finding. |
+
+Every audit reported zero request errors. The load rule did not report degradation for these runs: `/orders` p95 increased by 9.25 ms, and other p95 changes did not cross the material threshold. The N+1 result is described as a candidate, not a certain root cause. The slow-query endpoint was not classified as repeated-query behavior. External calls were not mislabeled as database activity. PostgreSQL pool/connection spans are excluded from the repeated-query denominator and external HTTP rule.
+
+All four saved snapshots were then re-analyzed offline with `--offline`; each produced the same finding content without a live Tempo request. Trace findings for the same target/rule/pattern are consolidated across profiles, retaining per-profile evidence and metrics rather than duplicating the finding. A no-ID `perflens analyze --offline` selected the newest completed run (`/performance/external-call`). Analysis artifacts are at each run's `analysis/evidence.json`, `analysis/findings.json`, and `analysis/analysis.json`. The evidence snapshot stores only normalized profile results and allowlisted sanitized span attributes; observed SQL shapes were derived from `db.query.text`, with literals and numeric values removed before persistence.
+
+### Phase 1 regression and shutdown
+
+The original `load-tests/baseline.js` ran unchanged with 5 VUs for 30 seconds against local `/orders`: **150 requests, 4.93 RPS, p50 6.14 ms, p95 59.96 ms, zero failed requests, and 300/300 checks passed**. The API health response confirmed PostgreSQL connectivity. Grafana datasources, Prometheus metric ingestion, Tempo readiness, HTTP root spans, and PostgreSQL child spans remained available during audit analysis.
+
+The four infrastructure services were stopped with `pnpm perflens infra down`, followed by `docker compose stop --timeout 30 demo-api postgres`. All six containers exited cleanly (exit code 0). The `postgres-data`, `tempo-data`, `prometheus-data`, and `grafana-data` volumes remain; no database reset or volume deletion occurred. Audit run artifacts remain local under ignored `.perflens/`. `perflens.phase3.local.json` was only an ignored acceptance config and is removed after verification.
+
+The analysis deliberately does not infer CPU, memory, connection-pool saturation, or missing indexes: Phase 2 does not persist reliable per-run resource snapshots. Trace collection is capped at 500 traces per profile and marks truncation. Phase 4 reports, recommendations, comparisons, and automatic changes remain unimplemented.
