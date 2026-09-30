@@ -225,7 +225,7 @@ function compareLoad(profiles: ProfileResult[], findings: Finding[]) {
     const ruleId = errorDegraded ? 'load.error-degradation' : latencyDegraded ? 'load.latency-degradation' : 'load.throughput-degradation';
     findings.push({
       id: findingId(ruleId, target, profilesUsed), ruleId, category: 'load',
-      title: ruleId === 'load.error-degradation' ? 'Error rate increases under higher configured concurrency' : ruleId === 'load.throughput-degradation' ? 'Observed throughput decrease under comparable workload' : 'Latency degradation under higher configured concurrency',
+      title: ruleId === 'load.error-degradation' ? 'Error rate increases under higher configured concurrency' : ruleId === 'load.throughput-degradation' ? 'Throughput decreased under higher configured concurrency' : 'Latency increased as configured concurrency increased',
       summary: latencyDegraded ? `p95 latency increased between comparable constant-VU ${previous.profile} and ${current.profile} profiles.` : errorDegraded ? 'The measured error rate increased between comparable constant-VU profiles with higher configured concurrency.' : 'Measured throughput decreased between comparable constant-VU profiles with higher configured concurrency; this observation does not establish saturation or root cause.',
       severity: severity({ p95: p95B, errorRate: errorDegraded ? errorsIncrease : 0 }), confidence: 'high', target, profiles: profilesUsed,
       evidence: [
@@ -268,6 +268,12 @@ export function analyzeEvidence(evidence: AnalysisEvidence, analyzedAt = new Dat
     const traces = profileTraces.filter(t => attr(t.root, 'http.route') === endpoint.path || endpoints.length === 1);
     if (traces.length < THRESHOLDS.minimumTraceSamples) continue;
     const databasePerTrace = traces.map(t => ({ ...t, db: t.spans.filter(db) }));
+    const databaseImpact = databasePerTrace.map(trace => {
+      const ratio = intervalUnionWithin(trace.db, trace.root);
+      return { trace, ratio, contributionMs: ratio * spanDuration(trace.root) };
+    });
+    const materialDatabaseImpact = databaseImpact.filter(item => item.ratio >= THRESHOLDS.dbDominanceRatio && item.contributionMs >= THRESHOLDS.minimumDbDominanceMs);
+    const materialDatabaseImpactRatio = materialDatabaseImpact.length / traces.length;
     const repeated = databasePerTrace.filter(t => {
       const operations = t.db.map(span => ({ span, key: operation(span) })).filter(item => item.key);
       if (operations.length < THRESHOLDS.repeatedDbOperationsPerTrace) return false;
@@ -278,18 +284,19 @@ export function analyzeEvidence(evidence: AnalysisEvidence, analyzedAt = new Dat
     const repeatedRatio = repeated.length / traces.length;
     if (repeated.length >= THRESHOLDS.minimumTraceSamples && repeatedRatio >= THRESHOLDS.consistencyRatio) {
       const queryCounts = repeated.map(t => t.db.filter(span => operation(span)).length);
-      const allDbRatio = databasePerTrace.map(t => intervalUnionWithin(t.db, t.root));
+      const allDbRatio = databaseImpact.map(item => item.ratio);
+      const medianDbContributionMs = median(databaseImpact.map(item => item.contributionMs));
       const representativeDb = median(allDbRatio);
       const target = endpoint;
       findings.push({
         id: findingId('database.repeated-operation', target, [profile]), ruleId: 'database.repeated-operation', category: 'database',
         title: 'Repeated database query pattern', summary: 'Similar PostgreSQL operations repeat within individual requests across multiple sampled traces. This is a likely N+1 pattern candidate; latency impact is assessed separately from repetition.',
-        severity: representativeDb >= THRESHOLDS.dbDominanceRatio && median(allDbRatio.map((ratio, index) => ratio * spanDuration(databasePerTrace[index].root))) >= THRESHOLDS.minimumDbDominanceMs ? 'P1' : 'P2', confidence: confidence(traces.length, repeatedRatio), target, profiles: [profile],
+        severity: materialDatabaseImpact.length >= THRESHOLDS.minimumTraceSamples && materialDatabaseImpactRatio >= THRESHOLDS.consistencyRatio ? 'P1' : 'P2', confidence: confidence(traces.length, repeatedRatio), target, profiles: [profile],
         evidence: [
           { observation: `${repeated.length} of ${traces.length} sampled requests had at least five equivalent operations among ${THRESHOLDS.repeatedDbOperationsPerTrace}+ query-shaped database spans.`, source: `Tempo trace snapshot (${profile})`, value: { affectedTraces: repeated.length, analyzedTraces: traces.length, ratio: repeatedRatio, minimumOperations: THRESHOLDS.repeatedDbOperationsPerTrace, sampleTraceIds: repeated.slice(0, 10).map(t => t.traceId) } },
           { observation: `Median database operations/request in affected traces: ${median(queryCounts)}.`, source: `Tempo trace snapshot (${profile})`, value: { medianOperationsPerRequest: median(queryCounts) } },
-          ...(representativeDb > 0 ? [{ observation: `Database activity occupied a median ${(representativeDb * 100).toFixed(1)}% of the request execution window.`, source: `Tempo span interval union (${profile})`, value: { medianDatabaseWindowRatio: representativeDb } }] : []),
-        ], metrics: { tracesAffected: repeated.length, tracesAnalyzed: traces.length, affectedRatio: repeatedRatio, medianOperationsPerRequest: median(queryCounts), medianDatabaseWindowRatio: representativeDb },
+          ...(representativeDb > 0 ? [{ observation: `Median database activity occupied ${(representativeDb * 100).toFixed(1)}% of the request window (${medianDbContributionMs.toFixed(1)} ms median interval contribution). Both material-impact thresholds were met in ${materialDatabaseImpact.length} of ${traces.length} requests.`, source: `Tempo span interval union (${profile})`, value: { medianDatabaseWindowRatio: representativeDb, medianDatabaseContributionMs: medianDbContributionMs, materialImpactTraces: materialDatabaseImpact.length, materialImpactRatio: materialDatabaseImpactRatio } }] : []),
+        ], metrics: { tracesAffected: repeated.length, tracesAnalyzed: traces.length, affectedRatio: repeatedRatio, medianOperationsPerRequest: median(queryCounts), medianDatabaseWindowRatio: representativeDb, medianDatabaseContributionMs: medianDbContributionMs, materialImpactTraces: materialDatabaseImpact.length, materialImpactRatio: materialDatabaseImpactRatio },
       });
     }
 

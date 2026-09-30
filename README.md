@@ -23,7 +23,7 @@ The audit command records what happened. The analysis command looks for specific
 - Deterministic analysis of completed results and sanitized, correlated traces.
 - Intentional slow-query, repeated-query, and external-call examples in the separate demo API.
 
-Phase 3 analysis currently supports measured latency, error-rate, and throughput changes under higher concurrency, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. It does not recommend code changes or generate reports. See [analysis methodology](docs/analysis-methodology.md) for thresholds and limits.
+Phase 3 analysis currently supports measured latency, error-rate, and throughput changes across comparable profiles, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. Profile comparison uses VUs only for the supported constant-VU model when endpoint, pacing, timeout, and test semantics match; otherwise it skips the comparison. Repeated-query detection is separate from impact severity, and dependency contribution is aggregated per request. It does not recommend code changes or generate reports. See [analysis methodology](docs/analysis-methodology.md) for thresholds and limits.
 
 ## Intended workflow
 
@@ -145,9 +145,10 @@ Artifacts contain no authorization headers, cookies, request bodies, raw SQL val
 
 Findings include stable rule IDs, category, target/profile, severity (`P0`/`P1`/`P2`), confidence (`high`/`medium`), supporting evidence, and measured values. The engine intentionally emits no low-confidence trace findings. In particular:
 
-- Load degradation requires comparable completed profiles, increased configured concurrency, at least 20 requests per profile, and a centralized material p95 or error-rate change threshold.
+- Load degradation requires comparable completed profiles under the same `constant-vus` model, one identical endpoint, pacing, and timeout; it uses strictly increased configured VUs only within that model, at least 20 requests per profile, and a centralized material latency/error/throughput change threshold. A throughput decrease is observational, not proof of saturation or root cause.
 - Trace rules require at least five correlated requests and consistent repeated evidence.
 - PostgreSQL contribution uses the union of child-span time intervals clipped to the request span, so overlapping spans are not double counted.
+- A repeated-query pattern can remain a P2 candidate when the measured database time contribution is small; repetition alone does not establish a major latency impact. External dependency severity uses per-request interval contribution rather than call-weighted durations.
 - Similar query detection uses conservative literal-free SQL normalization. Without a safe query shape, it will not infer repetition from generic `SELECT` labels.
 - CPU, memory, connection-pool saturation, index recommendations, and root-cause scoring are unsupported.
 

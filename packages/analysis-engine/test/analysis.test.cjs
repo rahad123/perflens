@@ -107,6 +107,19 @@ test('repeated fast query shape stays a low-severity candidate when request impa
   assert.match(finding.summary, /candidate/);
 });
 
+test('repeated query pattern with material database contribution receives stronger impact severity', () => {
+  const traces = [];
+  for (let i = 0; i < 10; i++) {
+    traces.push(root(`impact${i}`, i, 1000));
+    for (let q = 0; q < 21; q++) traces.push(span(`impact${i}`, `impact-db${i}-${q}`, `root${i}`, 'client', 10 + q * 25, 35 + q * 25, 'pg.query: SELECT * FROM order_items WHERE order_id = $1', { 'db.system': 'postgresql', 'db.query.sanitized': 'SELECT * FROM order_items WHERE order_id = $?' }));
+  }
+  const finding = analyzeEvidence(evidence({ traces })).findings.find(item => item.ruleId === 'database.repeated-operation');
+  assert.ok(finding);
+  assert.equal(finding.metrics.medianOperationsPerRequest, 21);
+  assert.ok(finding.metrics.medianDatabaseWindowRatio >= .5);
+  assert.equal(finding.severity, 'P1');
+});
+
 test('slow repeated DB query is measured without misclassifying one query per request as N+1', () => {
   const traces = [];
   for (let i = 0; i < 10; i++) {
@@ -154,7 +167,12 @@ test('a consistently slow external dependency is identified without a DB claim',
     traces.push(span(`ext${i}`, `http${i}`, `root${i}`, 'client', 50, 800, 'GET', { 'url.sanitized': '127.0.0.1/dependency', 'http.request.method': 'GET' }));
   }
   const result = analyzeEvidence(evidence({ traces }));
-  assert.ok(result.findings.some(item => item.ruleId === 'dependency.latency-dominance'));
+  const dependency = result.findings.find(item => item.ruleId === 'dependency.latency-dominance');
+  assert.ok(dependency);
+  assert.equal(dependency.confidence, 'medium');
+  assert.equal(dependency.metrics.tracesAffected, 10);
+  assert.equal(dependency.metrics.medianRequestContribution, .75);
+  assert.match(dependency.evidence[1].source, /per-request/);
   assert.equal(result.findings.some(item => item.category === 'database'), false);
   assert.ok(result.findings[0].severity);
 });
@@ -186,7 +204,9 @@ test('PostgreSQL connection spans with a peer address are not external HTTP evid
 
 test('load degradation requires an actual higher-concurrency comparison and a meaningful delta', () => {
   const worsened = analyzeEvidence(evidence({ profiles: [profile('baseline', 1, 100, 140), profile('normal', 3, 150, 230)] }));
-  assert.ok(worsened.findings.some(item => item.ruleId === 'load.latency-degradation'));
+  const latency = worsened.findings.find(item => item.ruleId === 'load.latency-degradation');
+  assert.ok(latency);
+  assert.equal(latency.title, 'Latency increased as configured concurrency increased');
   const stable = analyzeEvidence(evidence({ profiles: [profile('baseline', 1, 100), profile('normal', 3, 110)] }));
   assert.equal(stable.findings.some(item => item.ruleId.startsWith('load.')), false);
   const noComparison = analyzeEvidence(evidence({ profiles: [profile('baseline', 1, 100)] }));
@@ -200,9 +220,13 @@ test('load degradation requires an actual higher-concurrency comparison and a me
   const observed = analyzeEvidence(evidence({ profiles: throughputDrop }));
   const throughput = observed.findings.find(item => item.ruleId === 'load.throughput-degradation');
   assert.ok(throughput);
-  assert.match(throughput.title, /Observed throughput decrease/);
+  assert.match(throughput.title, /Throughput decreased under higher configured concurrency/);
   assert.match(throughput.summary, /does not establish saturation/);
   assert.match(throughput.evidence[1].observation, /Observed throughput changed/);
+  assert.equal(throughput.metrics.vusBefore, 1);
+  assert.equal(throughput.metrics.vusAfter, 3);
+  assert.equal(throughput.metrics.rpsBefore, 10);
+  assert.equal(throughput.metrics.rpsAfter, 8);
 });
 
 test('workload comparison is explicit, deterministic, and requires comparable constant-VU profiles', () => {
@@ -216,11 +240,14 @@ test('workload comparison is explicit, deterministic, and requires comparable co
     pair => { pair[1].workload.paceMs = 250; },
     pair => { pair[1].workload.requestTimeoutMs = 3000; },
     pair => { pair[1].target.endpoints = [{ method: 'GET', path: '/performance/slow-query' }]; },
+    pair => { pair[1].target.endpoints = [{ method: 'POST', path: '/orders' }]; },
     pair => { pair[0].target.endpoints.push({ method: 'GET', path: '/health' }); pair[1].target.endpoints.push({ method: 'GET', path: '/health' }); },
   ];
   for (const change of variants) {
     const pair = [structuredClone(before), structuredClone(after)]; change(pair);
-    assert.equal(compareWorkloadIntensity(...pair).comparable, false);
+    const comparison = compareWorkloadIntensity(...pair);
+    assert.equal(comparison.comparable, false);
+    assert.ok(comparison.reason.length > 0);
     pair[0].metrics.rps = 10; pair[1].metrics.rps = 5;
     const result = analyzeEvidence(evidence({ profiles: pair }));
     assert.equal(result.findings.some(item => item.category === 'load'), false);
@@ -244,6 +271,14 @@ test('low trace sample cannot produce high-confidence output and unsupported res
   const finding = result.findings.find(item => item.ruleId === 'database.repeated-operation');
   assert.equal(finding.confidence, 'medium');
   assert.match(result.unsupported[0], /CPU and memory/);
+});
+
+test('high latency without DB or external span evidence does not create a component bottleneck finding', () => {
+  const traces = Array.from({ length: 20 }, (_, i) => root(`high-latency${i}`, i, 1000));
+  const result = analyzeEvidence(evidence({ profiles: [profile('baseline', 1, 100), profile('normal', 3, 1000)], traces }));
+  assert.ok(result.findings.some(item => item.ruleId === 'load.latency-degradation'));
+  assert.equal(result.findings.some(item => item.category === 'database' || item.category === 'dependency'), false);
+  assert.match(result.unsupported.join(' '), /CPU and memory/);
 });
 
 test('malformed or unsupported evidence is rejected instead of receiving an empty successful analysis', () => {
