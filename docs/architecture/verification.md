@@ -1,6 +1,6 @@
 # PerfLens verification
 
-The latest results are in **Phase 2 — standardized audit execution — 2026-09-30** below. All preceding sections are historical records; their implementation boundaries and stack states describe those earlier checks.
+The latest results are in **Phase 2 hardening and re-verification — 2026-09-30** below. All preceding sections are historical records; their implementation boundaries and stack states describe those earlier checks.
 
 Executed on 2026-09-29 (Asia/Dhaka), using macOS/ARM64 with OrbStack. The host has Node 23.10.0 and pnpm 10.12.4; the Docker application uses Node 24. Node 24 is the documented development target.
 
@@ -269,7 +269,7 @@ docs/architecture/verification.md
 
 Created empty ignored `.perflens/runs`, `.perflens/results`, and `.perflens/logs` directories. Existing `.env`, demo source, database schema/seed, OpenTelemetry instrumentation, Collector config, Prometheus config, datasource definitions, API smoke script, and k6 baseline script were preserved. Final `docker compose ps --all` confirmed exit code 0 for all six containers; the volume listing confirmed all four named volumes remain.
 
-## Phase 2 — standardized audit execution — 2026-09-30
+## Phase 2 initial implementation verification — 2026-09-30
 
 Implemented incrementally in the working repository. No infrastructure definitions, demo endpoints, database schema/seed, independent Prometheus registry, or original k6 smoke script were replaced. No Phase 3 analysis, findings, reports, or source-code modification was added.
 
@@ -477,3 +477,52 @@ Recommended Phase 3, not started: define how to consume versioned run evidence a
 `docker volume ls --filter label=com.docker.compose.project=perflens` confirmed all four named volumes remain: `perflens_grafana-data`, `perflens_postgres-data`, `perflens_prometheus-data`, and `perflens_tempo-data`. No volume/database reset or history deletion occurred. Local audit artifacts remain in their config-relative `.perflens/runs` directories. Final `git diff --check` passed.
 
 Restart with `pnpm perflens infra up`, then `docker compose up --build -d --wait demo-api`, then `pnpm perflens audit`. This verification is complete; Phase 3 was not started.
+
+## Phase 2 hardening and re-verification — 2026-09-30
+
+This pass reviewed the local `feat/phase-2` branch for merge readiness. The public PR page lists the PR as open, from `feat/phase-2` into `main`, with no reviews; its listed head (`9e1cf02`) matches this workspace's HEAD. This hardening diff is currently local and uncommitted, so it is not yet in the remote PR. The GitHub CLI is not authenticated; hosted check status could not be verified. CI is added locally but has not run on GitHub. No remote PR write or merge was attempted.
+
+### Changes in this pass
+
+- Added `.github/workflows/ci.yml` for pull requests and pushes to `main`. It uses Node 24, the repository's pinned pnpm version, frozen lockfile installation, build, typecheck, optional root/workspace lint, and the Docker-independent `pnpm test` suite. Permissions are read-only, PR checkout credentials are not persisted, and the job has a ten-minute limit. It does not provision Docker or k6.
+- Checked normalized results against actual k6 2.3.0 `handleSummary` output. `http_reqs.values.count/rate` are request count/RPS. For the k6 Rate metric `http_req_failed`, `values.passes` counts failing requests (the metric's truthy samples), `fails` counts successful requests, and `rate` is the failure fraction. Successful request count is therefore requests minus `passes`.
+- Completed-run validation now requires the supported counter/rate/trend types and units; positive, consistent request count and duration; RPS consistent with count/duration; a bounded error rate consistent with failure counts; all configured percentile values in monotonic order; and raw request/status/endpoint/client-interval samples consistent with the summary. Observed HTTP statuses must agree with k6's failure count. Missing/invalid data never turns an exited-zero process into a completed profile.
+- NDJSON parsing rejects malformed records, request points, sample values, and timestamps. Failed/cancelled runs still keep raw files and preserve whatever structured metrics can be read.
+- `RunStore` now rejects paths escaping its run directory, serializes writes, stops accepting writes when finalization starts, drains earlier queued writes before final state, and refuses repeat finalization.
+- Added asymmetric fixtures (three successes, one failure) so swapping the k6 Rate pass/fail interpretation cannot pass unnoticed. Added missing-summary, missing-samples, mismatched-count, malformed-NDJSON, and zero-request completed-run tests. Added queue finalization and artifact path escape tests.
+
+No Phase 3 behavior was introduced.
+
+### Final checks run
+
+```sh
+pnpm install --frozen-lockfile
+pnpm build
+pnpm typecheck
+pnpm --if-present run lint
+pnpm -r --if-present run lint
+pnpm test
+docker compose config --quiet
+ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/ci.yml"); puts "CI YAML parse passed"'
+git diff --check
+```
+
+Results: frozen install passed with no lockfile change; build and typecheck passed for both workspaces; optional lint commands passed and found no lint script configured; **33 tests passed** (including five invalid-evidence subtests); Compose and CI YAML parsed; whitespace check passed. The existing pnpm warning that the optional `protobufjs` build script is ignored remains. No unit/integration test requires Docker or k6.
+
+Additional checks after hardening:
+
+- `pnpm perflens --help`, `--version`, `doctor`, and `infra status` passed.
+- Baseline audit `pfl_20260930T094546475Z_616bb573-9b0d-4469-bf5a-0088f42e06ac` completed with 20 requests, 0 failures, 2.00 RPS, and p50/p95/p99 **3.52 / 7.06 / 7.16 ms**.
+- Normal audit `pfl_20260930T094633744Z_f2f5ad76-810f-4a78-8f75-fdc667c63c3c` completed with 90 requests, 0 failures, 5.99 RPS, and p50/p95/p99 **4.41 / 9.50 / 45.07 ms**. These are local observations, not thresholds or capacity claims.
+- Its run-ID trace check found 90 measured root server spans and 90 PostgreSQL spans, with maximum simultaneous server-span overlap **3**. Prometheus target was UP and request metrics were queryable.
+- Original API smoke suite passed and created order 20007. After its new traces were allowed to flush through Tempo batching, the unchanged telemetry regression script passed: Grafana datasources, Prometheus target/11 metric series, and recent HTTP server/client/PostgreSQL/N+1 traces. N+1 remained 21 queries.
+- After restarting the stack for the final Phase 1 load-script regression, the unchanged `k6 run -e BASE_URL=http://localhost:3002 load-tests/baseline.js` passed again: **150 requests, zero failures, 300/300 checks**, five VUs for 30 seconds. This is the original smoke test, distinct from CLI audit artifacts. The final API smoke rerun created order 20008; the original telemetry test passed after waiting for Tempo's batch flush.
+- An unreachable target returned exit 1 and stored failed preflight without load: `pfl_20260930T094804004Z_c9da57e3-6b6b-475b-a513-687f8740bbf1`.
+- Real SIGINT returned exit 130 and stored cancellation evidence: `pfl_20260930T094819133Z_a1c2b196-6399-4f9b-9e60-015469565c65`. The lock was removed and prior baseline run hashes stayed unchanged.
+- Real k6 against a temporary loopback server returned both 200 and 500. The run completed and measured the failures: `pfl_20260930T094856457Z_eef445ed-31c1-4be0-bfcf-3753e355cfdc`, **5 requests, 2 successful, 3 failed, 60% error rate**. This temporary fixture is not a demo benchmark; actual request count and response ordering are stored in its artifact.
+
+The first stricter test run failed because its fake summary omitted k6 metric type/unit metadata. I updated the fixtures to match actual k6 2.3 output. A concurrency fixture assertion was also corrected to match its measured timestamp overlap. The final run passed.
+
+No linter or `actionlint` is installed; CI syntax was checked with Ruby's YAML parser. GitHub Actions itself was not run locally. The public PR page confirms it remains open with no reviews; GitHub's checks tab could not be fetched and the CLI has no credentials, so hosted check/required-check status remains unverified.
+
+After verification, all six Compose containers were stopped with exit code 0. The four named volumes remain; no database reset was performed. Generated `.perflens` run evidence and smoke-created orders remain local.

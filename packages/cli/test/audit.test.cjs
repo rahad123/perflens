@@ -6,7 +6,7 @@ const { join } = require('node:path');
 const { validateAudit, selectProfiles, durationMs } = require('../dist/audit/config');
 const { validateConfig } = require('../dist/config/project');
 const { RunStore, runId, listRuns } = require('../dist/audit/storage');
-const { normalize, readSamples } = require('../dist/audit/results');
+const { completedEvidenceError, normalize, readSamples } = require('../dist/audit/results');
 const { execute, k6Environment } = require('../dist/audit/process');
 const { K6Runner } = require('../dist/audit/k6');
 const { audit } = require('../dist/audit/service');
@@ -16,14 +16,16 @@ const base = { project: { name: 'test' }, target: { baseUrl: 'http://127.0.0.1:3
 const config = { ...base, audit: { endpoints: [{ method: 'GET', path: '/orders' }] } };
 async function temp(t) { const path = await mkdtemp(join(tmpdir(), 'perflens-audit-')); t.after(() => rm(path, { recursive: true, force: true })); return path; }
 function summary() {
-  return { state: { testRunDurationMs: 1000 }, metrics: { http_reqs: { values: { count: 2, rate: 2 } }, http_req_failed: { values: { passes: 1, fails: 1, rate: 0.5 } }, http_req_duration: { values: { avg: 20, med: 20, min: 10, max: 30, 'p(90)': 28, 'p(95)': 29, 'p(99)': 29.8 } } } };
+  return { state: { testRunDurationMs: 1000 }, metrics: { http_reqs: { type: 'counter', contains: 'default', values: { count: 4, rate: 4 } }, http_req_failed: { type: 'rate', contains: 'default', values: { passes: 1, fails: 3, rate: 0.25 } }, http_req_duration: { type: 'trend', contains: 'time', values: { avg: 20, med: 18, min: 10, max: 30, 'p(90)': 27, 'p(95)': 29, 'p(99)': 29.8 } } } };
 }
 function samples() {
   return [
-    { type: 'Point', metric: 'http_reqs', data: { value: 1, tags: { status: '200', name: 'GET /orders' }, time: '2026-09-30T00:00:00Z' } },
     { type: 'Point', metric: 'http_reqs', data: { value: 1, tags: { status: '500', name: 'GET /orders' }, time: '2026-09-30T00:00:00Z' } },
+    ...[1, 2, 3].map(i => ({ type: 'Point', metric: 'http_reqs', data: { value: 1, tags: { status: '200', name: 'GET /orders' }, time: `2026-09-30T00:00:00.00${i}Z` } })),
     { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 100, time: '2026-09-30T00:00:00.200Z' } },
     { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 100, time: '2026-09-30T00:00:00.250Z' } },
+    { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 50, time: '2026-09-30T00:00:00.270Z' } },
+    { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 50, time: '2026-09-30T00:00:00.280Z' } },
   ].map(x => JSON.stringify(x)).join('\n') + '\n';
 }
 function fakeDependencies(extra = {}) {
@@ -60,22 +62,33 @@ test('config rejects unsafe workloads, endpoints, unsupported fields, and remote
   assert.equal(durationMs('120s'), 120000);
   assert.deepEqual(validateConfig(base), base, 'Phase 1 config remains valid');
 });
-test('run IDs and directories are exclusive; finalization prevents historical writes', async t => {
+test('run IDs and directories are exclusive; finalized stores reject overwrites and path escapes', async t => {
   assert.equal(new Set(Array.from({ length: 100 }, runId)).size, 100);
   const dir = await temp(t); const a = await RunStore.create(dir), b = await RunStore.create(dir);
   assert.notEqual(a.directory, b.directory); assert.match(a.id, /^pfl_\d{8}T\d{9}Z_[0-9a-f-]{36}$/);
+  await assert.rejects(a.write(`../${b.id}/run.json`, { status: 'failed' }), /inside its own run directory/);
   await a.finalize({ status: 'completed' }); await assert.rejects(a.write('run.json', {}), /finalized/);
+  await assert.rejects(a.finalize({ status: 'failed' }), /finalized/);
+  const queued = await RunStore.create(dir);
+  const firstWrite = queued.write('run.json', { status: 'running' });
+  const finalWrite = queued.finalize({ status: 'completed' });
+  await Promise.all([firstWrite, finalWrite]);
+  assert.equal(JSON.parse(await readFile(join(queued.directory, 'run.json'))).status, 'completed');
+  await assert.rejects(queued.write('run.json', { status: 'failed' }), /finalized/);
   assert.equal(JSON.parse(await readFile(join(a.directory, 'run.json'))).status, 'completed');
 });
-test('normalization uses structured k6 values, derives success, records overlap, and leaves missing values null', async t => {
+test('k6 2.3 Rate.passes counts failed requests; counters, rates, duration and percentiles normalize exactly', async t => {
   const file = join(await temp(t), 'samples.ndjson'); await writeFile(file, samples());
-  const evidence = await readSamples(file); assert.equal(evidence.maxObservedInFlight, 2);
+  const evidence = await readSamples(file); assert.equal(evidence.maxObservedInFlight, 3);
   const plan = { schemaVersion: 1, runId: 'fixture', profile: 'normal', baseUrl: base.target.baseUrl, endpoints: config.audit.endpoints, workload: validateAudit(config.audit).profiles.normal, timeoutMs: 5000 };
   const result = normalize(summary(), plan, 'start', 'end', 'completed', evidence);
-  assert.equal(result.metrics.requests, 2); assert.equal(result.metrics.successfulRequests, 1);
-  assert.equal(result.metrics.failedRequests, 1); assert.equal(result.metrics.errorRate, 0.5);
-  assert.equal(result.metrics.latencyMs.p99, 29.8); assert.equal(result.metrics.rps, 2);
-  assert.deepEqual(result.metrics.statusDistribution, { '200': 1, '500': 1 });
+  assert.equal(result.metrics.requests, 4); assert.equal(result.metrics.failedRequests, 1);
+  assert.equal(result.metrics.successfulRequests, 3); assert.equal(result.metrics.errorRate, 0.25);
+  assert.equal(result.metrics.rps, 4); assert.equal(result.metrics.durationMs, 1000);
+  assert.deepEqual(result.metrics.latencyMs, { average: 20, min: 10, p50: 18, p90: 27, p95: 29, p99: 29.8, max: 30 });
+  assert.deepEqual(result.metrics.statusDistribution, { '200': 3, '500': 1 });
+  const swapped = summary(); swapped.metrics.http_req_failed.values = { passes: 3, fails: 1, rate: 0.75 };
+  assert.match(completedEvidenceError(swapped, evidence), /status samples disagree/);
   assert.equal(normalize({}, plan, 'start', 'end', 'failed', null).metrics.latencyMs.p99, null);
 });
 test('successful default audit persists raw/normalized results and windows without overwriting earlier runs', async t => {
@@ -127,13 +140,36 @@ test('failed k6 preserves completed profiles and failure evidence, never complet
   await assert.rejects(audit({ config: path }, undefined, deps), /Audit failed/);
   const run = await stored(dir); assert.equal(run.profiles[0].status, 'completed'); assert.equal(run.profiles[1].status, 'failed');
   const result = JSON.parse(await readFile(join(dir, '.perflens/runs', run.runId, 'results/normal.json')));
-  assert.equal(result.status, 'failed'); assert.equal(result.metrics.requests, 2);
+  assert.equal(result.status, 'failed'); assert.equal(result.metrics.requests, 4);
 });
 test('missing raw evidence is a failed execution, not a fabricated successful run', async t => {
   const dir = await temp(t), path = await project(dir); const deps = fakeDependencies();
   deps.runner.profile = async () => ({ code: 0, signal: null, timedOut: false, cancelled: false, stdout: '' });
   await assert.rejects(audit({ config: path, profile: 'baseline' }, undefined, deps), /inconsistent structured evidence/);
   assert.equal((await stored(dir)).status, 'failed');
+});
+test('missing summaries/samples, mismatched counts, malformed NDJSON, and zero requests fail completed profiles', async t => {
+  const { unlink } = require('node:fs/promises');
+  const mutations = [
+    ['missing summary', async (_dir, plan) => unlink(plan.summaryFile)],
+    ['missing samples', async (dir, plan) => unlink(join(dir, 'raw', `${plan.profile}.samples.ndjson`))],
+    ['request-count mismatch', async (_dir, plan) => { const value = summary(); value.metrics.http_reqs.values.count = 5; await writeFile(plan.summaryFile, JSON.stringify(value)); }],
+    ['malformed NDJSON', async (dir, plan) => writeFile(join(dir, 'raw', `${plan.profile}.samples.ndjson`), '{broken json\n')],
+    ['zero requests', async (dir, plan) => {
+      const value = summary(); value.metrics.http_reqs.values = { count: 0, rate: 0 };
+      value.metrics.http_req_failed.values = { passes: 0, fails: 0, rate: 0 }; value.state.testRunDurationMs = 0;
+      await writeFile(plan.summaryFile, JSON.stringify(value)); await writeFile(join(dir, 'raw', `${plan.profile}.samples.ndjson`), '');
+    }],
+  ];
+  for (const [name, mutate] of mutations) await t.test(name, async st => {
+    const dir = await temp(st), path = await project(dir), deps = fakeDependencies();
+    const profile = deps.runner.profile;
+    deps.runner.profile = async (runDir, plan, signal) => { const execution = await profile(runDir, plan, signal); await mutate(runDir, plan); return execution; };
+    await assert.rejects(audit({ config: path, profile: 'baseline' }, undefined, deps), /inconsistent structured evidence/i);
+    const run = await stored(dir); assert.equal(run.status, 'failed'); assert.equal(run.profiles[0].status, 'failed');
+    const result = JSON.parse(await readFile(join(dir, '.perflens/runs', run.runId, 'results/baseline.json')));
+    assert.equal(result.status, 'failed');
+  });
 });
 test('cancellation persists cancelled status and stops further profiles', async t => {
   const dir = await temp(t), path = await project(dir), controller = new AbortController();

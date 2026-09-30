@@ -7,7 +7,7 @@ import { CliError } from '../utils/errors';
 import { selectProfiles, ProfileName } from './config';
 import { K6Runner, Plan } from './k6';
 import { checkCancelled, checkInfrastructure, checkTarget } from './preflight';
-import { normalize, readSamples } from './results';
+import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
 export interface AuditOptions { config?: string; infraDir?: string; profile?: string }
 interface ProfileState { name: ProfileName; status: RunStatus; startedAt: string | null; endedAt: string | null; error: string | null; result: string | null }
@@ -83,8 +83,9 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       try { summary = JSON.parse(await readFile(currentPlan.summaryFile, 'utf8')); } catch { /* Partial failed/cancelled runs may not produce a summary. */ }
       try { samples = await readSamples(join(store.directory, 'raw', `${profile.name}.samples.ndjson`)); } catch { /* Raw evidence remains available even if interrupted mid-line. */ }
       const result = normalize(summary, currentPlan, profile.startedAt, profile.endedAt, profile.status, samples);
-      if (profile.status === 'completed' && (!result.metrics.requests || !samples || Object.values(samples.statusDistribution).reduce((a, b) => a + b, 0) !== result.metrics.requests)) {
-        profile.status = 'failed'; result.status = 'failed'; profile.error = 'k6 produced missing, empty, or inconsistent structured evidence.';
+      const evidenceError = completedEvidenceError(summary, samples);
+      if (profile.status === 'completed' && evidenceError) {
+        profile.status = 'failed'; result.status = 'failed'; profile.error = `k6 produced missing, empty, or inconsistent structured evidence. ${evidenceError}`;
       }
       profile.result = `results/${profile.name}.json`;
       await store.write(profile.result, result);
