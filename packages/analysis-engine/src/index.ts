@@ -150,10 +150,12 @@ function traceMap(spans: SanitizedSpan[]) {
 function operation(span: SanitizedSpan): string {
   const query = String(attr(span, 'db.query.sanitized') ?? '');
   const name = span.name.replace(/^pg\.query:\s*/i, '');
-  if (query) return normalizeSql(query);
+  const normalized = normalizeSql(query || name);
+  // A bare verb such as "SELECT" or "SELECT 1" is not a safe fingerprint.
+  if (normalized && /\bselect\b[\s\S]*\bfrom\s+[\w".]+|\binsert\s+into\s+[\w".]+|\bupdate\s+[\w".]+|\bdelete\s+from\s+[\w".]+/.test(normalized)) return normalized;
   // Do not equate all SELECT/UPDATE operations. Without a safe query shape,
   // repeat-query evidence is insufficient, though span counts still apply.
-  return /\b(select|insert|update|delete)\b/i.test(name) ? normalizeSql(name) : '';
+  return '';
 }
 function intervalUnionWithin(spans: SanitizedSpan[], root: SanitizedSpan): number {
   try {
@@ -173,19 +175,44 @@ function intervalUnionWithin(spans: SanitizedSpan[], root: SanitizedSpan): numbe
   } catch { return 0; }
 }
 
+export interface WorkloadComparison {
+  comparable: boolean;
+  reason: string;
+  beforeLoad?: number;
+  afterLoad?: number;
+}
+
+/**
+ * Compare only the Phase 2 constant-VU workload that PerfLens currently emits.
+ * In this model, VUs represent configured concurrency only when request pace,
+ * timeout, executor, and target endpoint set are unchanged.
+ */
+export function compareWorkloadIntensity(previous: ProfileResult, current: ProfileResult): WorkloadComparison {
+  const before = previous.workload as ProfileResult['workload'] & Record<string, unknown>;
+  const after = current.workload as ProfileResult['workload'] & Record<string, unknown>;
+  if (before.executor !== 'constant-vus' || after.executor !== 'constant-vus') return { comparable: false, reason: 'unsupported workload model' };
+  if (!Array.isArray(previous.target.endpoints) || !Array.isArray(current.target.endpoints) || JSON.stringify(previous.target.endpoints) !== JSON.stringify(current.target.endpoints)) return { comparable: false, reason: 'endpoint sets differ' };
+  if (previous.target.endpoints.length !== 1) return { comparable: false, reason: 'aggregate multi-endpoint measurements are not compared' };
+  if (before.paceMs !== after.paceMs) return { comparable: false, reason: 'request pacing differs' };
+  if (before.requestTimeoutMs !== after.requestTimeoutMs) return { comparable: false, reason: 'request timeouts differ' };
+  if (!finite(before.vus) || !finite(after.vus) || after.vus <= before.vus) return { comparable: false, reason: 'later profile does not have higher configured concurrency' };
+  return { comparable: true, reason: 'same constant-VU model and configuration with higher VUs', beforeLoad: before.vus, afterLoad: after.vus };
+}
+
 function compareLoad(profiles: ProfileResult[], findings: Finding[]) {
   const ordered = ['baseline', 'normal', 'peak', 'stress'];
   const eligible = profiles.filter(p => p.status === 'completed').sort((a, b) => ordered.indexOf(a.profile) - ordered.indexOf(b.profile));
   for (let i = 1; i < eligible.length; i++) {
     const previous = eligible[i - 1], current = eligible[i];
-    if (previous.target.endpoints.length !== 1 || current.target.endpoints.length !== 1 || previous.target.endpoints[0].path !== current.target.endpoints[0].path) continue;
+    const workloadComparison = compareWorkloadIntensity(previous, current);
+    if (!workloadComparison.comparable) continue;
     const requestsA = previous.metrics.requests, requestsB = current.metrics.requests;
     const p95A = previous.metrics.latencyMs.p95, p95B = current.metrics.latencyMs.p95;
     const p99A = previous.metrics.latencyMs.p99, p99B = current.metrics.latencyMs.p99;
     const errorA = previous.metrics.errorRate, errorB = current.metrics.errorRate;
     const rpsA = previous.metrics.rps, rpsB = current.metrics.rps;
     if (!finite(requestsA) || !finite(requestsB) || requestsA < THRESHOLDS.minimumLoadRequests || requestsB < THRESHOLDS.minimumLoadRequests ||
-      !finite(previous.workload.vus) || !finite(current.workload.vus) || current.workload.vus <= previous.workload.vus || !finite(p95A) || !finite(p95B)) continue;
+      !finite(p95A) || !finite(p95B)) continue;
     const delta = p95B - p95A;
     const relative = p95A === 0 ? (p95B > 0 ? Infinity : 0) : delta / p95A;
     const latencyDegraded = delta >= THRESHOLDS.p95AbsoluteIncreaseMs && relative >= THRESHOLDS.p95RelativeIncrease;
@@ -198,14 +225,14 @@ function compareLoad(profiles: ProfileResult[], findings: Finding[]) {
     const ruleId = errorDegraded ? 'load.error-degradation' : latencyDegraded ? 'load.latency-degradation' : 'load.throughput-degradation';
     findings.push({
       id: findingId(ruleId, target, profilesUsed), ruleId, category: 'load',
-      title: ruleId === 'load.error-degradation' ? 'Error rate increases under load' : ruleId === 'load.throughput-degradation' ? 'Throughput decreases under higher concurrency' : 'Latency degradation under load',
-      summary: latencyDegraded ? `p95 latency increased under the measured ${previous.profile} to ${current.profile} workload.` : errorDegraded ? 'The measured error rate increased as configured concurrency increased.' : 'Measured throughput decreased as configured concurrency increased; no component cause is inferred.',
+      title: ruleId === 'load.error-degradation' ? 'Error rate increases under higher configured concurrency' : ruleId === 'load.throughput-degradation' ? 'Observed throughput decrease under comparable workload' : 'Latency degradation under higher configured concurrency',
+      summary: latencyDegraded ? `p95 latency increased between comparable constant-VU ${previous.profile} and ${current.profile} profiles.` : errorDegraded ? 'The measured error rate increased between comparable constant-VU profiles with higher configured concurrency.' : 'Measured throughput decreased between comparable constant-VU profiles with higher configured concurrency; this observation does not establish saturation or root cause.',
       severity: severity({ p95: p95B, errorRate: errorDegraded ? errorsIncrease : 0 }), confidence: 'high', target, profiles: profilesUsed,
       evidence: [
-        { observation: `Configured concurrency increased from ${previous.workload.vus} to ${current.workload.vus} VUs.`, source: `results/${previous.profile}.json, results/${current.profile}.json` },
+        { observation: `Under the same constant-VU model, request pacing, timeout, and endpoint, configured concurrency increased from ${previous.workload.vus} to ${current.workload.vus} VUs.`, source: `results/${previous.profile}.json, results/${current.profile}.json` },
         ...(latencyDegraded ? [{ observation: `p95 changed from ${p95A} ms to ${p95B} ms; p99 changed from ${p99A ?? 'unavailable'} ms to ${p99B ?? 'unavailable'} ms.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { p95BeforeMs: p95A, p95AfterMs: p95B, p99BeforeMs: p99A, p99AfterMs: p99B } }] : []),
         ...(errorDegraded ? [{ observation: `Error rate changed from ${(errorA! * 100).toFixed(2)}% to ${(errorB! * 100).toFixed(2)}%.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { errorRateBefore: errorA, errorRateAfter: errorB } }] : []),
-        ...(throughputDegraded ? [{ observation: `Throughput changed from ${rpsA} to ${rpsB} requests/sec while configured concurrency increased.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { rpsBefore: rpsA, rpsAfter: rpsB } }] : []),
+        ...(throughputDegraded ? [{ observation: `Observed throughput changed from ${rpsA} to ${rpsB} requests/sec between the comparable ${previous.profile} and ${current.profile} profiles.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { rpsBefore: rpsA, rpsAfter: rpsB } }] : []),
       ], metrics: { p95BeforeMs: p95A, p95AfterMs: p95B, p99BeforeMs: p99A, p99AfterMs: p99B, errorRateBefore: errorA, errorRateAfter: errorB, rpsBefore: rpsA, rpsAfter: rpsB, vusBefore: previous.workload.vus, vusAfter: current.workload.vus },
     });
   }
@@ -256,8 +283,8 @@ export function analyzeEvidence(evidence: AnalysisEvidence, analyzedAt = new Dat
       const target = endpoint;
       findings.push({
         id: findingId('database.repeated-operation', target, [profile]), ruleId: 'database.repeated-operation', category: 'database',
-        title: 'Repeated database query pattern', summary: 'Similar PostgreSQL operations repeat within individual requests across multiple sampled traces; this is a likely N+1 query pattern, not a confirmed application root cause.',
-        severity: 'P1', confidence: confidence(traces.length, repeatedRatio), target, profiles: [profile],
+        title: 'Repeated database query pattern', summary: 'Similar PostgreSQL operations repeat within individual requests across multiple sampled traces. This is a likely N+1 pattern candidate; latency impact is assessed separately from repetition.',
+        severity: representativeDb >= THRESHOLDS.dbDominanceRatio && median(allDbRatio.map((ratio, index) => ratio * spanDuration(databasePerTrace[index].root))) >= THRESHOLDS.minimumDbDominanceMs ? 'P1' : 'P2', confidence: confidence(traces.length, repeatedRatio), target, profiles: [profile],
         evidence: [
           { observation: `${repeated.length} of ${traces.length} sampled requests had at least five equivalent operations among ${THRESHOLDS.repeatedDbOperationsPerTrace}+ query-shaped database spans.`, source: `Tempo trace snapshot (${profile})`, value: { affectedTraces: repeated.length, analyzedTraces: traces.length, ratio: repeatedRatio, minimumOperations: THRESHOLDS.repeatedDbOperationsPerTrace, sampleTraceIds: repeated.slice(0, 10).map(t => t.traceId) } },
           { observation: `Median database operations/request in affected traces: ${median(queryCounts)}.`, source: `Tempo trace snapshot (${profile})`, value: { medianOperationsPerRequest: median(queryCounts) } },
@@ -308,32 +335,31 @@ export function analyzeEvidence(evidence: AnalysisEvidence, analyzedAt = new Dat
       });
     }
 
-    const externalByHost = new Map<string, { spans: SanitizedSpan[]; traces: Set<string> }>();
-    for (const trace of traces) for (const span of trace.spans.filter(clients)) {
-      const dep = String(attr(span, 'url.sanitized') ?? 'external dependency');
-      const item = externalByHost.get(dep) ?? { spans: [], traces: new Set<string>() };
-      item.spans.push(span); item.traces.add(trace.traceId); externalByHost.set(dep, item);
-    }
-    for (const [dependency, item] of externalByHost) {
-      if (item.spans.length < THRESHOLDS.minimumTraceSamples || item.traces.size < THRESHOLDS.minimumTraceSamples || item.traces.size / traces.length < THRESHOLDS.consistencyRatio) continue;
-      const durations = item.spans.map(spanDuration);
-      const contribution = traces.map(t => {
-        const matching = t.spans.filter(span => clients(span) && attr(span, 'url.sanitized') === dependency);
-        return intervalUnionWithin(matching, t.root);
+    const dependencyNames = new Set(traces.flatMap(t => t.spans.filter(clients).map(span => String(attr(span, 'url.sanitized') ?? 'external dependency'))));
+    for (const dependency of dependencyNames) {
+      const requests = traces.map(trace => {
+        const matching = trace.spans.filter(span => clients(span) && attr(span, 'url.sanitized') === dependency);
+        const requestRatio = intervalUnionWithin(matching, trace.root);
+        return { trace, matching, requestRatio, requestMs: requestRatio * spanDuration(trace.root) };
       });
-      const dominantExternal = contribution.filter(value => value >= THRESHOLDS.externalDominanceRatio);
-      if (dominantExternal.length < THRESHOLDS.minimumTraceSamples || dominantExternal.length / traces.length < THRESHOLDS.consistencyRatio || median(durations) < 100) continue;
+      const affected = requests.filter(item => item.matching.length > 0);
+      const dominant = affected.filter(item => item.requestRatio >= THRESHOLDS.externalDominanceRatio);
+      if (affected.length < THRESHOLDS.minimumTraceSamples || affected.length / traces.length < THRESHOLDS.consistencyRatio || dominant.length < THRESHOLDS.minimumTraceSamples || dominant.length / traces.length < THRESHOLDS.consistencyRatio) continue;
+      const requestMedianMs = median(affected.map(item => item.requestMs));
+      const requestMedianRatio = median(affected.map(item => item.requestRatio));
+      if (requestMedianMs < 100) continue;
+      const spans = affected.flatMap(item => item.matching);
+      const requestContributionsMs = affected.map(item => item.requestMs);
       const target = endpoint;
-      const ratio = dominantExternal.length / traces.length;
-      const med = median(durations);
+      const ratio = dominant.length / traces.length;
       findings.push({
         id: findingId(`dependency.latency:${dependency}`, target, [profile]), ruleId: 'dependency.latency-dominance', category: 'dependency', title: 'External dependency contributes substantially to request latency',
-        summary: 'Repeated external HTTP client spans occupy a substantial portion of the request window across sampled traces; the evidence does not establish dependency ownership or root cause.',
-        severity: severity({ externalRatio: median(dominantExternal), externalMs: med }), confidence: confidence(item.traces.size, ratio), target, profiles: [profile],
+        summary: 'External HTTP dependency intervals occupy a substantial portion of request windows across most sampled requests; contribution is aggregated per request, and no dependency ownership or root cause is inferred.',
+        severity: severity({ externalRatio: requestMedianRatio, externalMs: requestMedianMs }), confidence: confidence(traces.length, ratio), target, profiles: [profile],
         evidence: [
-          { observation: `${item.spans.length} calls to ${dependency} appeared across ${item.traces.size} traces.`, source: `Tempo sanitized HTTP client spans (${profile})`, value: { dependency, calls: item.spans.length, traces: item.traces.size, sampleTraceIds: [...item.traces].sort().slice(0, 10) } },
-          { observation: `Median dependency call duration ${med.toFixed(1)} ms; dependency intervals occupied a median ${(median(dominantExternal) * 100).toFixed(1)}% of affected request windows.`, source: `Tempo client/server span interval union (${profile})`, value: { medianCallMs: med, p95CallMs: percentile(durations, .95), medianRequestContribution: median(dominantExternal), affectedTraces: dominantExternal.length, analyzedTraces: traces.length } },
-        ], metrics: { dependency, calls: item.spans.length, tracesAffected: item.traces.size, medianCallMs: med, p95CallMs: percentile(durations, .95), medianRequestContribution: median(dominantExternal) },
+          { observation: `${spans.length} calls to ${dependency} appeared across ${affected.length} of ${traces.length} sampled requests.`, source: `Tempo sanitized HTTP client spans (${profile})`, value: { dependency, calls: spans.length, tracesAffected: affected.length, tracesAnalyzed: traces.length, sampleTraceIds: affected.map(item => item.trace.traceId).sort().slice(0, 10) } },
+          { observation: `Across affected requests, median dependency interval contribution was ${requestMedianMs.toFixed(1)} ms (${(requestMedianRatio * 100).toFixed(1)}% of request windows); request-level p95 contribution was ${percentile(requestContributionsMs, .95).toFixed(1)} ms.`, source: `Tempo per-request client/server span interval union (${profile})`, value: { medianRequestContributionMs: requestMedianMs, p95RequestContributionMs: percentile(requestContributionsMs, .95), medianRequestContribution: requestMedianRatio, affectedTraces: affected.length, dominantTraces: dominant.length, analyzedTraces: traces.length } },
+        ], metrics: { dependency, calls: spans.length, tracesAffected: affected.length, tracesAnalyzed: traces.length, medianRequestContributionMs: requestMedianMs, p95RequestContributionMs: percentile(requestContributionsMs, .95), medianRequestContribution: requestMedianRatio },
       });
     }
     }
@@ -344,8 +370,7 @@ export function analyzeEvidence(evidence: AnalysisEvidence, analyzedAt = new Dat
   const completed = evidence.profiles.filter(p => p.status === 'completed').sort((a, b) => profileOrder.indexOf(a.profile) - profileOrder.indexOf(b.profile));
   for (let i = 1; i < completed.length; i++) {
     const a = completed[i - 1], b = completed[i];
-    if (a.target.endpoints.length !== 1 || b.target.endpoints.length !== 1 || a.target.endpoints[0].path !== b.target.endpoints[0].path) continue;
-    if (!finite(a.workload.vus) || !finite(b.workload.vus) || b.workload.vus <= a.workload.vus) continue;
+    if (!compareWorkloadIntensity(a, b).comparable) continue;
     if (!finite(a.metrics.errorRate) || !finite(b.metrics.errorRate) || b.metrics.errorRate - a.metrics.errorRate < THRESHOLDS.errorRateIncrease || !finite(a.metrics.requests) || !finite(b.metrics.requests) || a.metrics.requests < THRESHOLDS.minimumLoadRequests || b.metrics.requests < THRESHOLDS.minimumLoadRequests) continue;
     if (findings.some(f => f.category === 'load' && f.profiles.includes(a.profile) && f.profiles.includes(b.profile))) continue;
     const target = b.target.endpoints[0] ?? { method: 'GET', path: '/' };
