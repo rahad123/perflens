@@ -21,6 +21,19 @@ export const telemetry = new NodeSDK({
   instrumentations: [
     new HttpInstrumentation({
       ignoreIncomingRequestHook: (req) => ['/health', '/metrics'].includes(req.url ?? ''),
+      requestHook: (span, request) => {
+        if (!('headers' in request)) return;
+        const runId = request.headers['x-perflens-run-id'];
+        const profile = request.headers['x-perflens-profile'];
+        // Allowlisted audit metadata only; never capture authorization or bodies.
+        // OTel still creates/propagates trace IDs normally.
+        if (typeof runId === 'string' && /^pfl_\d{8}T\d{9}Z_[0-9a-f-]{36}$/.test(runId)) {
+          span.setAttribute('perflens.audit.run_id', runId);
+          if (typeof profile === 'string' && ['preflight', 'baseline', 'normal', 'peak', 'stress'].includes(profile)) {
+            span.setAttribute('perflens.audit.profile', profile);
+          }
+        }
+      },
     }),
     new PgInstrumentation({ enhancedDatabaseReporting: false }),
   ],

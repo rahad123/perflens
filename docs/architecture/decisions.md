@@ -1,4 +1,4 @@
-# Phase 1 architecture decisions
+# Architecture decisions
 
 - **CLI product, separate test target:** `packages/cli` is the PerfLens developer toolkit. The existing NestJS app and PostgreSQL are a test target. The CLI controls the four existing observability services; it does not own framework integration yet. See [current/future architecture](architecture.md).
 - **TypeORM and PostgreSQL:** explicit schema migration, foreign keys, indexes, and integer money values. Automatic schema synchronization is disabled. Migration and seed run before readiness. Local fixtures seed only an empty database and use a transaction/advisory lock; they are not a general data reconciliation system.
@@ -14,3 +14,13 @@ The slow query is bounded to 100 orders and database statements time out after 1
 - **Commander and JSON:** a real executable package uses Commander for argument parsing and a minimal, non-executable JSON target config. Safe initialization never overwrites config or edits source.
 - **Non-destructive lifecycle:** reuse the existing Compose definition and a four-service allowlist. Stop preserves all volumes and leaves target services untouched. Probe readiness through Prometheus rather than depending on NestJS.
 - **Local-only defaults:** reject remote Docker contexts and target URLs; disable Grafana/Tempo reporting and automatic Grafana update/plugin downloads. Explicit image/dependency downloads still require registry access.
+
+## Phase 2 additions
+
+- **Preserve infrastructure and target:** audit uses the existing readiness service and Compose definition. The only target code change captures allowlisted correlation metadata in its existing HTTP instrumentation. No demo behavior, database schema, or inefficient endpoint was rewritten.
+- **Host k6 adapter:** use the already established k6 2.3 series, packaged script, structured summary, and raw JSON samples. Pin the supported adapter version explicitly; keep the original manual/Docker baseline unchanged. No custom load generator or shell-output parser.
+- **Closed, bounded concurrency:** constant VUs with minimum request start intervals, finite durations, explicit timeouts, sequential selected profiles, and a per-project lock. Defaults run baseline plus normal; peak/stress are opt-in. No remote override or unbounded discovery strategy.
+- **Filesystem evidence:** UUID directories, schema-versioned normalized JSON, copied resolved config/script, raw summaries/samples, execution details, and logs. Atomic live-state updates then finalization preserve historical runs. No run-history database.
+- **Correlate without trace-ID invention:** safe run/profile HTTP headers become incoming server span attributes. Existing child trace relationships are retained. Prometheus uses windows and target/service metadata; no run-ID metric labels or analysis engine.
+- **Failure is explicit:** invalid setup, subprocess failure, or inconsistent evidence is nonzero; measured HTTP errors remain result data. Interrupted/failed runs retain partial evidence and never claim completion. No SLO or root-cause conclusion is inferred.
+- **Framework independence:** config and k6 communicate over HTTP. The CLI imports no NestJS code; the demo's trace verification script asserts known fixtures solely for acceptance testing.
