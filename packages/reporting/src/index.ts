@@ -29,19 +29,20 @@ function fail(message: string): never { throw new Error(message); }
 function safeText(value: unknown): string {
   if (typeof value !== 'string') return String(value ?? '');
   return value
-    .replace(/\b(Bearer\s+)[^\s,;]+/gi, '$1[REDACTED]')
-    .replace(/((?:authorization|cookie|token|password|secret|api[_-]?key)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@')
-    .replace(/(https?:\/\/[^\s?#]+)[?#][^\s]*/gi, '$1?[REDACTED]')
+    .replace(/\bPERFLENS_TEST_SECRET_[A-Za-z0-9_-]+\b/g, '[REDACTED]')
+    .replace(/\b(?:proxy-)?authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\r\n;,]+/gi, 'Authorization: [REDACTED]')
+    .replace(/\b(?:set-cookie|cookie)\s*[:=]\s*[^\r\n]+/gi, 'Cookie: [REDACTED]')
+    .replace(/\b((?:https?|postgres(?:ql)?|redis|rediss):\/\/)([^/\s?#@]*:[^/\s?#@]*@)/gi, '$1[REDACTED]@')
+    .replace(/([?&](?:api[_-]?key|access[_-]?token|password|passwd|secret|token|client[_-]?secret|auth(?:orization)?)=)[^&#\s"'<>]*/gi, '$1[REDACTED]')
     .replace(/\b(password|passwd|token|secret|api[_-]?key)\s*[=:]\s*(['"])[^'"]*\2/gi, '$1=[REDACTED]')
-    .replace(/\b(?:select|insert|update|delete)\b[\s\S]*/i, match => match.replace(/'[^']*'|"[^"]*"/g, '?'));
+    .replace(/\b(?:select|insert|update|delete)\b[\s\S]*/i, match => match.replace(/'(?:''|[^'])*'|\$[A-Za-z_0-9]*\$[\s\S]*?\$[A-Za-z_0-9]*\$/g, '?'));
 }
 function sanitize(value: unknown): any {
   if (Array.isArray(value)) return value.map(sanitize);
   if (value && typeof value === 'object') {
     const result: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (/authorization|cookie|password|secret|token|credential|request.?body/i.test(key)) continue;
+      if (/authorization|cookie|password|secret|token|api[_-]?key|credential|request.?body/i.test(key)) continue;
       result[key] = sanitize(item);
     }
     return result;

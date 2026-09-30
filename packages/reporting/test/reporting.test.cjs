@@ -29,6 +29,10 @@ test('preserves Phase 3 severity and confidence exactly while ordering by severi
   const p1 = finding({ id: 'a', ruleId: 'a.rule', severity: 'P1', confidence: 'low' });
   const model = build(fixture({ findings: [p2, p1] }));
   assert.deepEqual(model.findings.map(item => [item.severity, item.confidence]), [['P1', 'low'], ['P2', 'high']]);
+  const carried = model.findings.find(item => item.id === 'z');
+  assert.equal(carried.ruleId, p2.ruleId);
+  assert.deepEqual(carried.evidence, p2.evidence);
+  assert.deepEqual(carried.metrics, p2.metrics);
 });
 
 test('zero-finding runs remain valid and produce conservative report language', () => {
@@ -38,17 +42,77 @@ test('zero-finding runs remain valid and produce conservative report language', 
   assert.match(renderHtml(model), /No evidence-backed performance bottleneck met the configured detection thresholds/);
 });
 
-test('Markdown and HTML escape untrusted finding text and sanitize secret values and URL queries', () => {
-  const secretFinding = finding({ title: '<img src=x onerror=alert(1)>', summary: 'Bearer abc.def and https://example.test/pay?token=private', evidence: [{ observation: 'password=topsecret; Authorization: Bearer abc.def', source: 'SQL SELECT * FROM x WHERE name=\'secret-sql\'' }] });
-  const model = build(fixture({ findings: [secretFinding] }));
-  const md = renderMarkdown(model); const html = renderHtml(model); const serialized = JSON.stringify(model);
-  for (const text of ['topsecret', 'abc.def', 'private', 'secret-sql', 'user:password']) {
-    assert.ok(!md.includes(text), `markdown leaked ${text}`);
-    assert.ok(!html.includes(text), `html leaked ${text}`);
-    assert.ok(!serialized.includes(text), `model leaked ${text}`);
+test('redacts adversarial credentials, cookie values, database/dependency URLs, query secrets, and SQL literals at model construction', () => {
+  const cases = [
+    ['Bearer authorization', 'Authorization: Bearer bearerSentinel'],
+    ['Basic authorization', 'Authorization: Basic basicSentinel=='],
+    ['Cookie', 'Cookie: session=cookieSentinel; theme=dark'],
+    ['Set-Cookie', 'Set-Cookie: session=setCookieSentinel; HttpOnly; Secure'],
+    ['PostgreSQL URL', 'postgres://user:pgSentinel@db.internal:5432/app'],
+    ['PostgreSQL long URL', 'postgresql://user:pgLongSentinel@db.internal/app'],
+    ['Redis URL', 'redis://user:redisSentinel@cache.internal:6379/0'],
+    ['Redis password-only URL', 'redis://:redisPasswordOnlySentinel@cache.internal:6379/0'],
+    ['Redis TLS URL', 'rediss://user:redisTlsSentinel@cache.internal:6380/0'],
+    ['HTTP credentials', 'http://alice:httpSentinel@example.test/path'],
+    ['HTTPS credentials', 'https://alice:httpsSentinel@example.test/path'],
+    ['api_key query', 'https://api.test/path?api_key=apiKeySentinel&keep=yes'],
+    ['access_token query', 'https://api.test/path?access_token=accessTokenSentinel'],
+    ['password query', 'https://api.test/path?password=passwordSentinel'],
+    ['secret query', 'https://api.test/path?secret=secretSentinel'],
+    ['token query', 'https://api.test/path?token=tokenSentinel'],
+    ['SQL email literal', "SELECT * FROM customers WHERE email = 'customer@example.com'"],
+    ['SQL token literal', "SELECT * FROM events WHERE token = 'sqlTokenSentinel'"],
+  ];
+  for (const [label, input] of cases) {
+    const model = build(fixture({ findings: [finding({ summary: input })] }));
+    const outputs = [JSON.stringify(model, null, 2), renderMarkdown(model), renderHtml(model)].join('\n');
+    assert.doesNotMatch(outputs, /bearerSentinel|basicSentinel|cookieSentinel|setCookieSentinel|pgSentinel|pgLongSentinel|redisSentinel|redisPasswordOnlySentinel|redisTlsSentinel|httpSentinel|httpsSentinel|apiKeySentinel|accessTokenSentinel|passwordSentinel|secretSentinel|tokenSentinel|customer@example\.com|sqlTokenSentinel/, label);
   }
+});
+
+test('HTML injection fixtures are rendered only as escaped text', () => {
+  const inputText = `<script>alert(1)</script> <img src=x onerror=alert(1)> "double" 'single' <angle> & ampersand`;
+  const model = build(fixture({ findings: [finding({ title: inputText, summary: inputText, evidence: [{ observation: inputText, source: inputText }] })] }));
+  const html = renderHtml(model);
+  assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
   assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'));
+  assert.ok(html.includes('&quot;double&quot;'));
+  assert.ok(html.includes('&#39;single&#39;'));
+  assert.ok(html.includes('&amp;'));
+  assert.ok(!html.includes('<script>alert(1)</script>'));
   assert.ok(!html.includes('<img src=x'));
+});
+
+test('Markdown evidence cannot inject table rows, headings, raw HTML, or links', () => {
+  const injection = 'cell | injected\n| fake | row\n# heading <script>alert(1)</script> [click](javascript:alert(1)) & "quote"';
+  const model = build(fixture({ findings: [finding({ title: injection, summary: injection, evidence: [{ observation: injection, source: injection }] })] }));
+  const markdown = renderMarkdown(model);
+  assert.ok(markdown.includes('cell \\| injected \\| fake \\| row \\# heading \\<script\\>alert(1)\\</script\\> \\[click\\](javascript:alert(1))'));
+  assert.equal((markdown.match(/^\| fake \| row$/gm) ?? []).length, 0);
+  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 1);
+  assert.ok(!markdown.includes('<script>alert(1)</script>'));
+});
+
+test('unique sentinel secrets are removed from the model and every renderer across artifact fields', () => {
+  const sentinel = 'PERFLENS_TEST_SECRET_7f93a1';
+  const input = fixture({ findings: [finding({
+    summary: `finding summary ${sentinel}`,
+    evidence: [{ observation: `evidence ${sentinel}`, source: `dependency ${sentinel}`, value: { databaseOperation: `SELECT * FROM t WHERE token='${sentinel}'`, externalDependency: `redis://user:${sentinel}@cache/0`, note: sentinel } }],
+    metrics: { dependency: `https://user:${sentinel}@service.test/path?access_token=${sentinel}`, databaseFingerprint: `SELECT * FROM t WHERE email='${sentinel}@example.test'`, nested: { detail: sentinel } },
+  })] });
+  input.run.serviceName = `service-${sentinel}`;
+  input.run.engine = { name: `k6-${sentinel}`, version: sentinel };
+  input.run.target.baseUrl = `http://user:${sentinel}@localhost:3002/?api_key=${sentinel}`;
+  input.profiles[0].result.workload.label = sentinel;
+  input.profiles[0].result.metrics.extra = { dependency: sentinel, database: sentinel };
+  input.analysis.unsupported.push(sentinel);
+  input.evidence.telemetry.source = sentinel;
+  input.evidence.telemetry.details = { token: sentinel, note: sentinel };
+  input.evidence.traces.push({ name: sentinel, attributes: { 'db.query.text': `SELECT '${sentinel}'` } });
+
+  const model = build(input);
+  const outputs = [JSON.stringify(model, null, 2), renderMarkdown(model), renderHtml(model)];
+  for (const output of outputs) assert.ok(!output.includes(sentinel), 'sentinel must be absent before and after rendering');
 });
 
 test('missing optional metrics render as unavailable without fabricated values', () => {
