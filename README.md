@@ -2,7 +2,7 @@
 
 ## Backend Performance Audit CLI / Developer Toolkit
 
-PerfLens measures backend performance under controlled load, correlates measurements with local OpenTelemetry traces, and produces explainable findings from saved evidence. This repository is an early developer-toolkit foundation, not a hosted platform. The bundled NestJS application is a test target; PerfLens core is the CLI and reusable analysis engine.
+PerfLens measures backend performance under controlled load, correlates measurements with local OpenTelemetry traces, and produces explainable findings from saved evidence. This repository is an early developer-toolkit foundation, not a hosted platform. The NestJS and Express applications are separate test targets; PerfLens core is the CLI and reusable analysis engine.
 
 ## What problem does it solve?
 
@@ -21,7 +21,9 @@ The audit command records what happened. The analysis command looks for specific
 - k6-based bounded, concurrent profiles and immutable run directories.
 - Run/profile correlation headers for targets that capture the documented OpenTelemetry attributes.
 - Deterministic analysis of completed results and sanitized, correlated traces; Markdown and HTML audit reports from persisted findings.
-- Intentional slow-query, repeated-query, and external-call examples in the separate demo API.
+- Two separate Node.js reference targets: NestJS and Express. Each has normal routes and isolated intentional slow-query, repeated-query, and external-call examples.
+
+The reference apps are integrations/test targets, not the PerfLens product or analysis architecture. The shared `@perflens/node-instrumentation` workspace package provides generic HTTP/PostgreSQL instrumentation and the PerfLens correlation contract. Express opts into its OpenTelemetry layer instrumentation. Only NestJS and Express are verified; other Node.js frameworks are not claimed as supported.
 
 Phase 3 analysis currently supports measured latency, error-rate, and throughput changes across comparable profiles, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. Profile comparison uses VUs only for the supported constant-VU model when endpoint, pacing, timeout, and test semantics match; otherwise it skips the comparison. Repeated-query detection is separate from impact severity, and dependency contribution is aggregated per request. Phase 4 formats saved findings as Markdown and HTML; it performs no new diagnosis or recommendations. See [analysis methodology](docs/analysis-methodology.md) and [reporting](docs/reporting.md).
 
@@ -93,6 +95,7 @@ The Compose stack and its published ports bind to loopback. If a configured port
 | Service | URL |
 | --- | --- |
 | Demo API | `http://localhost:3002` |
+| Express reference API (opt-in) | `http://localhost:3003` |
 | API health (includes PostgreSQL check) | `http://localhost:3002/health` |
 | API metrics | `http://localhost:3002/metrics` |
 | Grafana | `http://localhost:3001` |
@@ -109,6 +112,20 @@ The separate NestJS demo API includes `GET /orders`, `GET /orders/:id`, `POST /o
 
 These fixtures are for controlled local audits. They are not PerfLens features and the analysis engine does not use endpoint names to decide findings.
 
+### Express reference target
+
+The Express application is an independent, opt-in reference target. Start it after `perflens infra up`:
+
+```sh
+docker compose --profile express up -d --build express-demo-api
+curl http://localhost:3003/health
+pnpm perflens --config apps/express-demo-api/perflens.config.json audit --profile baseline,normal
+pnpm perflens --config apps/express-demo-api/perflens.config.json analyze
+pnpm perflens --config apps/express-demo-api/perflens.config.json report
+```
+
+It reuses PostgreSQL and the current Collector/Tempo/Prometheus/Grafana stack. Its `/orders` route is a single clean bounded read; the `/performance/*` routes are documented intentional fixtures. Full setup, correlation, and privacy details are in [the Express integration guide](docs/integrations/express.md).
+
 ### Inspect traces and metrics
 
 Run an audit, copy its printed run ID, then open Grafana → Explore → Tempo and query:
@@ -117,9 +134,9 @@ Run an audit, copy its printed run ID, then open Grafana → Explore → Tempo a
 { resource.service.name = "perflens-demo-api" && span.perflens.audit.run_id = "<run-id>" }
 ```
 
-The demo's HTTP instrumentation captures `X-PerfLens-Run-Id` and `X-PerfLens-Profile` as span attributes. Open a server request span to inspect child PostgreSQL or HTTP client spans. PerfLens analysis uses the same run/profile correlation and saves the sanitized spans it examined.
+Both targets use the shared Node instrumentation bootstrap to capture valid `X-PerfLens-Run-Id` and `X-PerfLens-Profile` values as span attributes. Open a server request span to inspect child PostgreSQL or HTTP client spans. PerfLens analysis uses the same run/profile correlation and saves the sanitized spans it examined.
 
-Prometheus scrapes the demo API's `perflens_http_requests_total` and `perflens_http_request_duration_seconds` metrics. Try `perflens_http_requests_total` or `histogram_quantile(0.95, sum by (le) (rate(perflens_http_request_duration_seconds_bucket[5m])))` in Prometheus or Grafana Explore. These live dashboard queries are not persisted as per-run metric snapshots in this phase.
+Prometheus scrapes both reference APIs' `perflens_http_requests_total` and `perflens_http_request_duration_seconds` metrics. Try `perflens_http_requests_total` or `histogram_quantile(0.95, sum by (le) (rate(perflens_http_request_duration_seconds_bucket[5m])))` in Prometheus or Grafana Explore. These live dashboard queries are not persisted as per-run metric snapshots in this phase.
 
 ### Run the original Phase 1 smoke test
 
@@ -166,7 +183,9 @@ PerfLens currently runs its observability stack locally and does not export tele
 ## Repository layout
 
 ```text
-apps/demo-api/              NestJS test target and intentional bottlenecks
+apps/demo-api/              NestJS reference/test target
+apps/express-demo-api/      Express reference/test target
+packages/node-instrumentation/ Shared generic Node.js OpenTelemetry bootstrap
 packages/cli/                Executable PerfLens CLI and orchestration
 packages/analysis-engine/    Framework-independent deterministic rules
 packages/reporting/          Framework-independent JSON, Markdown, and HTML reports
@@ -182,8 +201,8 @@ docker-compose.yml            Local target and observability stack
 - **Phase 2 — Measure:** bounded concurrent audits and stored results.
 - **Phase 3 — Analyze:** deterministic findings from measured load and correlated traces.
 - **Phase 4 — Report:** client-readable Markdown and HTML from saved findings (current phase).
-- **Phase 5 — Remediation:** evidence-backed recommendations remain future work.
+- **Phase 5 — Node.js integrations:** NestJS and Express reference targets use shared instrumentation and the same audit pipeline.
 
-There is no automatic remediation, PDF report, before/after comparison, SaaS, authentication, billing, hosted dashboard, production stress mode, or non-Node instrumentation. The trace query currently snapshots at most 500 traces per profile. Data beyond that cap is marked truncated and findings describe only the captured sample. Tempo retention is finite; analyze while traces remain available, then reruns can use the saved evidence offline.
+There is no automatic remediation, PDF report, before/after comparison, SaaS, authentication, billing, hosted dashboard, production stress mode, or support for other languages/frameworks. The trace query currently snapshots at most 500 traces per profile. Data beyond that cap is marked truncated and findings describe only the captured sample. Tempo retention is finite; analyze while traces remain available, then reruns can use the saved evidence offline.
 
 See [architecture](docs/architecture/architecture.md), [analysis methodology](docs/analysis-methodology.md), [audit methodology](docs/audit-methodology.md), and [verification history](docs/architecture/verification.md).
