@@ -1,7 +1,7 @@
-import { access, cp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, chmod, cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { CliError } from '../utils/errors';
 export const INFRA_SERVICES = ['otel-collector', 'tempo', 'prometheus', 'grafana'] as const;
@@ -28,8 +28,11 @@ export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl =
   const root = join(resolve(cwd), '.perflens', 'infra');
   try { await access(join(root, 'docker-compose.yml')); }
   catch {
-    await mkdir(root, { recursive: true, mode: 0o700 });
+    // fs.cp expects its directory destination not to exist when errorOnExist
+    // is enabled (Node 24 enforces this); create only the consumer parent.
+    await mkdir(dirname(root), { recursive: true, mode: 0o700 });
     await cp(packagedAssets, root, { recursive: true, errorOnExist: true, force: false });
+    await chmod(root, 0o700);
     const project = `perflens-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 10)}`;
     const compose = await readFile(join(root, 'docker-compose.yml'), 'utf8');
     await writeFile(join(root, 'docker-compose.yml'), compose.replace('__PERFLENS_COMPOSE_NAME__', project), { flag: 'w', mode: 0o600 });
