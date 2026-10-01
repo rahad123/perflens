@@ -1,0 +1,15 @@
+{
+  "project": { "name": "express-demo-api" },
+  "target": { "baseUrl": "http://localhost:3003" },
+  "observability": { "serviceName": "perflens-express-demo-api" },
+  "audit": {
+    "endpoints": [{ "method": "GET", "path": "/orders" }],
+    "timeoutMs": 5000,
+    "profiles": {
+      "baseline": { "vus": 1, "duration": "10s", "paceMs": 500 },
+      "normal": { "vus": 3, "duration": "15s", "paceMs": 500 },
+      "peak": { "vus": 6, "duration": "15s", "paceMs": 500 },
+      "stress": { "vus": 10, "duration": "15s", "paceMs": 500 }
+    }
+  }
+}

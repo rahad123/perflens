@@ -1,0 +1,24 @@
+{
+  "name": "express-demo-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node --require ./dist/instrumentation.js dist/main.js",
+    "test": "pnpm build && node --test test/*.test.cjs"
+  },
+  "dependencies": {
+    "@perflens/node-instrumentation": "workspace:*",
+    "@opentelemetry/instrumentation-express": "0.70.0",
+    "@prometheus-io/client": "0.16.1",
+    "express": "5.2.1",
+    "pg": "8.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.0",
+    "typescript": "~5.9.2"
+  }
+}

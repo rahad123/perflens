@@ -682,6 +682,20 @@ Phase 4 checks: `pnpm install --frozen-lockfile` completed and its workspace pos
 
 The current machine could not run `pnpm perflens doctor` or `pnpm perflens infra status`: Docker is installed, but its local daemon socket (`~/.orbstack/run/docker.sock`) was unreachable. `docker compose config --quiet` still validated successfully. The report acceptance therefore consumed the actual already-persisted local acceptance runs above; it did not start new containers or claim a fresh API/telemetry round trip during this pass. The stored evidence confirms the measurements and findings listed above, and report generation itself uses only those artifacts.
 
+## Phase 5 — Express and generic Node integration
+
+### Automated checks
+
+`CI=1 pnpm install --frozen-lockfile`, `pnpm build`, `pnpm typecheck`, `pnpm test`, `git diff --check`, and `docker compose --env-file .env.example config --quiet` passed. The complete workspace suite reported **81 tests passed**: 24 analysis-engine, 2 shared Node instrumentation, 41 CLI, 10 reporting, and 4 Express target/instrumentation tests. No lint script is configured. `pnpm perflens --help` and `pnpm perflens --version` passed and continued to list the same framework-neutral commands.
+
+The Express tests exercise health, the clean bounded `/orders` query, the deterministic slow-query shape, the real HTTP dependency call, and a 21-call N+1 sequence (one order-list operation plus 20 identical item operations). A separate child Node process starts the SDK and `ExpressInstrumentation` before requiring Express, then exports spans through an in-memory processor. It observed a server span named `GET /performance/external-call` with `http.route=/performance/external-call`, `http.request.method=GET`, the supplied `perflens.audit.run_id` and `.profile=normal`, and resource attributes `service.name=perflens-test-express`, `service.version=9.8.7`, `deployment.environment=test`. The observed hierarchy was server span → Express request-handler span → HTTP client span; the HTTP client and server spans shared the same trace ID. This verifies route and correlation semantics against the installed instrumentation version without contacting a collector.
+
+### Docker and live-stack limitation
+
+Compose syntax validation passed, but live acceptance could not run. `pnpm perflens doctor` reported Docker installed, Compose available, local endpoint selected, and Compose configuration valid, then failed because the Docker daemon was unreachable. `pnpm perflens infra status` failed with permission denied on `unix:///Users/admin/.orbstack/run/docker.sock`. No fresh Compose build, PostgreSQL-backed Express run, Collector/Tempo export, k6 audit, Phase 3 analysis, Phase 4 report, or NestJS runtime regression is claimed in this verification. PostgreSQL span generation for `pg` and the real four-endpoint audit/report workflow still require rerun after the local daemon is available.
+
+No remote target support or other framework/language integration was added. The only live local trace evidence in this pass is the in-memory HTTP/Express test above; it did not exercise PostgreSQL or Tempo.
+
 ### Phase 4 report security hardening — 2026-09-30
 
 The normalized report model now redacts secret-bearing values while projecting artifacts into the safe model, before Markdown or HTML rendering. Regression coverage includes Bearer and Basic authorization headers, Cookie and Set-Cookie values, PostgreSQL/Postgres/Redis/Rediss URLs with credentials, HTTP/HTTPS username-password URLs, `api_key`, `access_token`, `password`, `secret`, and `token` query parameters, and SQL string literals containing email/token values. A `PERFLENS_TEST_SECRET_7f93a1` sentinel placed across run metadata, profile workload/metrics, finding evidence/metrics, and database/dependency values is asserted absent from the serialized model (the `report.json` content), Markdown, and HTML.
@@ -689,3 +703,32 @@ The normalized report model now redacts secret-bearing values while projecting a
 HTML injection fixtures cover script/img tags, event handlers, quotes, angle brackets, and ampersands; tests assert they render as escaped text. Markdown fixtures cover table delimiters, newlines, headings, raw HTML, and link-like input; tests assert they cannot inject a row or heading or become a link. Finding preservation tests compare `ruleId`, severity, confidence, evidence, and metrics with Phase 3 inputs to ensure reporting does not reinterpret them.
 
 Final hardening commands: `CI=1 pnpm install --frozen-lockfile`, `pnpm build`, `pnpm typecheck`, `pnpm -r --if-present run lint`, `pnpm test`, and `git diff --check` all passed. **75 tests passed**: 24 analysis-engine, 41 CLI, and 10 reporting. The repository has no lint script, so lint was not added or run. Docker remained unavailable as noted above; no fresh Docker acceptance is claimed by this hardening pass.
+
+## Phase 5 live acceptance — 2026-10-01
+
+Docker/Compose was available for this pass. The existing observability stack was started with `pnpm perflens infra up`; the Express reference target was built and started with its PostgreSQL dependency, and `/health` returned `{"status":"ok","database":"up"}`. Four fresh Express audits used only `http://localhost:3003`, with baseline (1 configured VU, 10 seconds, 500 ms pacing) and normal (3 configured VUs, 15 seconds, 500 ms pacing). Each completed profile had zero failed requests. These are observations from the persisted run artifacts, not benchmark guarantees.
+
+| Express endpoint / run ID | Baseline: requests; RPS; p50/p95/p99 ms | Normal: requests; RPS; p50/p95/p99 ms | Errors; correlated traces; PostgreSQL / external HTTP spans | Phase 3 findings |
+| --- | --- | --- | --- | --- |
+| `GET /orders` — `pfl_20261001T055203528Z_c3d352e0-c1bf-471b-b325-63c027f9d84a` | 20; 1.9951; 3.698 / 8.64485 / 10.66417 | 90; 5.9969; 4.8865 / 9.47135 / 13.11891 | 0/20 and 0/90 failed (0%); 110 traces; 222 / 0 spans | None; no severe finding was fabricated. |
+| `GET /performance/n-plus-one` — `pfl_20261001T055323526Z_4e575518-5057-4753-a6ed-1482ae95b4bc` | 20; 1.9964; 7.644 / 10.71805 / 11.95001 | 90; 5.9957; 11.1625 / 19.52015 / 20.34632 | 0/20 and 0/90 failed (0%); 110 traces; 4,622 / 0 spans | P2 / HIGH, `database.repeated-operation`; median 21 DB operations/request, repeated pattern in 20/20 baseline and 90/90 normal traces. Median DB interval contribution 37.2% (2.3 ms) baseline and 51.9% (5.0 ms) normal. Material-impact guard met in 0/20 and 0/90; no severe impact claim. |
+| `GET /performance/slow-query` — `pfl_20261001T055415962Z_579a9fd5-16c9-4080-b58e-15dcd73f8b4d` | 19; 1.8291; 522.72 / 653.0981 / 657.85802 | 81; 5.3793; 539.788 / 641.447 / 655.6386 | 0/19 and 0/81 failed (0%); 97 traces; 195 / 0 spans | P1 / HIGH, `database.slow-operation`; equivalent operation observed 19 baseline times (median 521.2 ms, p95 657.8 ms) and 78 normal times (median 542.4 ms, p95 642.3 ms). No N+1 or external finding. |
+| `GET /performance/external-call` — `pfl_20261001T055511247Z_96bab56b-30f2-4625-bc78-222a4e1b2d05` | 14; 1.3241; 754.2035 / 757.3697 / 758.72274 | 60; 3.9618; 756.3255 / 761.4301 / 762.18887 | 0/14 and 0/60 failed (0%); 74 traces; 0 / 74 spans | P1 / HIGH, `dependency.latency-dominance`; request-level dependency median contribution 751.8 ms / 99.9% baseline and 753.7 ms / 99.9% normal. No DB finding. |
+
+Tempo traces for these exact run IDs showed `service.name=perflens-express-demo-api`, `service.version=0.1.0`, `deployment.environment=local`, stable `http.route` matching the endpoint, and `perflens.audit.run_id` / `perflens.audit.profile`. Sampled `/orders` and slow-query traces had PostgreSQL descendants; N+1 traces had repeated PostgreSQL spans under the Express handler; external-call traces had an HTTP client span under the handler and its simulator server span in the same trace. The spans and parent/child relationships were checked in returned Tempo trace data. Prometheus returned `up{job="express-demo-api"}=1` and `sum(perflens_http_requests_total{job="express-demo-api"})=398`. Tempo `/ready` and Grafana `/api/health` returned ready/healthy.
+
+All four Express report sets exist at `/tmp/perflens-express-acceptance/.perflens/runs/<run-id>/report/{report.json,report.md,report.html}` for the run IDs above. Report JSON retained Phase 3 rule ID, severity, and confidence. `/orders` produced a valid zero-finding report.
+
+### Fresh NestJS regression
+
+After Express verification, the NestJS target was rebuilt and force-recreated from the current repository. Its health check reported the database up. A new baseline/normal audit targeted `GET /orders` at `http://localhost:3002`:
+
+| Run ID | Baseline: requests; RPS; p50/p95/p99 ms | Normal: requests; RPS; p50/p95/p99 ms | Failures and telemetry |
+| --- | --- | --- | --- |
+| `pfl_20261001T060415440Z_f59a02d9-4d6e-409e-bdcd-539e7d995d3e` | 20; 2.00; 3.45 / 5.96 / 6.39 | 90; 5.99; 5.83 / 27.21 / 40.13 | 0 errors in both profiles; 110 correlated traces, 222 PostgreSQL spans, 0 external HTTP spans. No findings met evidence/sample-size thresholds. |
+
+The run was analyzed and reported after the live Tempo query. Its report has zero findings and all three files at `/tmp/perflens-nest-acceptance/.perflens/runs/pfl_20261001T060415440Z_f59a02d9-4d6e-409e-bdcd-539e7d995d3e/report/{report.json,report.md,report.html}`. The analysis confirms trace correlation and PostgreSQL evidence. No further NestJS span-attribute claim is made here.
+
+### Commands and outcomes
+
+`CI=1 pnpm install --frozen-lockfile`, `pnpm build`, `pnpm typecheck`, `pnpm test`, `docker compose --env-file .env.example config --quiet`, and `git diff --check` passed. The suite reported **81 passing tests**: 24 analysis-engine, 2 shared Node instrumentation, 41 CLI, 10 reporting, and 4 Express target/instrumentation. No lint script is configured. Express Compose build/start, health, Tempo trace retrieval, Prometheus scrape/query, Grafana health, audits, analysis, reports, and the fresh NestJS audit/analysis/report were executed. No remote, staging, or production target was used; no rules or thresholds were changed.

@@ -12,11 +12,15 @@ flowchart TB
     Compose --> Tempo[Tempo]
     Compose --> Prometheus[Prometheus]
     Compose --> Grafana[Grafana]
-    subgraph Target[Separately managed test target]
+    subgraph Targets[Separately managed reference targets]
         API[NestJS Demo API] --> DB[(PostgreSQL)]
+        Express[Express Demo API - opt-in] --> DB
         API --> External[Loopback HTTP fixture]
-        API --> SDK[OpenTelemetry SDK]
+        Express --> ExpressDep[Loopback HTTP fixture]
+        API --> SDK[Shared Node OpenTelemetry bootstrap]
+        Express --> SDK
         API --> Metrics[Prometheus registry]
+        Express --> Metrics
     end
     SDK -->|OTLP HTTP traces| Collector
     Collector -->|OTLP gRPC traces| Tempo
@@ -26,6 +30,7 @@ flowchart TB
     CLI --> Preflight[Audit preflight]
     Preflight --> k6[k6 constant-VU profiles]
     k6 -->|GET with run/profile headers| API
+    k6 -->|same workflow and config contract| Express
     k6 --> Raw[Raw summary and samples]
     Raw --> Results[Normalized measurement results]
     CLI --> Windows[Run/profile metadata and time windows]
@@ -40,11 +45,12 @@ flowchart TB
 ### Boundaries
 
 - `packages/cli` owns command orchestration, project validation, subprocess execution, diagnostics, and readiness checks. Commander parses arguments; reusable functions/services handle operations.
-- `apps/demo-api` owns all NestJS/TypeORM code, migrations, synthetic seed data, and intentionally slow demo endpoints. The CLI does not import it, build it during `infra up`, or require it to probe infrastructure.
-- `infra` and `docker-compose.yml` remain the only infrastructure definitions. No generated or duplicated Compose template is introduced.
+- `apps/demo-api` owns the NestJS/TypeORM target; `apps/express-demo-api` owns a separate Express/pg target. Each has local fixture routes and neither is part of the CLI or analysis engine.
+- `packages/node-instrumentation` owns shared NodeSDK resource/exporter/HTTP/PostgreSQL setup and bounded audit correlation. Express opts into `ExpressInstrumentation` before importing Express. The Compose profile reuses the existing database and telemetry services.
+- `infra` and `docker-compose.yml` remain the only infrastructure definitions. No second infrastructure stack is introduced.
 - Metrics flow directly from the target to Prometheus. Tempo stores traces, not the application's Prometheus metrics.
-- `packages/cli/src/audit` owns bounded profile validation, preflight, child execution, k6 integration, normalization, and run storage. `packages/cli/src/analysis` resolves runs, retrieves trace snapshots from Tempo, and renders results. `packages/analysis-engine` owns reusable evidence validation and deterministic rules; it has no CLI or NestJS dependency.
-- `.perflens/runs/<run-id>` holds current and historical evidence, raw data, normalized results, telemetry metadata, logs, and an `analysis` directory with sanitized evidence, structured findings, and analysis metadata. Top-level `results`/`logs` directories created by Phase 1 init remain reserved. No reports are generated.
+- `packages/cli/src/audit` owns bounded profile validation, preflight, child execution, k6 integration, normalization, and run storage. `packages/cli/src/analysis` retrieves correlated trace snapshots and renders results. `packages/analysis-engine` has no CLI, NestJS, TypeORM, or Express dependency.
+- `.perflens/runs/<run-id>` stores measurements, analysis evidence/findings, and generated report files. Reports are rendered from persisted Phase 3 analysis without rediagnosis.
 
 ### Configuration and resolution
 
@@ -64,7 +70,7 @@ Doctor is read-only. Ports owned by the matching service in the selected Compose
 
 ### Safety and network behavior
 
-Shell-free argument arrays, local Docker checks, loopback bindings, bounded process timeouts, and nonzero errors form the preserved safety baseline. Audit adds bounded VUs/duration/request timeouts/pacing, explicit high-load selection, no redirects, and a project lock. Analysis only reads completed run artifacts and local Tempo, stores allowlisted sanitized spans, and does not mutate application or database state. Reports are not implemented. Remote target URLs remain rejected without an override; CI cannot implicitly authorize remote load.
+Shell-free argument arrays, local Docker checks, loopback bindings, bounded process timeouts, and nonzero errors form the preserved safety baseline. Audit adds bounded VUs/duration/request timeouts/pacing, explicit high-load selection, no redirects, and a project lock. Analysis only reads completed run artifacts and local Tempo, stores allowlisted sanitized spans, and does not mutate application or database state. Reporting formats persisted inputs and does no new diagnosis. Remote target URLs remain rejected without an override; CI cannot implicitly authorize remote load.
 
 Grafana and Tempo anonymous reporting is disabled. Grafana automatic preinstallation, plugin updates, update checks, and public-key downloads are disabled; required datasources are already bundled. Images and dependencies still require explicit registry downloads at installation/startup. These configuration guarantees are not a network firewall or a security review of third-party software.
 
@@ -76,24 +82,25 @@ The k6 script executes concurrent constant-VU GET requests with pacing and expli
 
 `RunStore` uses exclusive run-directory creation, atomic state writes, and finalization. Later commands never resume or overwrite a completed directory. This is application-level immutability, not OS protection against file owners. Raw evidence stays local; filesystem history needs no database.
 
-Incoming demo server spans capture allowlisted audit run/profile headers. Existing trace IDs, context propagation, pg instrumentation, and Prometheus collection remain unchanged. Analysis queries Tempo by service, run ID, profile, and profile UTC window, then stores only normalized span evidence needed by rules. PostgreSQL interval contribution uses span-window union to avoid overlap double counting. Prometheus metric snapshots and resource-saturation findings are unsupported because Phase 2 does not persist reliable per-run system metrics.
+Both Node reference apps use the shared HTTP/PostgreSQL bootstrap. Server spans capture only valid, bounded audit run/profile headers; OpenTelemetry remains responsible for trace IDs and context propagation. Express adds its framework layer instrumentation. Analysis queries Tempo by service, run ID, profile, and profile UTC window, then stores normalized span evidence. The analysis rules depend on span kinds, semantic HTTP/database attributes, service identity, timing, and correlation—not NestJS or Express internals. Prometheus metric snapshots and resource-saturation findings remain unsupported because Phase 2 does not persist reliable per-run system metrics.
 
 The full measurement contract is in [audit methodology](../audit-methodology.md); Phase 3 rules and thresholds are in [analysis methodology](../analysis-methodology.md).
 
-## Intended end-to-end workflow — reporting and richer integrations remain future work
+## Current-to-future workflow
 
 ```mermaid
 flowchart TB
     Backend[Existing Backend Project] --> PerfLens[PerfLens CLI]
-    PerfLens --> Instrument[Automatic instrumentation integration: future]
-    Instrument --> Observe[Observability infrastructure]
+    PerfLens --> Instrument[Node instrumentation: NestJS and Express verified]
+    Instrument --> Observe[Local observability infrastructure: implemented]
     Observe --> Load[Local controlled k6 audits: implemented]
     Load --> Collect[Stored measurements and telemetry correlation: implemented]
     Collect --> Analyze[Analysis engine: implemented]
     Analyze --> Findings[Evidence-backed P0 / P1 / P2 findings: implemented]
-    Findings --> Report[Performance audit report: future]
+    Findings --> Report[Markdown / HTML reports: implemented]
+    Report --> More[Other framework/language integrations: future]
 ```
 
-`analyze` consumes validated run artifacts and correlated telemetry, rather than NestJS controllers or demo-specific SQL. `audit` currently targets local GET endpoints. Language-specific instrumentation belongs behind explicit, separately tested integrations when authorized. No Python/Java/Go/.NET adapter exists now. Phase 4 reporting and richer recommendations are future work.
+`analyze` consumes validated run artifacts and correlated telemetry, rather than framework controllers or demo-specific SQL. `audit` currently targets local GET endpoints. Phase 5 verifies generic Node instrumentation with NestJS and Express reference targets. Other frameworks/languages and recommendations remain future work.
 
 Analysis remains separate from audit execution; offline replay uses the saved evidence snapshot. Missing optional trace evidence is reported explicitly, and unsupported resource rules do not infer saturation from latency.
