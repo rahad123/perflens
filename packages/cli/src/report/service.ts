@@ -1,7 +1,7 @@
 import { readdir, readFile, mkdir, writeFile, rename, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
-import { buildReportModel, renderHtml, renderMarkdown, ReportModel } from '@perflens/reporting';
+import { buildReportModel, renderHtml, renderMarkdown, ReportModel } from '../../../reporting/dist';
 import { loadProject } from '../config/project';
 import { CliError } from '../utils/errors';
 

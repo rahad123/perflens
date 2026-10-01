@@ -1,27 +1,60 @@
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { access, readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline/promises';
+import { stdin, stdout } from 'node:process';
 import { analyze } from '../analysis/service';
 import { report } from '../report/service';
-import { audit } from '../audit/service';
 import { listRuns } from '../audit/storage';
-import { loadProject } from '../config/project';
 import { Command } from 'commander';
-import { initialize } from '../config/project';
+import { initialize, loadProject } from '../config/project';
 import { doctor, Options } from '../services/doctor';
 import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
 import { infrastructureRoot, LABELS } from '../services/workspace';
+import { runCompleteAudit } from '../audit/orchestrator';
 
 export function registerCommands(program: Command): void {
-  program.command('init').description('Create a local project config and .perflens working directories; never overwrite')
-    .action(async () => { console.log(`Created ${await initialize()}\nCreated .perflens/{runs,results,logs}. No application source was modified.`); });
+  program.command('init').description('Guided onboarding for a local backend project; never rewrites application code')
+    .action(async () => {
+      let projectName = 'backend'; let express = false;
+      try {
+        const pkg = JSON.parse(await readFile(join(process.cwd(), 'package.json'), 'utf8'));
+        if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) throw new Error('Expected a JSON object.');
+        projectName = String(pkg.name ?? projectName).split('/').pop() || projectName;
+        express = Boolean(pkg.dependencies?.express || pkg.devDependencies?.express);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`Cannot inspect package.json: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      let baseUrl: string | undefined, endpoint: string | undefined;
+      let existingConfig = false;
+      try { await access(join(process.cwd(), 'perflens.config.json')); existingConfig = true; } catch { /* first initialization */ }
+      if (!existingConfig && stdin.isTTY && stdout.isTTY) {
+        const prompt = createInterface({ input: stdin, output: stdout });
+        try {
+          baseUrl = (await prompt.question(`Local API URL [http://localhost:3000]: `)).trim() || 'http://localhost:3000';
+          endpoint = (await prompt.question('GET endpoint to audit [/health]: ')).trim() || '/health';
+        } finally { prompt.close(); }
+      }
+      const result = await initialize(process.cwd(), { projectName, baseUrl, endpoint });
+      console.log(`${result.created ? 'Created' : 'Found and preserved'} ${result.path}\n${result.created ? 'Created' : 'Verified'} .perflens/{runs,results,logs}. No application source or dependencies were changed.`);
+      console.log(express ? 'Express project detected.' : 'Node project detected where package.json is present; framework support is not inferred.');
+      let bootstrapped = false;
+      for (const file of ['src/perflens-instrumentation.ts', 'src/perflens-instrumentation.js', 'src/instrumentation.ts', 'src/instrumentation.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'index.js', 'server.js']) {
+        try { const source = await readFile(join(process.cwd(), file), 'utf8'); if (/startNodeInstrumentation/.test(source)) { bootstrapped = true; break; } } catch { /* candidate entry file missing */ }
+      }
+      if (bootstrapped) console.log('OpenTelemetry bootstrap reference found in a common entrypoint.');
+      else console.log('Instrumentation is not confirmed. For Express, preload startExpressInstrumentation from @perflens/cli/express-instrumentation before importing Express or database clients. Generic Node apps can use startNodeInstrumentation from @perflens/cli/instrumentation.');
+      console.log('Request tracing excludes /health and /metrics. Choose a representative API route in audit.endpoints before running an audit.');
+      console.log('Next: verify target.baseUrl and audit.endpoints in perflens.config.json, start your API, then run npx perflens audit.');
+    });
   program.command('doctor').description('Check local prerequisites, configuration, ports, and existing infrastructure')
     .action(async () => { if (!await doctor(program.opts<Options>())) process.exitCode = 1; });
-  program.command('audit').description('Run bounded local GET load profiles and store measurements (no root-cause analysis)')
+  program.command('audit').description('Run a bounded local audit, collect telemetry, analyze evidence, and generate reports')
     .option('--profile <names>', 'Comma-separated baseline,normal,peak,stress; default: baseline,normal')
     .action(async (options: { profile?: string }) => {
       const abort = new AbortController();
       const cancel = () => abort.abort();
       process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
-      try { await audit({ ...program.opts<Options>(), ...options }, abort.signal); }
+      try { await runCompleteAudit({ ...program.opts<Options>(), ...options }, abort.signal); }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });
   program.command('runs').description('List local stored audit runs without modifying them')
@@ -43,7 +76,10 @@ export function registerCommands(program: Command): void {
     });
   const infra = program.command('infra').description('Control local audit infrastructure; target application remains separate');
   async function service(): Promise<Infrastructure> {
-    const root = await infrastructureRoot(program.opts<Options>().infraDir);
+    const options = program.opts<Options>();
+    let cwd = process.cwd(), baseUrl = 'http://localhost:3000';
+    try { const project = await loadProject(options.config); cwd = dirname(project.path); baseUrl = project.config.target.baseUrl; } catch { /* `infra` can bootstrap before init using the safe loopback default. */ }
+    const root = await infrastructureRoot(options.infraDir, cwd, baseUrl);
     await assertLocalDocker();
     return new Infrastructure(root);
   }
@@ -57,6 +93,7 @@ export function registerCommands(program: Command): void {
       for (const name of ['grafana', 'prometheus']) {
         for (const port of config.services[name].ports ?? []) console.log(`${LABELS[name]}: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       }
+      for (const port of config.services['otel-collector'].ports ?? []) if (Number(port.target) === 4318) console.log(`OTLP HTTP endpoint: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}/v1/traces`);
       for (const port of config.services.tempo.ports ?? []) console.log(`Tempo query API: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       console.log('The target application and its database are started separately.');
     });

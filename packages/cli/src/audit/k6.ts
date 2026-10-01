@@ -1,4 +1,5 @@
 import { join, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { copyFile, writeFile, constants } from 'node:fs/promises';
 import { AuditConfig, durationMs, ProfileName } from './config';
 import { Execute, execute, k6Environment } from './process';
@@ -16,7 +17,9 @@ export class K6Runner {
     return result.stdout.trim();
   }
   async prepare(directory: string): Promise<void> {
-    await copyFile(resolve(__dirname, '../../assets/audit.js'), join(directory, 'load-test.js'), constants.COPYFILE_EXCL);
+    const source = [resolve(__dirname, '../../assets/audit.js'), resolve(__dirname, '../assets/audit.js')].find(existsSync);
+    if (!source) throw new CliError('PerfLens could not locate its packaged k6 workload.', 'Reinstall the complete @perflens/cli package; no load was started.');
+    await copyFile(source, join(directory, 'load-test.js'), constants.COPYFILE_EXCL);
     await writeFile(join(directory, 'k6-options.json'), '{}\n', { flag: 'wx', mode: 0o600 });
   }
   async profile(directory: string, plan: Plan, signal: AbortSignal) {

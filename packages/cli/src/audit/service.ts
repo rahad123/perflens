@@ -56,7 +56,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     dependencies.write('✓ Configuration valid (loopback GET targets only)');
     run.engine.version = await dependencies.runner.version(signal); checkCancelled(signal);
     dependencies.write(`✓ ${run.engine.version}`);
-    metadata.infrastructure = await dependencies.infrastructure(infraDir); checkCancelled(signal);
+    metadata.infrastructure = await dependencies.infrastructure(infraDir, dirname(configPath), config.target.baseUrl); checkCancelled(signal);
     dependencies.write('✓ Collector, Tempo, Prometheus, and Grafana ready');
     for (const endpoint of auditConfig.endpoints) {
       await dependencies.target(config, endpoint, store.id, signal);

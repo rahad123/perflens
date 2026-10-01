@@ -6,9 +6,9 @@ import { Endpoint, targetUrl } from './config';
 export function checkCancelled(signal: AbortSignal): void {
   if (signal.aborted) throw new CliError('Audit cancelled.', 'Evidence collected so far is preserved.', 130);
 }
-export async function checkInfrastructure(infraDir?: string) {
+export async function checkInfrastructure(infraDir?: string, projectDirectory = process.cwd(), baseUrl?: string) {
   await assertLocalDocker();
-  const infra = new Infrastructure(await infrastructureRoot(infraDir));
+  const infra = new Infrastructure(await infrastructureRoot(infraDir, projectDirectory, baseUrl));
   const config = await infra.configuration();
   const states = await infra.status();
   if (!states.every(s => s.ready)) throw new CliError('Audit infrastructure is not ready.', 'Run perflens infra up; inspect perflens infra status before retrying.');

@@ -3,15 +3,18 @@ import { CliError, formatError } from '../utils/errors';
 import { assertLocalDocker, Infrastructure } from './infrastructure';
 import { docker, Runner } from './process';
 import { infrastructureRoot } from './workspace';
+import { K6Runner } from '../audit/k6';
 export interface Options { config?: string; infraDir?: string }
-export async function doctor(options: Options, write: (line: string) => void = console.log, run: Runner = docker): Promise<boolean> {
+export async function doctor(options: Options, write: (line: string) => void = console.log, run: Runner = docker, checkLoadEngine: () => Promise<string> = () => new K6Runner().version(new AbortController().signal)): Promise<boolean> {
   let failures = 0;
   async function check(label: string, fn: () => Promise<unknown>): Promise<boolean> {
     try { await fn(); write(`✓ ${label}`); return true; }
     catch (error) { failures++; write(formatError(error)); return false; }
   }
   write('PerfLens Doctor');
-  await check('Project configuration valid', () => loadProject(options.config));
+  let projectDirectory = process.cwd(), baseUrl = 'http://localhost:3000';
+  await check('Project configuration valid', async () => { const project = await loadProject(options.config); projectDirectory = require('node:path').dirname(project.path); baseUrl = project.config.target.baseUrl; });
+  await check('k6 2.3.x available', async () => { const version = await checkLoadEngine(); if (!/k6 v2\.3\.\d+\b/.test(version)) throw new CliError('Unsupported k6 version.', 'Install k6 2.3.x and ensure it is on PATH.'); return version; });
   const installed = await check('Docker installed', () => run(['--version']));
   let compose = false, daemon = false;
   if (installed) {
@@ -24,7 +27,7 @@ export async function doctor(options: Options, write: (line: string) => void = c
     });
   }
   let root: string | undefined;
-  await check('PerfLens infrastructure files found', async () => { root = await infrastructureRoot(options.infraDir); });
+  await check('PerfLens infrastructure assets available', async () => { root = await infrastructureRoot(options.infraDir, projectDirectory, baseUrl); });
   if (root && compose) {
     const infra = new Infrastructure(root, run);
     await check('Compose configuration valid', async () => {

@@ -1,4 +1,4 @@
-import { AnalysisEvidence, AnalysisResult, analyzeEvidence, validateEvidence } from '@perflens/analysis-engine';
+import { AnalysisEvidence, AnalysisResult, analyzeEvidence, validateEvidence } from '../../../analysis-engine/dist';
 import { readdir, readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { loadProject } from '../config/project';
@@ -56,7 +56,8 @@ async function loadCompletedProfiles(directory: string, run: RunRecord) {
   return results;
 }
 async function tempoUrl(options: AnalyzeOptions): Promise<string> {
-  const root = await infrastructureRoot(options.infraDir);
+  const project = await loadProject(options.config);
+  const root = await infrastructureRoot(options.infraDir, dirname(project.path), project.config.target.baseUrl);
   const config = await new Infrastructure(root).configuration();
   const binding = config.services.tempo?.ports?.find(port => port.published);
   if (!binding || !['127.0.0.1', '::1'].includes(binding.host_ip ?? '')) throw new CliError('Tempo query API is not exposed on loopback.', 'Configure TEMPO_PORT in .env and run perflens infra up.');

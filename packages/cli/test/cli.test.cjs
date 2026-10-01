@@ -6,7 +6,7 @@ const { tmpdir } = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { validateConfig, loadProject, initialize } = require('../dist/config/project');
 const { Infrastructure, parseContainers, assertLocalDocker } = require('../dist/services/infrastructure');
-const { INFRA_SERVICES } = require('../dist/services/workspace');
+const { INFRA_SERVICES, installInfrastructureAssets, infrastructureRoot } = require('../dist/services/workspace');
 const { doctor } = require('../dist/services/doctor');
 const { CliError, formatError } = require('../dist/utils/errors');
 const { docker } = require('../dist/services/process');
@@ -70,22 +70,50 @@ test('config discovery searches parents, explicit paths work, malformed/missing 
 test('init is create-only and never changes application files', async t => {
   const dir = await fixture(t); const empty = join(dir, 'new-target'); await mkdir(empty);
   await writeFile(join(empty, 'package.json'), '{"private":true}');
-  await initialize(empty);
+  const first = await initialize(empty);
+  assert.equal(first.created, true);
   for (const folder of ['runs', 'results', 'logs']) await access(join(empty, '.perflens', folder));
   assert.equal(await readFile(join(empty, 'package.json'), 'utf8'), '{"private":true}');
+  const custom = JSON.parse(await readFile(join(empty, 'perflens.config.json'), 'utf8'));
+  custom.target.baseUrl = 'http://localhost:4310'; custom.audit.endpoints[0].path = '/api/orders';
+  await writeFile(join(empty, 'perflens.config.json'), JSON.stringify(custom, null, 2));
   const before = await readFile(join(empty, 'perflens.config.json'), 'utf8');
-  await assert.rejects(initialize(empty), /already exists/);
+  const repeated = await initialize(empty, { baseUrl: 'http://localhost:9999', endpoint: '/replace-me' });
+  assert.equal(repeated.created, false); assert.equal(repeated.projectName, 'new-target');
   assert.equal(await readFile(join(empty, 'perflens.config.json'), 'utf8'), before);
+});
+test('installed infrastructure assets are package-relative, project-local, secret-free, and target the configured local metrics port', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-assets-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const root = await installInfrastructureAssets(dir, 'http://localhost:4567');
+  assert.equal(root, join(dir, '.perflens', 'infra'));
+  const composeText = await readFile(join(root, 'docker-compose.yml'), 'utf8');
+  assert.match(composeText, /name: perflens-[a-f0-9]{10}/);
+  assert.doesNotMatch(composeText, /__PERFLENS_COMPOSE_NAME__/);
+  const prometheus = await readFile(join(root, 'prometheus.yml'), 'utf8');
+  assert.match(prometheus, /host\.docker\.internal:4567/);
+  assert.ok(!prometheus.includes('__PERFLENS_'));
+  assert.match(await readFile(join(root, 'grafana/dashboards/perflens-performance.json'), 'utf8'), /histogram_quantile/);
+  assert.doesNotMatch(await readFile(join(root, '.env'), 'utf8'), /PASSWORD|TOKEN|SECRET/i);
+  await installInfrastructureAssets(dir, 'http://localhost:4568');
+  assert.match(await readFile(join(root, 'prometheus.yml'), 'utf8'), /host\.docker\.internal:4568/);
+  assert.equal(await infrastructureRoot(root), root);
 });
 test('doctor succeeds on its own occupied ports, fails on daemon/config/Compose errors with remediation', async t => {
   const dir = await fixture(t); const options = { config: join(dir, 'perflens.config.json'), infraDir: dir };
-  const output = []; assert.equal(await doctor(options, line => output.push(line), fake()), true);
+  const output = []; assert.equal(await doctor(options, line => output.push(line), fake(), async () => 'k6 v2.3.0'), true);
   assert.match(output.join('\n'), /used by this PerfLens/);
   for (const failure of ['info', 'version', 'config']) {
     const output = []; const normal = fake();
     const run = async args => { if (args.includes(failure)) throw new Error('simulated failure'); return normal(args); };
-    assert.equal(await doctor(options, line => output.push(line), run), false);
+    assert.equal(await doctor(options, line => output.push(line), run, async () => 'k6 v2.3.0'), false);
     assert.match(output.join('\n'), /Not ready/); assert.doesNotMatch(output.join('\n'), /Ready to run PerfLens/);
+  }
+});
+test('doctor reports missing or incompatible k6 without hiding the load-test prerequisite', async t => {
+  const dir = await fixture(t); const options = { config: join(dir, 'perflens.config.json'), infraDir: dir };
+  for (const check of [async () => { throw new CliError('PerfLens could not find k6.', 'Install k6 2.3.x.'); }, async () => 'k6 v1.2.3']) {
+    const output = []; assert.equal(await doctor(options, line => output.push(line), fake(), check), false);
+    assert.match(output.join('\n'), /k6/); assert.match(output.join('\n'), /Not ready/);
   }
 });
 test('missing Docker produces a useful CLI failure, not an unhandled stack', async t => {
