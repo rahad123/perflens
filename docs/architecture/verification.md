@@ -682,6 +682,20 @@ Phase 4 checks: `pnpm install --frozen-lockfile` completed and its workspace pos
 
 The current machine could not run `pnpm perflens doctor` or `pnpm perflens infra status`: Docker is installed, but its local daemon socket (`~/.orbstack/run/docker.sock`) was unreachable. `docker compose config --quiet` still validated successfully. The report acceptance therefore consumed the actual already-persisted local acceptance runs above; it did not start new containers or claim a fresh API/telemetry round trip during this pass. The stored evidence confirms the measurements and findings listed above, and report generation itself uses only those artifacts.
 
+## Phase 5 — Express and generic Node integration
+
+### Automated checks
+
+`CI=1 pnpm install --frozen-lockfile`, `pnpm build`, `pnpm typecheck`, `pnpm test`, `git diff --check`, and `docker compose --env-file .env.example config --quiet` passed. The complete workspace suite reported **81 tests passed**: 24 analysis-engine, 2 shared Node instrumentation, 41 CLI, 10 reporting, and 4 Express target/instrumentation tests. No lint script is configured. `pnpm perflens --help` and `pnpm perflens --version` passed and continued to list the same framework-neutral commands.
+
+The Express tests exercise health, the clean bounded `/orders` query, the deterministic slow-query shape, the real HTTP dependency call, and a 21-call N+1 sequence (one order-list operation plus 20 identical item operations). A separate child Node process starts the SDK and `ExpressInstrumentation` before requiring Express, then exports spans through an in-memory processor. It observed a server span named `GET /performance/external-call` with `http.route=/performance/external-call`, `http.request.method=GET`, the supplied `perflens.audit.run_id` and `.profile=normal`, and resource attributes `service.name=perflens-test-express`, `service.version=9.8.7`, `deployment.environment=test`. The observed hierarchy was server span → Express request-handler span → HTTP client span; the HTTP client and server spans shared the same trace ID. This verifies route and correlation semantics against the installed instrumentation version without contacting a collector.
+
+### Docker and live-stack limitation
+
+Compose syntax validation passed, but live acceptance could not run. `pnpm perflens doctor` reported Docker installed, Compose available, local endpoint selected, and Compose configuration valid, then failed because the Docker daemon was unreachable. `pnpm perflens infra status` failed with permission denied on `unix:///Users/admin/.orbstack/run/docker.sock`. No fresh Compose build, PostgreSQL-backed Express run, Collector/Tempo export, k6 audit, Phase 3 analysis, Phase 4 report, or NestJS runtime regression is claimed in this verification. PostgreSQL span generation for `pg` and the real four-endpoint audit/report workflow still require rerun after the local daemon is available.
+
+No remote target support or other framework/language integration was added. The only live local trace evidence in this pass is the in-memory HTTP/Express test above; it did not exercise PostgreSQL or Tempo.
+
 ### Phase 4 report security hardening — 2026-09-30
 
 The normalized report model now redacts secret-bearing values while projecting artifacts into the safe model, before Markdown or HTML rendering. Regression coverage includes Bearer and Basic authorization headers, Cookie and Set-Cookie values, PostgreSQL/Postgres/Redis/Rediss URLs with credentials, HTTP/HTTPS username-password URLs, `api_key`, `access_token`, `password`, `secret`, and `token` query parameters, and SQL string literals containing email/token values. A `PERFLENS_TEST_SECRET_7f93a1` sentinel placed across run metadata, profile workload/metrics, finding evidence/metrics, and database/dependency values is asserted absent from the serialized model (the `report.json` content), Markdown, and HTML.
