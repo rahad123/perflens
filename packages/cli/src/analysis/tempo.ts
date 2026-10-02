@@ -1,4 +1,4 @@
-import { normalizeSql, sanitizeDependency, SanitizedSpan } from '@perflens/analysis-engine';
+import { normalizeSql, sanitizeDependency, SanitizedSpan } from '../../../analysis-engine/dist';
 import { CliError } from '../utils/errors';
 
 type Json = Record<string, any>;

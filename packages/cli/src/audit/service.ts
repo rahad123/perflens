@@ -6,7 +6,7 @@ import { loadProject, ProjectConfig } from '../config/project';
 import { CliError } from '../utils/errors';
 import { selectProfiles, ProfileName } from './config';
 import { K6Runner, Plan } from './k6';
-import { checkCancelled, checkInfrastructure, checkTarget } from './preflight';
+import { checkCancelled, checkInfrastructure, checkInstrumentation, checkTarget } from './preflight';
 import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
 export interface AuditOptions { config?: string; infraDir?: string; profile?: string }
@@ -15,9 +15,10 @@ export interface AuditDependencies {
   runner: Pick<K6Runner, 'version' | 'prepare' | 'profile'>;
   infrastructure: typeof checkInfrastructure;
   target: typeof checkTarget;
+  instrumentation: typeof checkInstrumentation;
   write: (line: string) => void;
 }
-const defaults: AuditDependencies = { runner: new K6Runner(), infrastructure: checkInfrastructure, target: checkTarget, write: console.log };
+const defaults: AuditDependencies = { runner: new K6Runner(), infrastructure: checkInfrastructure, target: checkTarget, instrumentation: checkInstrumentation, write: console.log };
 export async function audit(options: AuditOptions, signal = new AbortController().signal, dependencies: AuditDependencies = defaults) {
   const selected = selectProfiles(options.profile);
   const loaded = await loadProject(options.config);
@@ -56,12 +57,15 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     dependencies.write('✓ Configuration valid (loopback GET targets only)');
     run.engine.version = await dependencies.runner.version(signal); checkCancelled(signal);
     dependencies.write(`✓ ${run.engine.version}`);
-    metadata.infrastructure = await dependencies.infrastructure(infraDir); checkCancelled(signal);
+    metadata.infrastructure = await dependencies.infrastructure(infraDir, dirname(configPath), config.target.baseUrl); checkCancelled(signal);
     dependencies.write('✓ Collector, Tempo, Prometheus, and Grafana ready');
+    dependencies.write(`OTLP traces endpoint: ${metadata.infrastructure.otlpTracesEndpoint}`);
     for (const endpoint of auditConfig.endpoints) {
       await dependencies.target(config, endpoint, store.id, signal);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
     }
+    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal);
+    dependencies.write('✓ Correlated OpenTelemetry traces verified before load');
     await dependencies.runner.prepare(store.directory);
     await store.write('raw/engine.json', { schemaVersion: 1, ...run.engine, scriptSha256: createHash('sha256').update(await readFile(join(store.directory, 'load-test.js'))).digest('hex') });
     run.status = 'running'; await save();

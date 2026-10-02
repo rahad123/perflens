@@ -1,10 +1,15 @@
 {
   "name": "@perflens/cli",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "description": "Backend Performance Audit CLI",
   "bin": {
     "perflens": "bin/perflens.cjs"
+  },
+  "exports": {
+    ".": "./dist/perflens.js",
+    "./instrumentation": { "types": "./dist/instrumentation.d.ts", "require": "./dist/instrumentation.cjs", "default": "./dist/instrumentation.cjs" },
+    "./express-instrumentation": { "types": "./dist/express-instrumentation.d.ts", "require": "./dist/express-instrumentation.cjs", "default": "./dist/express-instrumentation.cjs" }
   },
   "files": [
     "bin",
@@ -15,17 +20,26 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm --filter @perflens/analysis-engine build && pnpm --filter @perflens/reporting build && pnpm --filter @perflens/node-instrumentation build && tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/perflens.js --external:commander --external:@opentelemetry/* && esbuild ../node-instrumentation/src/index.ts --bundle --platform=node --format=cjs --outfile=dist/instrumentation.cjs --external:@opentelemetry/* && esbuild ../node-instrumentation/src/express.ts --bundle --platform=node --format=cjs --outfile=dist/express-instrumentation.cjs --external:@opentelemetry/* && cp ../node-instrumentation/dist/index.d.ts dist/instrumentation.d.ts && sed \"s|from './index'|from './instrumentation'|\" ../node-instrumentation/dist/express.d.ts > dist/express-instrumentation.d.ts",
+    "prepack": "pnpm build",
     "typecheck": "tsc --noEmit",
     "test": "pnpm build && node --test test/*.test.cjs"
   },
   "dependencies": {
-    "@perflens/analysis-engine": "workspace:*",
-    "@perflens/reporting": "workspace:*",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/exporter-trace-otlp-http": "0.222.0",
+    "@opentelemetry/instrumentation": "0.222.0",
+    "@opentelemetry/instrumentation-express": "0.70.0",
+    "@opentelemetry/instrumentation-http": "0.222.0",
+    "@opentelemetry/instrumentation-pg": "0.74.0",
+    "@opentelemetry/resources": "2.11.0",
+    "@opentelemetry/sdk-node": "0.222.0",
+    "@opentelemetry/sdk-trace": "2.11.0",
     "commander": "15.0.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "0.25.5",
     "typescript": "~5.9.2"
   }
 }

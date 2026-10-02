@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+  - job_name: perflens-target
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["__PERFLENS_METRICS_HOST__:__PERFLENS_METRICS_PORT__"]
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

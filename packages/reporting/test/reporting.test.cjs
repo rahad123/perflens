@@ -39,7 +39,24 @@ test('zero-finding runs remain valid and produce conservative report language', 
   const model = build();
   assert.equal(model.findingsSummary.total, 0);
   assert.match(renderMarkdown(model), /No evidence-backed performance bottleneck met the configured detection thresholds/);
-  assert.match(renderHtml(model), /No evidence-backed performance bottleneck met the configured detection thresholds/);
+  const html = renderHtml(model);
+  assert.match(html, /No evidence-backed performance bottleneck met the configured detection thresholds/);
+  assert.match(html, /<svg[^>]+aria-label="p50, p95, and p99 latency by load profile"/);
+  assert.match(html, /Latency by profile/);
+  assert.match(html, /p99/);
+});
+
+test('HTML comparison visualizations use only measured percentiles and conditionally show component evidence', () => {
+  const model = build(fixture({ findings: [finding({ category: 'dependency', title: 'External dependency latency', evidence: [{ observation: '75% contribution in 12 traces', source: 'Tempo' }] })] }));
+  const html = renderHtml(model);
+  assert.match(html, /75% contribution in 12 traces/);
+  assert.match(html, /External dependency evidence/);
+  assert.doesNotMatch(html, /Database evidence/);
+  assert.match(html, /width="710\.00"/);
+  const escaped = renderHtml(build(fixture({ findings: [finding({ title: '<svg onload=alert(1)>', summary: '<script>owned</script>' })] })));
+  assert.match(escaped, /&lt;svg onload=alert\(1\)&gt;/);
+  assert.match(escaped, /&lt;script&gt;owned&lt;\/script&gt;/);
+  assert.doesNotMatch(escaped, /<script>owned<\/script>/);
 });
 
 test('redacts adversarial credentials, cookie values, database/dependency URLs, query secrets, and SQL literals at model construction', () => {

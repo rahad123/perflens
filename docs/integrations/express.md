@@ -1,53 +1,63 @@
-# Express integration
+# Use PerfLens with an existing Express project
 
-The Express demo is a reference **target application**, not part of the PerfLens analysis engine. It demonstrates the existing audit → analyze → report workflow with another Node.js framework. The only verified framework targets in this repository are NestJS and Express; this does not imply support for every Node.js framework.
+PerfLens installs into the backend project you want to audit. The demo APIs and monorepo are not runtime requirements.
 
-## Prerequisites and startup
+## Requirements
 
-Use the root `.env.example` for local PostgreSQL credentials and image versions, and run all published services only on loopback. Docker with a local daemon, Docker Compose, Node.js/pnpm for workspace commands, and k6 for audits are required.
+- Node.js 22.12 or newer
+- Docker with a local daemon and Docker Compose
+- k6 2.3.x on `PATH`
+- An Express app that you can start on a loopback address
+- An application-owned database if the app needs one
 
-```sh
-cp .env.example .env
-pnpm install --frozen-lockfile
-pnpm build
-pnpm perflens infra up
-docker compose --profile express up -d --build express-demo-api
-curl http://localhost:3003/health
-```
-
-The target is an opt-in Compose profile. It shares the existing PostgreSQL and OTel Collector services, binds its API to `127.0.0.1:${EXPRESS_API_PORT:-3003}`, and identifies itself as `perflens-express-demo-api`. It creates the same deterministic local data used by the NestJS demo if the database is empty. Both seeders use a PostgreSQL advisory lock to serialize initial seeding.
-
-If `EXPRESS_API_PORT` is changed in `.env`, update `target.baseUrl` in this app's `perflens.config.json` to the same loopback port.
-
-## Instrumentation bootstrap
-
-`packages/node-instrumentation` contains framework-neutral NodeSDK resource, OTLP, HTTP, PostgreSQL, and correlation setup. `apps/express-demo-api/src/instrumentation.ts` opts into `ExpressInstrumentation`; the generic bootstrap itself does not depend on Express. The container preloads the compiled instrumentation entry using Node's `--require` before `main.js` loads Express or `pg`. Keep this startup ordering when launching the app outside Compose:
+Install from the consumer project directory:
 
 ```sh
-node --require apps/express-demo-api/dist/instrumentation.js apps/express-demo-api/dist/main.js
+npm install -D @perflens/cli
 ```
 
-The generic bootstrap sets `service.name`, `service.version`, and `deployment.environment`, exports traces to the configured local OTLP endpoint, and instruments HTTP and PostgreSQL. Express instrumentation adds framework route-layer context; audit analysis still consumes server/client span kinds, semantic HTTP/database attributes, timing, and correlation rather than Express internals.
+The normal first-use command is `npx perflens audit`. In an interactive terminal it asks for the target base URL and representative GET endpoint, then creates configuration through the same create-only service as optional `npx perflens init`. Existing configuration is validated and reused without prompts or overwriting. Non-interactive first use requires an existing `perflens.config.json`; PerfLens will not guess a target route. Express is reported as detected only when listed in package dependencies. Setup writes configuration and `.perflens/{runs,results,logs}` only; it does not add dependencies or edit source files.
 
-## Configuration and workflow
+## Start instrumentation before Express and database imports
 
-`apps/express-demo-api/perflens.config.json` is an example using the existing PerfLens JSON configuration model. It targets only `http://localhost:3003`; the CLI's local-target safety validation remains unchanged.
+Create a small preload module such as `src/perflens-instrumentation.ts`:
+
+```ts
+import { startExpressInstrumentation } from '@perflens/cli/express-instrumentation';
+
+startExpressInstrumentation({
+  serviceName: process.env.OTEL_SERVICE_NAME ?? 'my-api',
+  serviceVersion: '1.0.0',
+  environment: 'local',
+});
+```
+
+Compile that file with the application and preload it before the server entrypoint imports Express, `pg`, TypeORM, or other instrumented modules:
 
 ```sh
-pnpm perflens --config apps/express-demo-api/perflens.config.json doctor
-pnpm perflens --config apps/express-demo-api/perflens.config.json audit --profile baseline,normal
-pnpm perflens --config apps/express-demo-api/perflens.config.json analyze
-pnpm perflens --config apps/express-demo-api/perflens.config.json report
+OTEL_SERVICE_NAME=my-api node --require ./dist/perflens-instrumentation.js ./dist/server.js
 ```
 
-Change the configured endpoint path to one of the explicit performance fixtures when needed. `GET /orders` is a bounded database read without intentional delay. The three `/performance/*` routes are intentional fixtures solely for local analysis. They are not production examples.
+The package adapter enables the generic Node HTTP and PostgreSQL instrumentation plus Express route instrumentation. At startup it reads the selected `OTLP_HTTP_PORT` from the nearest `.perflens/infra/.env` and sets the standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` variable before constructing the exporter. It does not fall back to the SDK's default port when project infrastructure selected another port. If an existing `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` conflicts with the selected local endpoint, bootstrap fails with both the mismatch and the expected URL. `perflens init`, `doctor`, `infra up`, and `audit` print this same endpoint. Apps using their own OpenTelemetry SDK can set the printed URL directly in `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. PerfLens does not capture arbitrary headers or request bodies.
 
-## Correlation and privacy
+The `serviceName` passed to instrumentation must match `observability.serviceName` in `perflens.config.json`. PerfLens adds `X-PerfLens-Run-Id` and `X-PerfLens-Profile` to audit requests. The instrumentation maps valid values to `perflens.audit.run_id` and `perflens.audit.profile`; they are correlation metadata, never authorization. OpenTelemetry continues to create and propagate trace IDs.
 
-Audit requests retain the existing `X-PerfLens-Run-Id` and `X-PerfLens-Profile` contract. The shared HTTP hook maps valid values to `perflens.audit.run_id` and `perflens.audit.profile`; run IDs and profile names are allowlisted and length-bounded. They are observability metadata, never authorization. OpenTelemetry creates and propagates trace IDs normally. Tempo analysis filters by service, run, profile, and time window.
+## Metrics and dashboard
 
-Only those two PerfLens headers are copied to span attributes. Authorization, Cookie, arbitrary headers, bodies, and unbounded values are not captured by this integration. PostgreSQL enhanced statement reporting is disabled; existing SQL normalization/privacy handling remains in the CLI evidence path.
+The packaged Prometheus configuration scrapes the configured local target at `/metrics`. The Grafana dashboard uses the verified `perflens_http_requests_total` and `perflens_http_request_duration_seconds` metric names. If your app does not expose those metrics, its scrape target may be down or those panels may have no data; tracing and k6 measurements still work. PerfLens does not install a metrics library into your app.
 
-## Known limits
+## Run the audit
 
-This target uses PostgreSQL and local synthetic data. The external-call fixture makes a real HTTP request to a latency simulator bound to the app container's loopback interface. Trace attribute details must be checked against the installed OpenTelemetry instrumentation versions; framework integrations and route instrumentation not verified here should not be assumed supported. Only loopback auditing is allowed. No remote targets, automatic instrumentation edits, or other language/framework integrations are included.
+Start your application and its database first, then run:
+
+```sh
+npx perflens audit
+```
+
+Before k6 load, audit sends a single correlated preflight request and checks Tempo for the matching service/run/profile server span. If it cannot find that trace, it stops before load and prints the supported instrumentation setup. Once verified, it starts missing local Collector/Tempo/Prometheus/Grafana services, reuses healthy infrastructure on later runs, executes the configured bounded baseline and normal profiles by default, analyzes correlated traces, and writes a report. It prints profile measurements, Phase 3 findings, telemetry coverage, the Grafana URL, and the HTML report path.
+
+Findings and reports are stored under `.perflens/runs/<run-id>/`. The HTML report is `report/report.html`; JSON and Markdown versions are beside it. To inspect the raw trace in Grafana, open Explore → Tempo and filter `perflens.audit.run_id` by the printed run ID. Prometheus is available from the URL printed by PerfLens. Advanced commands `perflens analyze <run-id>`, `perflens analyze <run-id> --offline`, `perflens report <run-id>`, and `perflens infra status|down` remain available.
+
+## Limits and safety
+
+Only loopback HTTP(S) targets are accepted. Profiles are bounded; peak and stress are not run by default. Use the tool only against systems you own or are authorized to test. PerfLens starts no target app or database, resets no data, and does not stop infrastructure on audit completion. The generated dashboard depends on the documented metrics being present. Only the Node instrumentation and Express integration path are documented here; other frameworks and languages are not claimed as supported.

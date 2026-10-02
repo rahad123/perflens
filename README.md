@@ -1,8 +1,8 @@
 # PerfLens
 
-## Backend Performance Audit CLI / Developer Toolkit
+## Backend Performance Audit CLI
 
-PerfLens measures backend performance under controlled load, correlates measurements with local OpenTelemetry traces, and produces explainable findings from saved evidence. This repository is an early developer-toolkit foundation, not a hosted platform. The NestJS and Express applications are separate test targets; PerfLens core is the CLI and reusable analysis engine.
+PerfLens is an installable developer toolkit for measuring backend performance under controlled local load, correlating results with OpenTelemetry traces, identifying evidence-backed bottlenecks, and generating an audit report. Install it into the backend you want to test; the PerfLens monorepo and reference applications are not required at runtime.
 
 ## What problem does it solve?
 
@@ -16,8 +16,8 @@ The audit command records what happened. The analysis command looks for specific
 
 ## Current capabilities
 
-- Local CLI commands: `doctor`, `infra`, `audit`, `runs`, `analyze`, and `report`.
-- Existing Docker-based OpenTelemetry Collector, Tempo, Prometheus, and Grafana stack, controlled by the CLI.
+- Installable `@perflens/cli` with project-local infrastructure assets and a framework-neutral audit command.
+- Docker-based OpenTelemetry Collector, Tempo, Prometheus, and Grafana, provisioned by the installed CLI.
 - k6-based bounded, concurrent profiles and immutable run directories.
 - Run/profile correlation headers for targets that capture the documented OpenTelemetry attributes.
 - Deterministic analysis of completed results and sanitized, correlated traces; Markdown and HTML audit reports from persisted findings.
@@ -29,7 +29,7 @@ Phase 3 analysis currently supports measured latency, error-rate, and throughput
 
 ## Intended workflow
 
-The long-term developer experience is an installable package (`npm install -D @perflens/cli`, followed by `npx perflens init`, `doctor`, and `audit`). This source checkout currently provides the local pnpm workspace workflow below. `init` creates a minimal configuration; it does not instrument or edit application source.
+The normal consumer workflow is `npm install -D @perflens/cli` followed by `npx perflens audit`. On first interactive use, audit asks for the local target URL and representative GET route and creates configuration without modifying application code or dependencies. `npx perflens init` remains available for explicit setup. For Express, initialize PerfLens instrumentation before Express and database modules as described in [the consumer integration guide](docs/integrations/express.md).
 
 ## Architecture
 
@@ -46,61 +46,53 @@ flowchart LR
   Tempo --> Grafana
   CLI -->|analyze completed run| Engine[Analysis engine]
   Engine -->|sanitized evidence + findings| Run[.perflens/runs]
-  CLI -->|infra up/status/down| Collector
+  CLI -->|start/reuse local infra| Collector
+  CLI -->|summarize| Report[Terminal summary + HTML report]
 ```
 
 ## CLI commands
 
 ```sh
-pnpm perflens --help
-pnpm perflens --version
-pnpm perflens doctor
-pnpm perflens infra up
-pnpm perflens infra status
-pnpm perflens audit
-pnpm perflens audit --profile baseline,normal
-pnpm perflens runs
-pnpm perflens analyze
-pnpm perflens analyze <run-id>
-pnpm perflens analyze <run-id> --offline
-pnpm perflens report
-pnpm perflens report <run-id>
-pnpm perflens report <run-id> --format markdown
-pnpm perflens infra down
+npx perflens --help
+npx perflens --version
+npx perflens init
+npx perflens doctor
+npx perflens audit
+npx perflens audit --profile baseline,normal
+npx perflens runs
+npx perflens analyze <run-id> --offline
+npx perflens report <run-id> --format markdown
+npx perflens infra status
+npx perflens infra down
 ```
 
-`analyze` selects the latest completed run by default. The first analysis queries local Tempo for the run/profile windows and writes a sanitized `analysis/evidence.json` snapshot. Later analyses reuse that snapshot; `--offline` explicitly requires it and never contacts Tempo. Analysis never starts a load test.
+`npx perflens audit` validates the configured loopback target, starts missing local audit infrastructure while reusing services already running for that project, runs the configured bounded profiles, analyzes correlated Tempo evidence, and generates all report formats. It prints actual profile measurements, Phase 3 findings, trace counts, Grafana access, and the HTML report path. If telemetry is missing, analysis fails explicitly and keeps the measured run artifacts for review.
 
-`report` selects the latest completed run with valid Phase 3 analysis by default. It never starts an audit, reruns analysis, or queries Tempo. The default `all` format writes `report.json`, `report.md`, and `report.html` under `.perflens/runs/<run-id>/report/`. Use `--format markdown` or `--format html` to select one rendered format; the normalized JSON model is always saved. Run `perflens analyze <run-id>` first when analysis is missing.
+Advanced commands remain separate: `analyze` selects the latest completed run by default, snapshots sanitized traces from local Tempo once, and supports offline reruns. `report` consumes saved analysis only and writes `report.json`, `report.md`, and `report.html` under `.perflens/runs/<run-id>/report/`; it never starts a load test or analysis.
 
 ## Quick start
 
-Prerequisites: Docker with a local daemon, Docker Compose, Node.js 22.12+, pnpm 10, and k6 2.3.x on `PATH` for audits. Docker and Compose are needed for infrastructure operations and first-time trace collection.
+Prerequisites: Node.js 22.12+, Docker with a local daemon and Docker Compose, plus k6 2.3.x on `PATH` for audits. The installed tool binds infrastructure to loopback and retains data in local named volumes.
 
 ```sh
-pnpm install --frozen-lockfile
-cp .env.example .env
-pnpm build
-pnpm perflens doctor
-pnpm perflens infra up
-docker compose up -d --build postgres demo-api
-pnpm perflens audit
-pnpm perflens analyze
+npm install -D @perflens/cli
+# Instrument your app using docs/integrations/express.md, then start it.
+npx perflens audit
 ```
 
-The Compose stack and its published ports bind to loopback. If a configured port is occupied, change the corresponding port in `.env` (including `TEMPO_PORT`) before starting infrastructure. `perflens infra down` stops only the Collector, Tempo, Prometheus, and Grafana; volumes and the target are preserved.
+On the first interactive audit, PerfLens asks for the local API URL and a representative GET endpoint, then creates configuration through the same create-only initialization service used by `perflens init`. It prepares local infrastructure, verifies a correlated OpenTelemetry request trace before starting k6, and runs the complete audit → analyze → report workflow. It never changes application source code or installs dependencies. Existing valid configuration is reused without prompting or rewriting. In non-interactive use, provide configuration before the audit; PerfLens will not guess a target route. `perflens init` remains available as optional explicit setup and debugging. The Node instrumentation package reads the selected project-local OTLP port and configures `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` before creating its exporter. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
 
 ### Local URLs
 
 | Service | URL |
 | --- | --- |
-| Demo API | `http://localhost:3002` |
-| Express reference API (opt-in) | `http://localhost:3003` |
-| API health (includes PostgreSQL check) | `http://localhost:3002/health` |
-| API metrics | `http://localhost:3002/metrics` |
-| Grafana | `http://localhost:3001` |
-| Prometheus | `http://localhost:9090` |
-| Tempo query API (CLI use) | `http://localhost:3200` |
+| Example local target | `http://localhost:3000` (set during init) |
+| Grafana | `http://localhost:3001` (actual selected URL is printed) |
+| Prometheus | `http://localhost:9090` (actual selected URL is printed) |
+| Tempo query API | `http://localhost:3200` (actual selected URL is printed) |
+| OTLP HTTP receiver | Selected loopback endpoint is printed by init, doctor, infra up, and audit; the Node bootstrap configures it automatically. |
+
+Grafana provisions the **PerfLens — Local API Performance** dashboard with request rate, 4xx/5xx rate, and p50/p95/p99 latency queries over the standard `perflens_http_*` metrics. The dashboard has data only when the target exposes those metrics. In Grafana → Explore → Tempo, query the run using `{ resource.service.name = "<service-name>" && span.perflens.audit.run_id = "<run-id>" }`.
 
 ### Demo target endpoints
 

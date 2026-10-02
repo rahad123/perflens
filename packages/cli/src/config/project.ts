@@ -49,15 +49,32 @@ export async function loadProject(file?: string, cwd = process.cwd()): Promise<{
     }
   }
 }
-export async function initialize(cwd = process.cwd()): Promise<string> {
-  const projectName = basename(resolve(cwd)).replace(/[^a-zA-Z0-9._-]/g, '-').replace(/^[^a-zA-Z0-9]+/, '').slice(0, 100) || 'backend';
-  const config: ProjectConfig = { project: { name: projectName }, target: { baseUrl: 'http://localhost:3000' }, observability: { serviceName: projectName }, audit: validateAudit({ endpoints: [{ method: 'GET', path: '/' }] }) };
-  const path = join(cwd, CONFIG_NAME);
-  try { await writeFile(path, JSON.stringify(config, null, 2) + '\n', { flag: 'wx' }); }
+/** Returns null only when no config exists; malformed configs remain fatal. */
+export async function findProject(file?: string, cwd = process.cwd()): Promise<{ path: string; config: ProjectConfig } | null> {
+  try { return await loadProject(file, cwd); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError(`${CONFIG_NAME} already exists.`, 'Existing configuration was preserved. Edit it explicitly if needed.', 2);
+    if (error instanceof CliError && error.message === 'PerfLens project configuration was not found.') return null;
     throw error;
   }
-  for (const folder of ['runs', 'results', 'logs']) await mkdir(join(cwd, '.perflens', folder), { recursive: true });
-  return path;
+}
+export async function initialize(cwd = process.cwd(), options: { baseUrl?: string; endpoint?: string; projectName?: string } = {}): Promise<{ path: string; created: boolean; projectName: string }> {
+  let packageName: string | undefined;
+  try { packageName = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf8')).name; } catch { /* package.json is optional */ }
+  const projectName = name(options.projectName ?? (typeof packageName === 'string' ? packageName.split('/').pop() : undefined) ?? (basename(resolve(cwd)).replace(/[^a-zA-Z0-9._-]/g, '-').replace(/^[^a-zA-Z0-9]+/, '').slice(0, 100) || 'backend'), 'project.name');
+  const config: ProjectConfig = { project: { name: projectName }, target: { baseUrl: options.baseUrl ?? 'http://localhost:3000' }, observability: { serviceName: projectName }, audit: validateAudit({ endpoints: [{ method: 'GET', path: options.endpoint ?? '/health' }] }) };
+  const path = join(cwd, CONFIG_NAME);
+  let created = false;
+  let selectedName = projectName;
+  try { await writeFile(path, JSON.stringify(config, null, 2) + '\n', { flag: 'wx', mode: 0o600 }); created = true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const existing = await loadProject(path, cwd);
+    selectedName = existing.config.project.name;
+  }
+  try {
+    for (const folder of ['runs', 'results', 'logs']) await mkdir(join(cwd, '.perflens', folder), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    throw new CliError('PerfLens config was created, but its working directories could not be prepared.', error instanceof Error ? error.message : 'Check local filesystem permissions.', 1);
+  }
+  return { path, created, projectName: selectedName };
 }

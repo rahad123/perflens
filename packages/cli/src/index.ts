@@ -5,7 +5,7 @@ const { version } = require('../package.json') as { version: string };
 const program = new Command();
 program.name('perflens').description('PerfLens — Backend Performance Audit CLI').version(version)
   .option('--config <path>', 'Path to perflens.config.json (otherwise search current directory and parents)')
-  .option('--infra-dir <path>', 'PerfLens checkout containing the existing Docker Compose infrastructure')
+  .option('--infra-dir <path>', 'Local PerfLens infrastructure directory (normally managed from .perflens/infra)')
   .showHelpAfterError().exitOverride();
 registerCommands(program);
 void program.parseAsync().catch(error => {

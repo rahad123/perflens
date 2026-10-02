@@ -10,7 +10,7 @@ const { completedEvidenceError, normalize, readSamples } = require('../dist/audi
 const { execute, k6Environment } = require('../dist/audit/process');
 const { K6Runner } = require('../dist/audit/k6');
 const { audit } = require('../dist/audit/service');
-const { checkTarget } = require('../dist/audit/preflight');
+const { checkTarget, checkInstrumentation } = require('../dist/audit/preflight');
 const { CliError } = require('../dist/utils/errors');
 const base = { project: { name: 'test' }, target: { baseUrl: 'http://127.0.0.1:3002' }, observability: { serviceName: 'test' } };
 const config = { ...base, audit: { endpoints: [{ method: 'GET', path: '/orders' }] } };
@@ -38,7 +38,7 @@ function fakeDependencies(extra = {}) {
       return { code: 0, signal: null, timedOut: false, cancelled: false, stdout: '' };
     },
   };
-  return { runner, infrastructure: async () => ({ composeProject: 'test', readiness: [], localUrls: {} }), target: async () => {}, write: () => {}, ...extra };
+  return { runner, infrastructure: async () => ({ composeProject: 'test', readiness: [], localUrls: { tempo: 'http://127.0.0.1:3200' } }), target: async () => {}, instrumentation: async () => {}, write: () => {}, ...extra };
 }
 async function project(dir) { const path = join(dir, 'perflens.config.json'); await writeFile(path, JSON.stringify(config)); return path; }
 async function stored(dir) { const runs = await listRuns(dir); return JSON.parse(await readFile(join(dir, '.perflens/runs', runs[0].id, 'run.json'))); }
@@ -131,6 +131,24 @@ test('target preflight sends correlation without redirects, rejects non-2xx, and
     assert.equal(cancelled, 2);
     global.fetch = async () => { throw new Error('sensitive transport detail'); };
     await assert.rejects(checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal), error => /Target preflight failed/.test(error.message) && !error.message.includes('sensitive'));
+  } finally { global.fetch = original; }
+});
+test('instrumentation preflight requires the correlated Tempo server span before k6 starts', async t => {
+  const dir = await temp(t), path = await project(dir); let profilesStarted = false;
+  const deps = fakeDependencies({ instrumentation: async () => { throw new CliError('Target is reachable but no correlated span exists.', 'Add the bootstrap. No load was started.'); } });
+  deps.runner.profile = async () => { profilesStarted = true; throw new Error('k6 must not start'); };
+  await assert.rejects(audit({ config: path }, undefined, deps), /no correlated span/);
+  assert.equal(profilesStarted, false);
+  assert.equal((await stored(dir)).status, 'failed');
+});
+test('Tempo instrumentation probe is run/profile scoped and accepts a real correlated trace', async () => {
+  const original = global.fetch; let query;
+  global.fetch = async url => { query = new URL(url); return { ok: true, json: async () => ({ traces: [{ traceID: 'abc' }] }) }; };
+  try {
+    await checkInstrumentation('http://127.0.0.1:3200', 'service-a', 'run-a', new AbortController().signal, { attempts: 1, intervalMs: 0, timeoutMs: 1000 });
+    assert.deepEqual(query.searchParams.getAll('tags'), ['service.name=service-a', 'perflens.audit.run_id=run-a', 'perflens.audit.profile=preflight']);
+    global.fetch = async () => ({ ok: true, json: async () => ({ traces: [] }) });
+    await assert.rejects(checkInstrumentation('http://127.0.0.1:3200', 'service-a', 'run-b', new AbortController().signal, { attempts: 1, intervalMs: 0, timeoutMs: 1000 }), /could not find its correlated OpenTelemetry server span/);
   } finally { global.fetch = original; }
 });
 test('failed k6 preserves completed profiles and failure evidence, never completing the audit', async t => {

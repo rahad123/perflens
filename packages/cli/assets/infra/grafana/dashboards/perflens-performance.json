@@ -1,0 +1,39 @@
+{
+  "uid": "perflens-performance",
+  "title": "PerfLens — Local API Performance",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (method, route) (rate(perflens_http_requests_total[1m]))", "legendFormat": "{{method}} {{route}}" }]
+    },
+    {
+      "id": 2,
+      "title": "Request errors",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum(rate(perflens_http_requests_total{status_code=~\"4..|5..\"}[1m]))", "legendFormat": "4xx/5xx requests/sec" }]
+    },
+    {
+      "id": 3,
+      "title": "Request latency p50 / p95 / p99",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 9 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(perflens_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(perflens_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(perflens_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    }
+  ]
+}
