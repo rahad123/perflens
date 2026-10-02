@@ -70,6 +70,32 @@ export function configurePerfLensOtlpEndpoint(cwd = process.cwd(), env: NodeJS.P
   return selected;
 }
 
+/** Resolve the consumer's project-local port when a batch is exported. This
+ * covers apps started before the first `perflens audit` creates infra config. */
+export class ProjectOtlpTraceExporter implements SpanExporter {
+  private delegate: SpanExporter | undefined;
+  private delegateUrl: string | undefined;
+  constructor(
+    private readonly cwd = process.cwd(),
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly create: (url?: string) => SpanExporter = url => new OTLPTraceExporter(url ? { url } : undefined),
+  ) {}
+  export(spans: Parameters<SpanExporter['export']>[0], callback: Parameters<SpanExporter['export']>[1]): void {
+    let endpoint: string | undefined;
+    try { endpoint = configurePerfLensOtlpEndpoint(this.cwd, this.env) ?? this.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT; }
+    catch (error) { callback({ code: 1, error: error instanceof Error ? error : new Error(String(error)) }); return; }
+    if (!this.delegate || endpoint !== this.delegateUrl) {
+      const previous = this.delegate;
+      this.delegate = this.create(endpoint);
+      this.delegateUrl = endpoint;
+      if (previous) void previous.shutdown();
+    }
+    this.delegate.export(spans, callback);
+  }
+  async forceFlush(): Promise<void> { await this.delegate?.forceFlush?.(); }
+  async shutdown(): Promise<void> { await this.delegate?.shutdown(); }
+}
+
 /** Start before importing the target application's HTTP framework or database client. */
 export function startNodeInstrumentation(options: NodeInstrumentationOptions = {}): NodeSDK {
   configurePerfLensOtlpEndpoint();
@@ -82,7 +108,7 @@ export function startNodeInstrumentation(options: NodeInstrumentationOptions = {
       'service.version': options.serviceVersion ?? process.env.OTEL_SERVICE_VERSION ?? '0.1.0',
       'deployment.environment': options.environment ?? process.env.DEPLOYMENT_ENVIRONMENT ?? 'local',
     }),
-    traceExporter: options.traceExporter ?? new OTLPTraceExporter(),
+    traceExporter: options.traceExporter ?? new ProjectOtlpTraceExporter(),
     // Metrics are exposed for Prometheus scrape; Collector is traces-only in Phase 1.
     metricReaders: [],
     ...(options.spanProcessors ? { spanProcessors: options.spanProcessors } : {}),

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { mkdtemp, mkdir, writeFile, rm } = require('node:fs/promises');
 const { join } = require('node:path');
 const { tmpdir } = require('node:os');
-const { readPerfLensCorrelation, configurePerfLensOtlpEndpoint } = require('../dist/index.js');
+const { readPerfLensCorrelation, configurePerfLensOtlpEndpoint, ProjectOtlpTraceExporter } = require('../dist/index.js');
 
 const runId = 'pfl_20260930T120000000Z_123e4567-e89b-12d3-a456-426614174000';
 
@@ -38,4 +38,22 @@ test('rejects a conflicting explicit traces endpoint instead of silently exporti
   await mkdir(join(project, '.perflens', 'infra'), { recursive: true });
   await writeFile(join(project, '.perflens', 'infra', '.env'), 'OTLP_HTTP_PORT=4319\n');
   assert.throws(() => configurePerfLensOtlpEndpoint(project, { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://127.0.0.1:4318/v1/traces' }), /does not match this PerfLens project.*4319/);
+});
+
+test('exporter started before first audit switches to the selected project endpoint on export', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'perflens-otel-late-infra-'));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  const endpoints = [], callbacks = [];
+  const exporter = new ProjectOtlpTraceExporter(project, {}, url => {
+    endpoints.push(url);
+    return { export(_spans, callback) { callbacks.push(callback); callback({ code: 0 }); }, shutdown: async () => {} };
+  });
+  exporter.export([], () => {});
+  assert.equal(endpoints[0], undefined);
+  await mkdir(join(project, '.perflens', 'infra'), { recursive: true });
+  await writeFile(join(project, '.perflens', 'infra', '.env'), 'OTLP_HTTP_PORT=4319\n');
+  exporter.export([], () => {});
+  assert.equal(endpoints[1], 'http://127.0.0.1:4319/v1/traces');
+  assert.equal(callbacks.length, 2);
+  await exporter.shutdown();
 });

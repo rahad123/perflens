@@ -8,6 +8,7 @@ const { validateConfig, loadProject, initialize } = require('../dist/config/proj
 const { Infrastructure, parseContainers, assertLocalDocker } = require('../dist/services/infrastructure');
 const { INFRA_SERVICES, installInfrastructureAssets, infrastructureRoot, otlpTracesEndpoint } = require('../dist/services/workspace');
 const { doctor } = require('../dist/services/doctor');
+const { ensureProjectForAudit } = require('../dist/services/onboarding');
 const { CliError, formatError } = require('../dist/utils/errors');
 const { docker } = require('../dist/services/process');
 const bin = resolve(__dirname, '../bin/perflens.cjs');
@@ -82,6 +83,41 @@ test('init is create-only and never changes application files', async t => {
   assert.equal(repeated.created, false); assert.equal(repeated.projectName, 'new-target');
   assert.equal(await readFile(join(empty, 'perflens.config.json'), 'utf8'), before);
 });
+test('first audit setup asks only for target details, creates config through init service, and recognizes Express', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-onboarding-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: '@example/api', dependencies: { express: '^5.0.0' } }));
+  const prompts = [];
+  const result = await ensureProjectForAudit(dir, undefined, async (question, defaultValue) => {
+    prompts.push({ question, defaultValue });
+    return question.includes('base URL') ? 'http://localhost:4567' : '/api/orders';
+  });
+  assert.equal(result.created, true); assert.equal(result.framework, 'express'); assert.deepEqual(prompts.map(p => p.defaultValue), ['http://localhost:3000', undefined]);
+  const saved = await loadProject(result.path);
+  assert.equal(saved.config.target.baseUrl, 'http://localhost:4567');
+  assert.deepEqual(saved.config.audit.endpoints, [{ method: 'GET', path: '/api/orders' }]);
+});
+test('existing audit project is reused without prompts or config changes; repeat setup remains idempotent', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-existing-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'package.json'), '{"name":"existing","devDependencies":{"express":"5"}}');
+  const created = await initialize(dir, { baseUrl: 'http://localhost:4567', endpoint: '/orders' });
+  const before = await readFile(created.path, 'utf8');
+  const existing = await ensureProjectForAudit(dir, undefined, async () => { throw new Error('must not prompt'); });
+  const repeated = await ensureProjectForAudit(dir, undefined);
+  assert.equal(existing.created, false); assert.equal(existing.framework, 'express');
+  assert.equal(repeated.created, false); assert.equal(await readFile(created.path, 'utf8'), before);
+});
+test('first audit setup refuses missing required target details without writing config', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-no-target-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : ''), /requires a representative GET endpoint/);
+  await assert.rejects(readFile(join(dir, 'perflens.config.json'), 'utf8'), { code: 'ENOENT' });
+  await assert.rejects(ensureProjectForAudit(dir, undefined), /needs a local target and representative GET endpoint/);
+});
+test('malformed existing config is fatal and never replaced during first audit', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-malformed-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'perflens.config.json'); await writeFile(path, '{broken');
+  await assert.rejects(ensureProjectForAudit(dir), /Invalid JSON/);
+  assert.equal(await readFile(path, 'utf8'), '{broken');
+});
 test('init surfaces the selected project OTLP traces endpoint', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-init-')); t.after(() => rm(dir, { recursive: true, force: true }));
   await writeFile(join(dir, 'package.json'), '{"name":"init-target"}');
@@ -120,6 +156,17 @@ test('installed OTLP endpoint follows selected ports with default and occupied 4
 
   const probeFailure = await mkdtemp(join(tmpdir(), 'perflens-otlp-probe-failure-')); t.after(() => rm(probeFailure, { recursive: true, force: true }));
   await assert.rejects(installInfrastructureAssets(probeFailure, 'http://localhost:3000', async () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); }), /Cannot check local port 3001/);
+});
+test('partial infrastructure setup restores missing files and port settings without replacing customized assets', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-infra-recovery-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const root = await installInfrastructureAssets(dir, 'http://localhost:3000', async () => true);
+  const composePath = join(root, 'docker-compose.yml'); const compose = await readFile(composePath, 'utf8');
+  const { unlink } = require('node:fs/promises');
+  await unlink(join(root, 'tempo.yaml')); await unlink(join(root, '.env'));
+  await installInfrastructureAssets(dir, 'http://localhost:3000', async () => true);
+  assert.equal(await readFile(composePath, 'utf8'), compose);
+  assert.match(await readFile(join(root, 'tempo.yaml'), 'utf8'), /server:/);
+  assert.equal(await otlpTracesEndpoint(root), 'http://127.0.0.1:4318/v1/traces');
 });
 test('doctor succeeds on its own occupied ports, fails on daemon/config/Compose errors with remediation', async t => {
   const dir = await fixture(t); const options = { config: join(dir, 'perflens.config.json'), infraDir: dir };

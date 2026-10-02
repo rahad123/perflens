@@ -11,6 +11,7 @@ import { doctor, Options } from '../services/doctor';
 import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
 import { infrastructureRoot, LABELS, otlpTracesEndpoint } from '../services/workspace';
 import { runCompleteAudit } from '../audit/orchestrator';
+import { ensureProjectForAudit } from '../services/onboarding';
 
 export function registerCommands(program: Command): void {
   program.command('init').description('Guided onboarding for a local backend project; never rewrites application code')
@@ -57,7 +58,22 @@ export function registerCommands(program: Command): void {
       const abort = new AbortController();
       const cancel = () => abort.abort();
       process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
-      try { await runCompleteAudit({ ...program.opts<Options>(), ...options }, abort.signal); }
+      try {
+        const globalOptions = program.opts<Options>();
+        const setup = await ensureProjectForAudit(process.cwd(), globalOptions.config, stdin.isTTY && stdout.isTTY
+          ? async (question, defaultValue) => {
+            const prompt = createInterface({ input: stdin, output: stdout });
+            try { const answer = await prompt.question(`${question}${defaultValue ? ` [${defaultValue}]` : ''}: `); return answer || defaultValue || ''; }
+            finally { prompt.close(); }
+          }
+          : undefined);
+        if (setup.created) {
+          console.log(`First-time setup created ${setup.path} for ${setup.projectName}.`);
+          console.log(setup.framework === 'express' ? 'Express project detected.' : setup.framework === 'node' ? 'Node project detected; framework support is not inferred.' : 'Project framework could not be determined from package.json.');
+          console.log('No application source or dependencies were changed.');
+        }
+        await runCompleteAudit({ ...globalOptions, ...options }, abort.signal);
+      }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });
   program.command('runs').description('List local stored audit runs without modifying them')

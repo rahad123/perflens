@@ -29,7 +29,7 @@ Phase 3 analysis currently supports measured latency, error-rate, and throughput
 
 ## Intended workflow
 
-The consumer workflow is `npm install -D @perflens/cli`, `npx perflens init`, then `npx perflens audit`. Initialization creates or validates configuration and working directories; it does not rewrite source files or install other dependencies. For Express, import PerfLens instrumentation before Express and database modules as described in [the consumer integration guide](docs/integrations/express.md).
+The normal consumer workflow is `npm install -D @perflens/cli` followed by `npx perflens audit`. On first interactive use, audit asks for the local target URL and representative GET route and creates configuration without modifying application code or dependencies. `npx perflens init` remains available for explicit setup. For Express, initialize PerfLens instrumentation before Express and database modules as described in [the consumer integration guide](docs/integrations/express.md).
 
 ## Architecture
 
@@ -76,13 +76,11 @@ Prerequisites: Node.js 22.12+, Docker with a local daemon and Docker Compose, pl
 
 ```sh
 npm install -D @perflens/cli
-npx perflens init
 # Instrument your app using docs/integrations/express.md, then start it.
-npx perflens doctor
 npx perflens audit
 ```
 
-`init` asks for the local API URL and GET endpoint in an interactive terminal, detects Express from `package.json`, and preserves existing configuration on repeat runs. In non-interactive use, it creates a conservative `/health` example that you should update to a representative GET route. It copies infrastructure assets into `.perflens/infra`, selects and records local ports, and prints the consumer's OTLP traces endpoint. The Node instrumentation package reads that same project-local port and configures the standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` before creating its exporter. Init never changes application source code or package dependencies. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
+On the first interactive audit, PerfLens asks for the local API URL and a representative GET endpoint, then creates configuration through the same create-only initialization service used by `perflens init`. It prepares local infrastructure, verifies a correlated OpenTelemetry request trace before starting k6, and runs the complete audit → analyze → report workflow. It never changes application source code or installs dependencies. Existing valid configuration is reused without prompting or rewriting. In non-interactive use, provide configuration before the audit; PerfLens will not guess a target route. `perflens init` remains available as optional explicit setup and debugging. The Node instrumentation package reads the selected project-local OTLP port and configures `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` before creating its exporter. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
 
 ### Local URLs
 

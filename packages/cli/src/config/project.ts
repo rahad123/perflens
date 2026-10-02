@@ -49,6 +49,14 @@ export async function loadProject(file?: string, cwd = process.cwd()): Promise<{
     }
   }
 }
+/** Returns null only when no config exists; malformed configs remain fatal. */
+export async function findProject(file?: string, cwd = process.cwd()): Promise<{ path: string; config: ProjectConfig } | null> {
+  try { return await loadProject(file, cwd); }
+  catch (error) {
+    if (error instanceof CliError && error.message === 'PerfLens project configuration was not found.') return null;
+    throw error;
+  }
+}
 export async function initialize(cwd = process.cwd(), options: { baseUrl?: string; endpoint?: string; projectName?: string } = {}): Promise<{ path: string; created: boolean; projectName: string }> {
   let packageName: string | undefined;
   try { packageName = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf8')).name; } catch { /* package.json is optional */ }

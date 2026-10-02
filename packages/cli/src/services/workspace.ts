@@ -37,21 +37,38 @@ async function selectPort(preferred: number, reserved: Set<number>, probePort = 
 
 export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl = 'http://localhost:3000', probePort = portAvailable): Promise<string> {
   const root = join(resolve(cwd), '.perflens', 'infra');
-  try { await access(join(root, 'docker-compose.yml')); }
-  catch {
-    // fs.cp expects its directory destination not to exist when errorOnExist
-    // is enabled (Node 24 enforces this); create only the consumer parent.
-    await mkdir(dirname(root), { recursive: true, mode: 0o700 });
-    await cp(packagedAssets, root, { recursive: true, errorOnExist: true, force: false });
-    await chmod(root, 0o700);
-    const project = `perflens-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 10)}`;
-    const compose = await readFile(join(root, 'docker-compose.yml'), 'utf8');
-    await writeFile(join(root, 'docker-compose.yml'), compose.replace('__PERFLENS_COMPOSE_NAME__', project), { flag: 'w', mode: 0o600 });
-    const ports = new Set<number>();
-    const grafana = await selectPort(3001, ports, probePort), prometheus = await selectPort(9090, ports, probePort), tempo = await selectPort(3200, ports, probePort);
-    const grpc = await selectPort(4317, ports, probePort), http = await selectPort(4318, ports, probePort), health = await selectPort(13133, ports, probePort);
-    await writeFile(join(root, '.env'), `GRAFANA_PORT=${grafana}\nPROMETHEUS_PORT=${prometheus}\nTEMPO_PORT=${tempo}\nOTLP_GRPC_PORT=${grpc}\nOTLP_HTTP_PORT=${http}\nOTEL_HEALTH_PORT=${health}\n`, { flag: 'wx', mode: 0o600 });
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  await chmod(root, 0o700);
+  const project = `perflens-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 10)}`;
+  // Restore missing packaged files without replacing consumer-owned/customized assets.
+  for (const file of required.filter(item => item !== '.env')) {
+    const target = join(root, file);
+    try { await access(target); }
+    catch {
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      if (file === 'docker-compose.yml') {
+        const compose = await readFile(join(packagedAssets, file), 'utf8');
+        await writeFile(target, compose.replace('__PERFLENS_COMPOSE_NAME__', project), { flag: 'wx', mode: 0o600 });
+      } else await cp(join(packagedAssets, file), target, { errorOnExist: true, force: false });
+    }
   }
+  const envPath = join(root, '.env');
+  let envContent = await readFile(envPath, 'utf8').catch(error => (error as NodeJS.ErrnoException).code === 'ENOENT' ? '' : Promise.reject(error));
+  const portDefaults: Record<string, number> = { GRAFANA_PORT: 3001, PROMETHEUS_PORT: 9090, TEMPO_PORT: 3200, OTLP_GRPC_PORT: 4317, OTLP_HTTP_PORT: 4318, OTEL_HEALTH_PORT: 13133 };
+  const reserved = new Set<number>();
+  for (const [key, preferred] of Object.entries(portDefaults)) {
+    const existing = new RegExp(`^${key}=(.*)$`, 'm').exec(envContent)?.[1];
+    if (existing !== undefined) {
+      const port = Number(existing);
+      if (!/^\d+$/.test(existing) || !Number.isInteger(port) || port < 1 || port > 65535 || reserved.has(port)) throw new CliError(`Invalid or duplicate ${key} in local infrastructure configuration.`, 'Repair .perflens/infra/.env without changing ports used by a running stack.');
+      reserved.add(port);
+    } else {
+      const port = await selectPort(preferred, reserved, probePort);
+      envContent += `${envContent && !envContent.endsWith('\n') ? '\n' : ''}${key}=${port}\n`;
+    }
+  }
+  if (envContent) await writeFile(envPath, envContent, { mode: 0o600 });
+  await chmod(envPath, 0o600);
   const url = new URL(baseUrl);
   const host = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ? 'host.docker.internal' : url.hostname;
   const source = join(root, 'prometheus.yml');

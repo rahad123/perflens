@@ -10,14 +10,13 @@ PerfLens installs into the backend project you want to audit. The demo APIs and 
 - An Express app that you can start on a loopback address
 - An application-owned database if the app needs one
 
-Install and initialize from the consumer project directory:
+Install from the consumer project directory:
 
 ```sh
 npm install -D @perflens/cli
-npx perflens init
 ```
 
-In an interactive terminal, initialization asks for the target base URL and a representative GET endpoint. It detects Express from the project's `package.json`. It writes `perflens.config.json` and `.perflens/{runs,results,logs}` only. It does not add dependencies, edit source files, or overwrite existing configuration. Review the generated `target.baseUrl`, `observability.serviceName`, and `audit.endpoints` fields before the first audit.
+The normal first-use command is `npx perflens audit`. In an interactive terminal it asks for the target base URL and representative GET endpoint, then creates configuration through the same create-only service as optional `npx perflens init`. Existing configuration is validated and reused without prompts or overwriting. Non-interactive first use requires an existing `perflens.config.json`; PerfLens will not guess a target route. Express is reported as detected only when listed in package dependencies. Setup writes configuration and `.perflens/{runs,results,logs}` only; it does not add dependencies or edit source files.
 
 ## Start instrumentation before Express and database imports
 
@@ -52,11 +51,10 @@ The packaged Prometheus configuration scrapes the configured local target at `/m
 Start your application and its database first, then run:
 
 ```sh
-npx perflens doctor
 npx perflens audit
 ```
 
-The audit command starts missing local Collector/Tempo/Prometheus/Grafana services, reuses its own healthy infrastructure on later runs, executes the configured bounded baseline and normal profiles by default, analyzes correlated traces, and writes a report. It prints profile measurements, Phase 3 findings, telemetry coverage, the Grafana URL, and the HTML report path.
+Before k6 load, audit sends a single correlated preflight request and checks Tempo for the matching service/run/profile server span. If it cannot find that trace, it stops before load and prints the supported instrumentation setup. Once verified, it starts missing local Collector/Tempo/Prometheus/Grafana services, reuses healthy infrastructure on later runs, executes the configured bounded baseline and normal profiles by default, analyzes correlated traces, and writes a report. It prints profile measurements, Phase 3 findings, telemetry coverage, the Grafana URL, and the HTML report path.
 
 Findings and reports are stored under `.perflens/runs/<run-id>/`. The HTML report is `report/report.html`; JSON and Markdown versions are beside it. To inspect the raw trace in Grafana, open Explore → Tempo and filter `perflens.audit.run_id` by the printed run ID. Prometheus is available from the URL printed by PerfLens. Advanced commands `perflens analyze <run-id>`, `perflens analyze <run-id> --offline`, `perflens report <run-id>`, and `perflens infra status|down` remain available.
 
