@@ -5,6 +5,7 @@ import { Trend } from 'k6/metrics';
 
 const plan = JSON.parse(open(__ENV.PERFLENS_PLAN));
 const wall = new Trend('perflens_request_wall_ms');
+const requestHeaders = Object.fromEntries((plan.requestHeaderEnv || []).map(item => [item.name, __ENV[item.envName]]));
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }));
 export const options = {
   scenarios: { audit: { executor: 'constant-vus', vus: plan.workload.vus, duration: plan.workload.duration, gracefulStop: `${plan.timeoutMs + plan.workload.paceMs + 1000}ms` } },
@@ -21,7 +22,7 @@ export default function () {
   http.get(plan.baseUrl.replace(/\/$/, '') + endpoint.path, {
     redirects: 0,
     timeout: `${plan.timeoutMs}ms`,
-    headers: { 'X-PerfLens-Run-Id': plan.runId, 'X-PerfLens-Profile': plan.profile },
+    headers: { ...requestHeaders, 'X-PerfLens-Run-Id': plan.runId, 'X-PerfLens-Profile': plan.profile },
     tags: { name: `GET ${endpoint.path}` },
   });
   // Raw sample timestamp minus value approximates the client in-flight interval.

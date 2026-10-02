@@ -15,10 +15,11 @@ export interface ReportFinding {
   metrics: Record<string, unknown>;
 }
 export interface ReportModel {
-  schemaVersion: 1; perflensVersion: string; reportVersion: 1; generatedAt: string;
+  schemaVersion: 1; perflensVersion: string; reportVersion: 2; generatedAt: string;
   run: { id: string; target: string; method: string; path: string; endpoints: { method: string; path: string }[]; startedAt: string; completedAt: string; serviceName: string; loadEngine: { name: string | null; version: string | null } };
   workload: { profiles: ReportProfile[] };
   performanceSummary: { profiles: ReportProfile[] };
+  endpointEvidence: { method: string; path: string; requestTraces: number | null; databaseSpans: number | null; externalHttpSpans: number | null }[];
   findingsSummary: { total: number; bySeverity: Record<Severity, number> };
   findings: ReportFinding[];
   evidenceSummary: { requestTraces: number | null; databaseSpans: number | null; externalHttpSpans: number | null; traceAvailable: boolean; snapshotTraceCount: number | null; snapshotSpanCount: number | null; snapshotTruncated: boolean | null; profiles: string[] };
@@ -116,14 +117,32 @@ export function buildReportModel(input: { run: any; profiles: { runProfile: any;
   const expectedEndpoints = endpointKey(endpoints);
   if (input.profiles.some(item => !Array.isArray(item.result?.target?.endpoints) || endpointKey(item.result.target.endpoints) !== expectedEndpoints)) fail('Audit profile endpoint sets differ; report model does not currently support mixed targets.');
   const profiles = input.profiles.map(item => makeProfile(item.runProfile, item.result));
+  const endpointEvidence = safeEndpoints.map((endpoint: { method: string; path: string }) => {
+    if (!analysis.availability.traces) return { ...endpoint, requestTraces: null, databaseSpans: null, externalHttpSpans: null };
+    const roots = evidence.traces.filter((span: any) => span.kind === 'server'
+      && span.attributes?.['perflens.audit.run_id'] === run.runId
+      && span.attributes?.['http.route'] === endpoint.path);
+    const traceIds = new Set(roots.map((span: any) => span.traceId));
+    const scoped = evidence.traces.filter((span: any) => traceIds.has(span.traceId));
+    const isDatabase = (span: any) => span.kind !== 'server'
+      && (typeof span.attributes?.['db.system'] === 'string'
+        || typeof span.attributes?.['db.namespace'] === 'string'
+        || (typeof span.name === 'string' && span.name.startsWith('pg.query:')));
+    const databaseSpans = scoped.filter(isDatabase);
+    const externalHttpSpans = scoped.filter((span: any) => span.kind === 'client' && !isDatabase(span)
+      && (typeof span.attributes?.['http.request.method'] === 'string'
+        || typeof span.attributes?.['http.method'] === 'string'
+        || typeof span.attributes?.['url.sanitized'] === 'string'));
+    return { ...endpoint, requestTraces: traceIds.size, databaseSpans: databaseSpans.length, externalHttpSpans: externalHttpSpans.length };
+  });
   const findings = findingsArtifact.findings.map((finding: any) => validFinding(finding, target)).sort((a: ReportFinding, b: ReportFinding) => ['P0', 'P1', 'P2'].indexOf(a.severity) - ['P0', 'P1', 'P2'].indexOf(b.severity) || a.ruleId.localeCompare(b.ruleId) || a.category.localeCompare(b.category) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id));
   const bySeverity: Record<Severity, number> = { P0: 0, P1: 0, P2: 0 };
   for (const finding of findings as ReportFinding[]) bySeverity[finding.severity]++;
   const limitations = [...new Set([...(Array.isArray(analysis.unsupported) ? analysis.unsupported.map(safeText) : []), ...(analysis.availability.traces ? [] : ['Trace evidence was unavailable for this analysis.']), 'This report contains only configured audit targets and does not represent untested production traffic.'])].sort();
   return {
-    schemaVersion: 1, perflensVersion: safeText(input.perflensVersion ?? 'unknown'), reportVersion: 1, generatedAt: validDate(input.generatedAt ?? new Date().toISOString(), 'report generation timestamp'),
+    schemaVersion: 1, perflensVersion: safeText(input.perflensVersion ?? 'unknown'), reportVersion: 2, generatedAt: validDate(input.generatedAt ?? new Date().toISOString(), 'report generation timestamp'),
     run: { id: run.runId, target: safeBaseUrl(run.target?.baseUrl), method: target.method, path: target.path, endpoints: safeEndpoints, startedAt: validDate(run.startedAt, 'audit start time'), completedAt: validDate(run.endedAt, 'audit completion time'), serviceName: safeText(run.serviceName ?? analysis.target?.serviceName ?? 'unknown'), loadEngine: { name: typeof run.engine?.name === 'string' ? safeText(run.engine.name) : null, version: typeof run.engine?.version === 'string' ? safeText(run.engine.version) : null } },
-    workload: { profiles }, performanceSummary: { profiles },
+    workload: { profiles }, performanceSummary: { profiles }, endpointEvidence,
     findingsSummary: { total: findings.length, bySeverity }, findings,
     evidenceSummary: { requestTraces: finiteOrNull(analysis.traceSummary.requests), databaseSpans: finiteOrNull(analysis.traceSummary.databaseSpans), externalHttpSpans: finiteOrNull(analysis.traceSummary.externalClientSpans), traceAvailable: Boolean(analysis.availability.traces), snapshotTraceCount: finiteOrNull(evidence.telemetry.traceCount), snapshotSpanCount: finiteOrNull(evidence.telemetry.spanCount), snapshotTruncated: typeof evidence.telemetry.truncated === 'boolean' ? evidence.telemetry.truncated : null, profiles: profiles.map(profile => profile.name) },
     limitations,
@@ -142,6 +161,15 @@ export function renderMarkdown(model: ReportModel): string {
   for (const profile of model.performanceSummary.profiles) {
     const metrics: any = profile.metrics; const latency: any = metrics.latencyMs ?? {};
     lines.push(`| ${escMd(profile.name)} | ${value(profile.workload.vus)} | ${value(profile.workload.durationMs)} | ${value(profile.observedDurationMs)} | ${value(metrics.concurrency?.maxObservedInFlight)} | ${metric(metrics, 'requests')} | ${metric(metrics, 'successfulRequests')} | ${metric(metrics, 'failedRequests')} | ${metric(metrics, 'errorRate')} | ${metric(metrics, 'rps')} | ${value(latency.min)} | ${value(latency.p50)} | ${value(latency.p90)} | ${value(latency.p95)} | ${value(latency.p99)} | ${value(latency.max)} |`);
+  }
+  if (model.run.endpoints.length > 1) {
+    lines.push('', '## Endpoint comparison', '', '| Profile | Endpoint | Requests | RPS | Error rate | p50 (ms) | p95 (ms) | p99 (ms) | Request traces | PostgreSQL spans | External HTTP spans | Findings |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|');
+    for (const profile of model.performanceSummary.profiles) for (const endpoint of (profile.metrics as any).endpointResults ?? []) {
+      const target = endpoint.target, m = endpoint.metrics ?? {}, l = m.latencyMs ?? {};
+      const related = model.findings.filter(finding => finding.target.method === target.method && finding.target.path === target.path).map(finding => `${finding.severity} ${finding.title}`);
+      const traceEvidence = model.endpointEvidence.find(item => item.method === target.method && item.path === target.path);
+      lines.push(`| ${escMd(profile.name)} | ${escMd(target.method)} ${escMd(target.path)} | ${value(m.requests)} | ${value(m.rps)} | ${value(m.errorRate)} | ${value(l.p50)} | ${value(l.p95)} | ${value(l.p99)} | ${value(traceEvidence?.requestTraces)} | ${value(traceEvidence?.databaseSpans)} | ${value(traceEvidence?.externalHttpSpans)} | ${related.length ? related.map(escMd).join('; ') : 'None'} |`);
+    }
   }
   lines.push('', 'Configured workload values describe the test setup; the remaining columns describe observed results.', '', '## Findings summary', '');
   if (!model.findings.length) lines.push('No findings were recorded by Phase 3.');
@@ -167,6 +195,12 @@ export function renderMarkdown(model: ReportModel): string {
 export function renderHtml(model: ReportModel): string {
   const h = (v: unknown) => escHtml(safeText(typeof v === 'string' ? v : value(v)));
   const profileRows = model.performanceSummary.profiles.map(profile => { const m: any = profile.metrics; const latency: any = m.latencyMs ?? {}; return `<tr><th scope="row">${h(profile.name)}</th><td>${h(value(profile.workload.vus))}</td><td>${h(value(profile.workload.durationMs))}</td><td>${h(value(profile.observedDurationMs))}</td><td>${h(value(m.concurrency?.maxObservedInFlight))}</td><td>${h(metric(m, 'requests'))}</td><td>${h(metric(m, 'successfulRequests'))}</td><td>${h(metric(m, 'failedRequests'))}</td><td>${h(metric(m, 'errorRate'))}</td><td>${h(metric(m, 'rps'))}</td><td>${h(value(latency.min))}</td><td>${h(value(latency.p50))}</td><td>${h(value(latency.p90))}</td><td>${h(value(latency.p95))}</td><td>${h(value(latency.p99))}</td><td>${h(value(latency.max))}</td></tr>`; }).join('');
+  const endpointRows = model.performanceSummary.profiles.flatMap(profile => ((profile.metrics as any).endpointResults ?? []).map((endpoint: any) => {
+    const m = endpoint.metrics ?? {}, latency = m.latencyMs ?? {};
+    const related = model.findings.filter(finding => finding.target.method === endpoint.target.method && finding.target.path === endpoint.target.path).map(finding => `${finding.severity} ${finding.title}`).join('; ') || 'None';
+    const traceEvidence = model.endpointEvidence.find(item => item.method === endpoint.target.method && item.path === endpoint.target.path);
+    return `<tr><th scope="row">${h(profile.name)}</th><td>${h(endpoint.target.method)} ${h(endpoint.target.path)}</td><td>${h(value(m.requests))}</td><td>${h(value(m.rps))}</td><td>${h(value(m.errorRate))}</td><td>${h(value(latency.p50))}</td><td>${h(value(latency.p95))}</td><td>${h(value(latency.p99))}</td><td>${h(value(traceEvidence?.requestTraces))}</td><td>${h(value(traceEvidence?.databaseSpans))}</td><td>${h(value(traceEvidence?.externalHttpSpans))}</td><td>${h(related)}</td></tr>`;
+  })).join('');
   const latencyValues = model.performanceSummary.profiles.flatMap(profile => {
     const latency = (profile.metrics as any).latencyMs ?? {};
     return ['p50', 'p95', 'p99'].map(key => typeof latency[key] === 'number' && Number.isFinite(latency[key]) && latency[key] >= 0 ? latency[key] as number : null);
@@ -195,5 +229,6 @@ export function renderHtml(model: ReportModel): string {
 </style></head><body><main><header><div class="brand">PerfLens</div><h1>Backend Performance Audit</h1><p class="subtle">A factual report generated from persisted audit measurements and Phase 3 findings.</p><div class="metadata"><div><strong>Run</strong>${h(model.run.id)}</div><div><strong>Target</strong>${h(model.run.target)}</div><div><strong>Endpoint</strong>${h(model.run.method)} ${h(model.run.path)}</div><div><strong>Audit period</strong>${h(model.run.startedAt)} – ${h(model.run.completedAt)}</div><div><strong>Report generated</strong>${h(model.generatedAt)}</div><div><strong>Service</strong>${h(model.run.serviceName)}</div></div></header>
 <section><h2>Executive summary</h2><p>${model.findings.length ? `${h(model.findings.length)} evidence-backed finding(s) were identified.` : 'No evidence-backed performance bottleneck met the configured detection thresholds for this audit run.'}</p><div class="counts"><span><b class="severity">P0</b>${count('P0')}</span><span><b style="color:var(--p1)">P1</b>${count('P1')}</span><span><b style="color:var(--p2)">P2</b>${count('P2')}</span></div></section>
 <section><h2>Test scope and performance overview</h2><p>Load engine: ${h(model.run.loadEngine.name ?? 'Not available')} ${h(model.run.loadEngine.version ?? '')}. Configured endpoints: <strong>${h(model.run.endpoints.map(endpoint => `${endpoint.method} ${endpoint.path}`).join(', '))}</strong>. Configured workload values describe test setup; measurements describe observed results.</p><div class="table-wrap"><table><thead><tr><th>Profile</th><th>Configured VUs</th><th>Configured duration ms</th><th>Observed duration ms</th><th>Max in-flight</th><th>Requests</th><th>Success</th><th>Failed</th><th>Error rate</th><th>RPS</th><th>min ms</th><th>p50 ms</th><th>p90 ms</th><th>p95 ms</th><th>p99 ms</th><th>max ms</th></tr></thead><tbody>${profileRows}</tbody></table></div><h3>Latency by profile</h3>${latencyChart}</section>
+${model.run.endpoints.length > 1 ? `<section><h2>Endpoint comparison</h2><p>Endpoint latency percentiles are calculated from raw per-request k6 samples for each route. Trace counts use only persisted spans correlated to this run and matching the route template. Aggregate profile metrics above cover the full selected endpoint set.</p><div class="table-wrap"><table><thead><tr><th>Profile</th><th>Endpoint</th><th>Requests</th><th>RPS</th><th>Error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Request traces</th><th>PostgreSQL spans</th><th>External HTTP spans</th><th>Phase 3 finding</th></tr></thead><tbody>${endpointRows}</tbody></table></div></section>` : ''}
 ${databaseFindings.length ? `<section><h2>Database evidence</h2><p>PostgreSQL spans analyzed: ${h(value(model.evidenceSummary.databaseSpans))}. The following evidence is carried from Phase 3 findings.</p>${evidenceCards(databaseFindings)}</section>` : ''}${dependencyFindings.length ? `<section><h2>External dependency evidence</h2><p>External HTTP spans analyzed: ${h(value(model.evidenceSummary.externalHttpSpans))}. The following evidence is carried from Phase 3 findings.</p>${evidenceCards(dependencyFindings)}</section>` : ''}<section><h2>Detailed findings</h2>${findings}</section><section><h2>Evidence coverage</h2><ul><li>Request traces analyzed: ${h(value(model.evidenceSummary.requestTraces))}</li><li>PostgreSQL spans analyzed: ${h(value(model.evidenceSummary.databaseSpans))}</li><li>External HTTP spans analyzed: ${h(value(model.evidenceSummary.externalHttpSpans))}</li><li>Persisted snapshot: ${h(value(model.evidenceSummary.snapshotTraceCount))} traces / ${h(value(model.evidenceSummary.snapshotSpanCount))} spans</li><li>Snapshot truncated: ${h(value(model.evidenceSummary.snapshotTruncated))}</li><li>Trace evidence available: ${model.evidenceSummary.traceAvailable ? 'Yes' : 'No'}</li><li>Profiles: ${h(model.evidenceSummary.profiles.join(', ') || 'None')}</li></ul></section><section><h2>Limitations</h2><ul>${model.limitations.map(item => `<li>${h(item)}</li>`).join('')}</ul></section><footer>Generated by PerfLens ${h(model.perflensVersion)} · Report version ${model.reportVersion}. Findings, severity, and confidence are carried from the persisted Phase 3 analysis. This report does not perform additional diagnosis.</footer></main></body></html>`;
 }

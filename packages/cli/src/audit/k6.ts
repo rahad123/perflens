@@ -6,7 +6,7 @@ import { Execute, execute, k6Environment } from './process';
 import { CliError } from '../utils/errors';
 export interface Plan {
   schemaVersion: 1; runId: string; profile: ProfileName; baseUrl: string;
-  endpoints: AuditConfig['endpoints']; workload: AuditConfig['profiles'][ProfileName]; timeoutMs: number; summaryFile: string;
+  endpoints: AuditConfig['endpoints']; requestHeaderEnv: { name: string; envName: string }[]; workload: AuditConfig['profiles'][ProfileName]; timeoutMs: number; summaryFile: string;
 }
 export class K6Runner {
   constructor(private readonly run: Execute = execute) {}
@@ -22,16 +22,16 @@ export class K6Runner {
     await copyFile(source, join(directory, 'load-test.js'), constants.COPYFILE_EXCL);
     await writeFile(join(directory, 'k6-options.json'), '{}\n', { flag: 'wx', mode: 0o600 });
   }
-  async profile(directory: string, plan: Plan, signal: AbortSignal) {
+  async profile(directory: string, plan: Plan, signal: AbortSignal, requestHeaders: Record<string, string> = {}) {
     const planFile = join(directory, 'raw', `${plan.profile}.plan.json`);
     await writeFile(planFile, JSON.stringify(plan, null, 2), { flag: 'wx', mode: 0o600 });
     return this.run('k6', [
-      'run', '--quiet', '--no-color', '--no-usage-report', '--include-system-env-vars=false',
+      'run', '--quiet', '--no-color', '--no-usage-report', '--include-system-env-vars=true',
       '--config', join(directory, 'k6-options.json'), '--summary-mode=full',
       '--out', `json=${join(directory, 'raw', `${plan.profile}.samples.ndjson`)}`,
       '--env', `PERFLENS_PLAN=${planFile}`, join(directory, 'load-test.js'),
     ], {
-      cwd: directory, env: k6Environment(), signal,
+      cwd: directory, env: k6Environment((plan.requestHeaderEnv ?? []).reduce((env, item) => ({ ...env, [item.envName]: requestHeaders[item.name] }), {})), signal,
       timeoutMs: durationMs(plan.workload.duration) + plan.timeoutMs + plan.workload.paceMs + 15000,
       stdoutFile: join(directory, 'logs', `${plan.profile}.stdout.log`),
       stderrFile: join(directory, 'logs', `${plan.profile}.stderr.log`),

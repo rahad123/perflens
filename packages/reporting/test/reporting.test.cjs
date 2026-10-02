@@ -45,6 +45,80 @@ test('zero-finding runs remain valid and produce conservative report language', 
   assert.match(html, /Latency by profile/);
   assert.match(html, /p99/);
 });
+test('multi-endpoint report comparison uses endpoint-scoped k6 samples and existing Phase 3 findings only', () => {
+  const input = fixture({ findings: [finding({ target: { method: 'GET', path: '/products' }, severity: 'P1', confidence: 'medium' })] });
+  const profile = input.profiles[0].result;
+  const products = { method: 'GET', path: '/products' };
+  profile.target.endpoints.push(products);
+  input.run.profiles[0].result = profile;
+  profile.metrics.endpointResults = [
+    { target: { method: 'GET', path: '/orders' }, metrics: { requests: 12, rps: 1.2, errorRate: 0, latencyMs: { p50: 10, p95: 25, p99: 30 } } },
+    { target: products, metrics: { requests: 9, rps: 0.9, errorRate: 0.1, latencyMs: { p50: 50, p95: 150, p99: 200 } } },
+  ];
+  const model = build(input);
+  const html = renderHtml(model), markdown = renderMarkdown(model);
+  assert.match(html, /Endpoint comparison/);
+  assert.match(html, /GET \/products/);
+  assert.match(html, /150/);
+  assert.match(html, /P1 Repeated &lt;query&gt; pattern/);
+  assert.match(markdown, /GET \/products/);
+  assert.ok(markdown.includes('P1 Repeated \\<query\\> pattern'));
+  assert.equal(model.findings[0].severity, 'P1');
+  assert.equal(model.findings[0].confidence, 'medium');
+});
+
+test('multi-endpoint report renders each endpoint metrics and findings independently', () => {
+  const endpoints = [
+    { method: 'GET', path: '/orders' },
+    { method: 'GET', path: '/performance/n-plus-one' },
+    { method: 'GET', path: '/performance/slow-query' },
+    { method: 'GET', path: '/performance/external-call' },
+  ];
+  const repeated = finding({ id: 'n-plus-one', target: endpoints[1], ruleId: 'database.repeated-operation', title: 'Repeated DB evidence', evidence: [{ observation: 'NPLUS_ONLY_EVIDENCE', source: 'trace snapshot' }] });
+  const slow = finding({ id: 'slow-query', target: endpoints[2], ruleId: 'database.slow-operation', title: 'Slow DB evidence', evidence: [{ observation: 'SLOW_ONLY_EVIDENCE', source: 'trace snapshot' }] });
+  const dependency = finding({ id: 'external-call', target: endpoints[3], ruleId: 'dependency.latency-dominance', category: 'dependency', title: 'Dependency evidence', evidence: [{ observation: 'DEPENDENCY_ONLY_EVIDENCE', source: 'trace snapshot' }] });
+  const input = fixture({ findings: [repeated, slow, dependency] });
+  const profile = input.profiles[0].result;
+  profile.target.endpoints = endpoints;
+  profile.metrics.endpointResults = endpoints.map((target, index) => ({
+    target,
+    metrics: { requests: 10 + index, rps: 1 + index, errorRate: 0, latencyMs: { p50: 10 + index, p95: 20 + index, p99: 30 + index } },
+  }));
+  input.evidence.traces = endpoints.flatMap((target, index) => {
+    const traceId = `trace-${index}`;
+    const root = { traceId, spanId: `root-${index}`, parentSpanId: null, kind: 'server', name: `GET ${target.path}`, attributes: { 'perflens.audit.run_id': runId, 'http.route': target.path } };
+    if (index === 3) return [root, { traceId, spanId: 'external-span', parentSpanId: root.spanId, kind: 'client', name: 'GET', attributes: { 'http.request.method': 'GET', 'url.sanitized': 'dependency.test/api' } }];
+    const count = index === 1 ? 21 : 1;
+    return [root, ...Array.from({ length: count }, (_, query) => ({ traceId, spanId: `db-${index}-${query}`, parentSpanId: root.spanId, kind: 'client', name: 'pg.query: SELECT', attributes: { 'db.system': 'postgresql' } }))];
+  });
+  const model = build(input);
+  assert.deepEqual(model.endpointEvidence.map(item => [item.path, item.requestTraces, item.databaseSpans, item.externalHttpSpans]), [
+    ['/orders', 1, 1, 0],
+    ['/performance/n-plus-one', 1, 21, 0],
+    ['/performance/slow-query', 1, 1, 0],
+    ['/performance/external-call', 1, 0, 1],
+  ]);
+  const html = renderHtml(model);
+  const rows = html.match(/<tr><th scope="row">[^]*?<\/tr>/g) ?? [];
+  const endpointRows = Object.fromEntries(endpoints.map(endpoint => [endpoint.path, rows.find(row => row.includes(endpoint.path))]));
+  assert.ok(endpointRows['/orders'].includes('10</td>') && endpointRows['/orders'].includes('None'));
+  assert.ok(endpointRows['/performance/n-plus-one'].includes('11</td>') && endpointRows['/performance/n-plus-one'].includes('P2 Repeated DB evidence'));
+  assert.ok(endpointRows['/performance/slow-query'].includes('12</td>') && endpointRows['/performance/slow-query'].includes('P2 Slow DB evidence'));
+  assert.ok(endpointRows['/performance/external-call'].includes('13</td>') && endpointRows['/performance/external-call'].includes('P2 Dependency evidence'));
+  assert.ok(endpointRows['/orders'].includes('>1</td><td>1</td><td>0</td>'));
+  assert.ok(endpointRows['/performance/n-plus-one'].includes('>1</td><td>21</td><td>0</td>'));
+  assert.ok(endpointRows['/performance/slow-query'].includes('>1</td><td>1</td><td>0</td>'));
+  assert.ok(endpointRows['/performance/external-call'].includes('>1</td><td>0</td><td>1</td>'));
+  for (const [path, text] of [['/performance/n-plus-one', 'NPLUS_ONLY_EVIDENCE'], ['/performance/slow-query', 'SLOW_ONLY_EVIDENCE'], ['/performance/external-call', 'DEPENDENCY_ONLY_EVIDENCE']]) {
+    const section = (html.match(/<article class="finding[^]*?<\/article>/g) ?? []).find(article => article.includes(path));
+    assert.ok(section, `${path} has a detailed finding section`);
+    assert.ok(section.includes(text), `${path} includes its own evidence`);
+    for (const other of ['NPLUS_ONLY_EVIDENCE', 'SLOW_ONLY_EVIDENCE', 'DEPENDENCY_ONLY_EVIDENCE'].filter(item => item !== text)) assert.ok(!section.includes(other), `${path} excludes ${other}`);
+  }
+  assert.ok(!endpointRows['/orders'].includes('Repeated DB evidence'));
+  assert.ok(!endpointRows['/orders'].includes('Slow DB evidence'));
+  assert.ok(!endpointRows['/orders'].includes('Dependency evidence'));
+});
 
 test('HTML comparison visualizations use only measured percentiles and conditionally show component evidence', () => {
   const model = build(fixture({ findings: [finding({ category: 'dependency', title: 'External dependency latency', evidence: [{ observation: '75% contribution in 12 traces', source: 'Tempo' }] })] }));

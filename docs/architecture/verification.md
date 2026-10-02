@@ -792,3 +792,84 @@ The existing explicit `perflens init` path was also exercised twice in `/tmp/per
 ### Phase 6.1 quality results
 
 `CI=1 pnpm install --frozen-lockfile`, `pnpm build`, `pnpm typecheck`, `pnpm test`, `docker compose --env-file .env.example config --quiet`, and `git diff --check` completed successfully. The test suite reported **99 passing tests**: 24 analysis-engine, 5 Node instrumentation, 55 CLI, 11 reporting, and 4 Express app/instrumentation tests. The first sandboxed test attempt failed two CLI cases because local port probes were denied with `listen EPERM`; the authorized rerun passed all 99. No lint script is configured. The external first-audit and repeat-audit runs used the packed CLI tarball and required no workspace links. No Phase 7 functionality was added.
+
+## Phase 6.2 — Consumer UX and multi-endpoint hardening — 2026-10-02
+
+### External packed consumer run
+
+The current CLI package tarball was installed with npm in `/tmp/perflens-phase62-consumer`, outside the PerfLens monorepo. The Express consumer and PostgreSQL target were independent of workspace packages; application instrumentation was loaded before the Express app. Port 4318 was intentionally occupied by a Python listener on `127.0.0.1:4318` (PID 79544), and PerfLens selected `http://127.0.0.1:4331/v1/traces`. Infrastructure was started automatically, then reused on later audits. The consumer configuration referenced `${PERFLENS_TEST_TOKEN}`; the value `PERFLENS_TEST_SECRET_7f93a1` was provided only in the process environment.
+
+The first command was `npx --no-install perflens audit`; `init`, `doctor`, and `infra up` were not invoked manually. The user selected two GET routes and approved them. The unauthenticated `GET /api/audit-logs` returned HTTP 401. Audit stopped before load, reported load not started, analysis not run, and report not generated; that failed run contains configuration, run state, and telemetry metadata only, with no profile results or report. This is the expected safe behavior for missing auth.
+
+With `PERFLENS_TEST_TOKEN` set to the sentinel and `target.headers.Authorization` configured as `Bearer ${PERFLENS_TEST_TOKEN}`, a second audit completed for `/api/orders` and `/api/audit-logs`:
+
+| Profile | Requests | Failed | RPS | Error rate | p50 / p95 / p99 (ms) | Duration | Observed in-flight |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| baseline | 20 | 0 | 1.9964 | 0% | 3.29 / 9.74 / 11.72 | 10,018 ms | 1 |
+| normal | 90 | 0 | 5.9939 | 0% | 3.04 / 12.74 / 27.68 | 15,009 ms | 3 |
+
+That run correlated 23 request traces and 48 PostgreSQL spans, had no external client spans because no external-call route was selected, and produced no Phase 3 findings for these routes. The three report formats were generated. Configuration retained the env reference, not the secret.
+
+A further audit selected `/api/orders`, `/api/audit-logs`, and `/api/dependency`; PerfLens showed all three GET endpoints plus baseline/normal profiles and waited for explicit approval before running k6. It reused infrastructure and the selected OTLP port. Run ID: `pfl_20261002T174405892Z_8e641def-142f-473e-97c6-044e22729e65`.
+
+| Profile | Requests | Failed | RPS | Error rate | p50 / p95 / p99 (ms) | Duration | Observed in-flight |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| baseline | 20 | 0 | 1.9964 | 0% | 3.8365 / 42.9608 / 43.4746 | 10,018 ms | 1 |
+| normal | 90 | 0 | 5.9977 | 0% | 3.4395 / 43.7354 / 45.3084 | 15,006 ms | 3 |
+
+Per-endpoint normal-profile results were measured from the raw k6 sample stream:
+
+| Endpoint | Requests | RPS | Error rate | p50 / p95 / p99 (ms) | Status |
+| --- | ---: | ---: | ---: | --- | --- |
+| `GET /api/orders` | 30 | 1.9992 | 0% | 2.855 / 6.715 / 8.0032 | 30 × 200 |
+| `GET /api/audit-logs` | 30 | 1.9992 | 0% | 2.787 / 7.4303 / 8.5216 | 30 × 200 |
+| `GET /api/dependency` | 30 | 1.9992 | 0% | 43.3185 / 44.528 / 48.9762 | 30 × 200 |
+
+Telemetry analysis for that run found 23 correlated request traces, 34 PostgreSQL spans, and 7 external HTTP client spans. Phase 3 emitted no findings; no DB or dependency diagnosis was invented. The report's endpoint comparison lists each route/profile independently, and the profile evidence records a maximum of 3 simultaneous in-flight requests. Output files are `/tmp/perflens-phase62-consumer/.perflens/runs/pfl_20261002T174405892Z_8e641def-142f-473e-97c6-044e22729e65/report/report.json`, `report.md`, and `report.html`.
+
+The successful report includes endpoint-scoped measured samples, status counts, request count, RPS, error rate, and latency percentiles. Its top-level report target metadata uses the first configured endpoint; the endpoint-comparison section contains all selected endpoints. The three-endpoint run did not include the intentional N+1 or slow-query routes, so their findings were not tested in this consumer run. The dependency route did produce seven correlated client spans, but Phase 3 thresholds were not met and no dependency finding was emitted.
+
+Secret scan: recursive `rg` over the consumer `.perflens/` tree and config found no `PERFLENS_TEST_SECRET_7f93a1` occurrences. The stored config contains the env placeholder only. The failed 401 run has no report; the successful report run has all three expected report files. Grafana and Prometheus URLs printed from this run were `http://127.0.0.1:3010` and `http://127.0.0.1:9097`; Tempo navigation used the verified run ID filter in Grafana Explore. Port 4318 remained occupied during these runs.
+
+The Express process ran on the host and used a Docker PostgreSQL container. This verification did not claim that an app running inside Docker can reach the loopback-bound OTLP receiver; the integration guide now explains the container/host networking distinction and that PerfLens does not rewrite consumer Compose files.
+
+The persisted correlated Tempo snapshot contains 94 spans across 23 traces. In an observed baseline `/api/dependency` trace, the root server span was `GET /api/dependency` with route `/api/dependency`, `profile=baseline`, and the exact run ID. Its `GET` HTTP client span had the root's internal handler span as parent; the simulated dependency server span `GET /:segment` was a child of that client span in the same trace. The request trace also contained PostgreSQL client spans on DB-backed endpoints. Trace attributes were sanitized before persistence, and the sentinel secret was absent. Grafana `/api/health` returned database `ok` (Grafana 13.2.2); Tempo `/ready` returned `ready`. A Prometheus query for `up` returned `up{job="prometheus"}=1`; its consumer target `up{job="perflens-target",instance="host.docker.internal:3412"}=0` because this external demo app did not expose the documented `/metrics` scrape endpoint. Therefore this acceptance verified Grafana/Tempo availability and trace evidence, but did not claim populated consumer metrics panels.
+
+The package's final packed artifact was recreated at `/tmp/perflens-phase62-pack-final/perflens-cli-0.1.0.tgz`: 84,623 bytes and 36 tar entries, including compiled CLI code, package metadata, generic Node/Express instrumentation, the k6 script, and packaged infrastructure templates. It contains no consumer run data or `.env` secrets. The external project was refreshed from a project-local tarball path with `npm install --offline --cache /tmp/perflens-phase62-npm-cache -D ./vendor/perflens-cli-0.1.0.tgz`; its package manifest and lockfile refer to `file:vendor/perflens-cli-0.1.0.tgz`, not a host `/tmp` path. `npx --no-install perflens --help` and `--version` worked there (`0.1.0`). The dogfood-only `vendor/` tarball is not part of the published install workflow.
+
+### Phase 6.2 quality results
+
+`CI=1 pnpm install --frozen-lockfile`, `pnpm build`, and `pnpm typecheck` passed. The full test suite passed **106 tests**: 24 analysis-engine, 5 Node instrumentation, 61 CLI, 12 reporting, and 4 Express integration tests. One initial new report assertion expected the wrong fixture title; the report correctly carried the fixture's existing repeated-query finding, the assertion was corrected to verify that title, and all 12 reporting tests then passed. A failure-path regression also verifies that an HTTP 500 mentioned in a failed k6 execution is reported as load failure, not incorrectly labeled a preflight failure. `docker compose --env-file .env.example config --quiet` and `git diff --check` passed. No root lint script is configured. The first registry install attempt in the sandbox failed DNS resolution; the frozen-lockfile install was rerun with approved registry access and passed. The sandboxed test rerun denied local port probes (`listen EPERM`); the complete suite passed on the authorized loopback-enabled rerun.
+
+The 4318-occupied acceptance used a listener observed on `127.0.0.1:4318`; the project's `.perflens/infra/.env` selected OTLP HTTP 4331 and the audit/metadata/instrumentation agreed on `http://127.0.0.1:4331/v1/traces`. The separate default-port unit case remains covered by the CLI suite. An explicit authenticated target preflight and k6 run succeeded, while the unauthenticated 401 path failed before load and left no report. No remote target was used.
+
+## Phase 6.2 route and multi-endpoint isolation verification — 2026-10-03
+
+Express route discovery remains an honest manual fallback. The CLI prompt no longer describes manual path entry as “recommended” discovery: it asks for one known GET path or multiple known safe GET paths and explicitly says PerfLens does not inspect the already-running Express router. Health and metrics routes remain excluded. The integration guide and README describe this limitation.
+
+For live isolation verification, the repository Express reference app and its real PostgreSQL schema/data were used with an isolated local database and a local delayed HTTP dependency. One multi-endpoint audit selected `GET /orders`, `GET /performance/n-plus-one`, `GET /performance/slow-query`, and `GET /performance/external-call`; no separate endpoint audits or changes to analysis thresholds were used. The run was `pfl_20261002T184919953Z_4024eb49-ce39-44a2-8add-76a0ac9e4627`. Baseline used 1 VU for 20 seconds; normal used 3 VUs for 30 seconds. Normal recorded a maximum of 3 in-flight requests. Baseline recorded 35 requests at 1.71 RPS, p50/p95/p99 27.92/752.77/753.23 ms; normal recorded 157 requests at 5.15 RPS, p50/p95/p99 39.16/752.35/767.80 ms. Both profiles had 0 failures and 0% error rate.
+
+The endpoint-specific k6 samples were:
+
+| Endpoint | Profile | Requests | RPS | Errors | p50 / p95 / p99 (ms) |
+| --- | --- | ---: | ---: | ---: | --- |
+| `GET /orders` | baseline | 9 | 0.4408 | 0 (0%) | 2.152 / 11.6946 / 11.79572 |
+| `GET /orders` | normal | 40 | 1.3123 | 0 (0%) | 1.4585 / 2.5584 / 4.96243 |
+| `GET /performance/n-plus-one` | baseline | 9 | 0.4408 | 0 (0%) | 18.14 / 25.7514 / 27.48708 |
+| `GET /performance/n-plus-one` | normal | 39 | 1.2795 | 0 (0%) | 6.04 / 12.5922 / 30.8999 |
+| `GET /performance/slow-query` | baseline | 9 | 0.4408 | 0 (0%) | 597.271 / 676.1422 / 702.34604 |
+| `GET /performance/slow-query` | normal | 39 | 1.2795 | 0 (0%) | 552.915 / 616.9942 / 953.55828 |
+| `GET /performance/external-call` | baseline | 8 | 0.3918 | 0 (0%) | 752.324 / 753.2262 / 753.30684 |
+| `GET /performance/external-call` | normal | 39 | 1.2795 | 0 (0%) | 751.785 / 753.4776 / 764.59004 |
+
+The persisted Tempo snapshot had 144 correlated request traces, 1,703 PostgreSQL spans, and 34 external HTTP client spans. Grouping root server spans by `http.route` and their trace IDs showed: `/orders` 37 traces / 37 query spans / 0 external spans; `/performance/n-plus-one` 37 / 777 / 0; `/performance/slow-query` 36 / 36 / 0; `/performance/external-call` 34 / 0 / 34. The same run ID and baseline/normal profile attributes were present on the corresponding root spans. Each finding’s sampled trace IDs mapped only to root spans with that finding’s target route.
+
+Phase 3 emitted exactly three findings: P2 / HIGH `database.repeated-operation` targeted `/performance/n-plus-one` (21 median DB operations/request; repeated pattern in 9/9 baseline and 28/28 normal samples; median interval-union DB contribution 11.88 ms baseline and 1.68 ms normal, so the finding describes a pattern, not a major impact); P1 / HIGH `database.slow-operation` targeted `/performance/slow-query` (9 baseline and 27 normal slow-operation spans, median 596.27 ms and 548.63 ms respectively); and P1 / HIGH `dependency.latency-dominance` targeted `/performance/external-call` (request-level median contribution 751.62 ms / 99.9% baseline and 751.02 ms / 99.9% normal). No finding targeted `/orders`. The slow-query route produced one query operation/request and no repeated-operation finding. The external-call route produced no PostgreSQL spans and no DB finding. Findings and evidence did not leak to the other routes.
+
+The generated report exists at `.perflens/runs/pfl_20261002T184919953Z_4024eb49-ce39-44a2-8add-76a0ac9e4627/report/report.json`, `report.md`, and `report.html` (report model version 2). The report endpoint comparison rendered independent baseline and normal rows for all four routes with each route's own request count, RPS, error rate, p50/p95/p99, run-correlated request trace count, PostgreSQL span count, external HTTP span count, and associated finding (or `None` for `/orders`). The persisted endpoint evidence counts were `/orders`: 37 traces / 75 PostgreSQL spans / 0 HTTP client spans; N+1: 37 / 1,555 / 0; slow-query: 36 / 73 / 0; external-call: 34 / 0 / 34. Detailed finding cards included only the evidence and target path belonging to that finding. A reporting regression test now asserts this separation across all four endpoint rows and three endpoint-specific findings; an analysis regression test also asserts DB rule targets and evidence trace IDs remain route-scoped.
+
+`pnpm --filter @perflens/reporting test` passed 13 tests and `pnpm --filter @perflens/analysis-engine test` passed 25 tests after these changes. Full workspace quality checks are recorded below after completion. This live acceptance used the existing local infrastructure with OTLP endpoint `http://127.0.0.1:4333/v1/traces`; it did not use a remote target or modify rule thresholds.
+
+### Phase 6.2.1 quality results
+
+`pnpm build` and `pnpm typecheck` passed. `pnpm test` passed **108 tests** across the workspace: 25 analysis-engine, 5 Node instrumentation, 61 CLI, 13 reporting, and 4 Express tests. The initial sandboxed `pnpm test` attempt failed only the two CLI loopback port-probe tests with `listen EPERM`; the full rerun with local socket access passed. `git diff --check` passed. No lint script is configured.

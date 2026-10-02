@@ -47,14 +47,15 @@ export function registerCommands(program: Command): void {
       }
       if (bootstrapped) console.log('OpenTelemetry bootstrap reference found in a common entrypoint.');
       else console.log('Instrumentation is not confirmed. For Express, preload startExpressInstrumentation from @perflens/cli/express-instrumentation before importing Express or database clients. Generic Node apps can use startNodeInstrumentation from @perflens/cli/instrumentation.');
-      console.log('Request tracing excludes /health and /metrics. Choose a representative API route in audit.endpoints before running an audit.');
+      console.log('Routes /health and /metrics are excluded from traced request analysis. Use representative business GET routes in audit.endpoints.');
       console.log('Next: verify target.baseUrl and audit.endpoints in perflens.config.json, start your API, then run npx perflens audit.');
     });
   program.command('doctor').description('Check local prerequisites, configuration, ports, and existing infrastructure')
     .action(async () => { if (!await doctor(program.opts<Options>())) process.exitCode = 1; });
   program.command('audit').description('Run a bounded local audit, collect telemetry, analyze evidence, and generate reports')
     .option('--profile <names>', 'Comma-separated baseline,normal,peak,stress; default: baseline,normal')
-    .action(async (options: { profile?: string }) => {
+    .option('--yes', 'Explicitly authorize load against all configured local GET endpoints (for non-interactive use)')
+    .action(async (options: { profile?: string; yes?: boolean }) => {
       const abort = new AbortController();
       const cancel = () => abort.abort();
       process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
@@ -72,7 +73,18 @@ export function registerCommands(program: Command): void {
           console.log(setup.framework === 'express' ? 'Express project detected.' : setup.framework === 'node' ? 'Node project detected; framework support is not inferred.' : 'Project framework could not be determined from package.json.');
           console.log('No application source or dependencies were changed.');
         }
-        await runCompleteAudit({ ...globalOptions, ...options }, abort.signal);
+        const project = await loadProject(globalOptions.config);
+        const endpoints = project.config.audit?.endpoints ?? [];
+        if (endpoints.length > 1) {
+          console.log(`PerfLens will run bounded local load against:\n${endpoints.map(endpoint => `  GET ${endpoint.path}`).join('\n')}\nProfiles: ${(options.profile ?? 'baseline,normal').split(',').join(', ')}`);
+          if (!options.yes) {
+            if (!stdin.isTTY || !stdout.isTTY) throw new Error('Multiple configured endpoints require interactive approval. Rerun with --yes only after reviewing the endpoint list. No load was started.');
+            const prompt = createInterface({ input: stdin, output: stdout });
+            try { if (!/^y(?:es)?$/i.test((await prompt.question('Proceed? (y/N): ')).trim())) throw new Error('Endpoint load-test permission was not granted. No load was started.'); }
+            finally { prompt.close(); }
+          }
+        } else if (endpoints.length === 1) console.log(`Selected endpoint: GET ${endpoints[0].path}`);
+        await runCompleteAudit({ ...globalOptions, ...options, confirmMultipleEndpoints: options.yes || endpoints.length <= 1 || (stdin.isTTY && stdout.isTTY) }, abort.signal);
       }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });

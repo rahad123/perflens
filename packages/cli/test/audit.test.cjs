@@ -4,7 +4,7 @@ const { mkdtemp, writeFile, readFile, readdir, rm } = require('node:fs/promises'
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { validateAudit, selectProfiles, durationMs } = require('../dist/audit/config');
-const { validateConfig } = require('../dist/config/project');
+const { validateConfig, resolveTargetHeaders } = require('../dist/config/project');
 const { RunStore, runId, listRuns } = require('../dist/audit/storage');
 const { completedEvidenceError, normalize, readSamples } = require('../dist/audit/results');
 const { execute, k6Environment } = require('../dist/audit/process');
@@ -22,6 +22,7 @@ function samples() {
   return [
     { type: 'Point', metric: 'http_reqs', data: { value: 1, tags: { status: '500', name: 'GET /orders' }, time: '2026-09-30T00:00:00Z' } },
     ...[1, 2, 3].map(i => ({ type: 'Point', metric: 'http_reqs', data: { value: 1, tags: { status: '200', name: 'GET /orders' }, time: `2026-09-30T00:00:00.00${i}Z` } })),
+    ...[10, 20, 30, 40].map((value, i) => ({ type: 'Point', metric: 'http_req_duration', data: { value, tags: { name: 'GET /orders' }, time: `2026-09-30T00:00:00.00${i + 1}Z` } })),
     { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 100, time: '2026-09-30T00:00:00.200Z' } },
     { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 100, time: '2026-09-30T00:00:00.250Z' } },
     { type: 'Point', metric: 'perflens_request_wall_ms', data: { value: 50, time: '2026-09-30T00:00:00.270Z' } },
@@ -62,6 +63,16 @@ test('config rejects unsafe workloads, endpoints, unsupported fields, and remote
   assert.equal(durationMs('120s'), 120000);
   assert.deepEqual(validateConfig(base), base, 'Phase 1 config remains valid');
 });
+test('request headers require env references for credentials and resolve only in memory', () => {
+  const secret = 'PERFLENS_TEST_SECRET_7f93a1';
+  const target = { baseUrl: 'http://127.0.0.1:3002', headers: { Authorization: 'Bearer ${PERFLENS_AUTH_TOKEN}', 'X-Api-Key': '${PERFLENS_API_KEY}', 'X-Tenant': 'tenant-a' } };
+  const validated = validateConfig({ ...base, target });
+  const resolved = resolveTargetHeaders(validated.target.headers, { PERFLENS_AUTH_TOKEN: secret, PERFLENS_API_KEY: secret });
+  assert.equal(resolved.Authorization, `Bearer ${secret}`); assert.equal(resolved['X-Api-Key'], secret);
+  assert.doesNotMatch(JSON.stringify(validated), new RegExp(secret));
+  assert.throws(() => validateConfig({ ...base, target: { ...target, headers: { Authorization: 'Bearer literal-secret' } } }), /environment-variable reference/);
+  assert.throws(() => resolveTargetHeaders(target.headers, {}), /PERFLENS_AUTH_TOKEN.*not set/);
+});
 test('run IDs and directories are exclusive; finalized stores reject overwrites and path escapes', async t => {
   assert.equal(new Set(Array.from({ length: 100 }, runId)).size, 100);
   const dir = await temp(t); const a = await RunStore.create(dir), b = await RunStore.create(dir);
@@ -87,6 +98,10 @@ test('k6 2.3 Rate.passes counts failed requests; counters, rates, duration and p
   assert.equal(result.metrics.rps, 4); assert.equal(result.metrics.durationMs, 1000);
   assert.deepEqual(result.metrics.latencyMs, { average: 20, min: 10, p50: 18, p90: 27, p95: 29, p99: 29.8, max: 30 });
   assert.deepEqual(result.metrics.statusDistribution, { '200': 3, '500': 1 });
+  assert.deepEqual(result.metrics.endpointResults[0].target, { method: 'GET', path: '/orders' });
+  assert.equal(result.metrics.endpointResults[0].metrics.requests, 4);
+  assert.equal(result.metrics.endpointResults[0].metrics.latencyMs.p50, 25);
+  assert.equal(result.metrics.endpointResults[0].metrics.latencyMs.p95, 38.5);
   const swapped = summary(); swapped.metrics.http_req_failed.values = { passes: 3, fails: 1, rate: 0.75 };
   assert.match(completedEvidenceError(swapped, evidence), /status samples disagree/);
   assert.equal(normalize({}, plan, 'start', 'end', 'failed', null).metrics.latencyMs.p99, null);
@@ -105,6 +120,33 @@ test('successful default audit persists raw/normalized results and windows witho
   assert.equal(metadata.auditRunId, first.run.runId); assert.ok(metadata.auditEndedAt);
   const results = await readdir(join(first.directory, 'results')); assert.deepEqual(results.sort(), ['baseline.json', 'normal.json']);
 });
+test('multiple endpoint workloads require explicit approval before audit begins', async t => {
+  const dir = await temp(t), path = await project(dir);
+  const parsed = JSON.parse(await readFile(path)); parsed.audit.endpoints.push({ method: 'GET', path: '/products' }); await writeFile(path, JSON.stringify(parsed));
+  let versionCalled = false;
+  const deps = fakeDependencies(); deps.runner.version = async () => { versionCalled = true; return 'k6 v2.3.0 test'; };
+  await assert.rejects(audit({ config: path }, undefined, deps), /Multiple endpoints require explicit load-test approval/);
+  assert.equal(versionCalled, false);
+});
+test('authentication context reaches target preflight and k6 but never enters audit artifacts', async t => {
+  const dir = await temp(t), path = await project(dir), secret = 'PERFLENS_TEST_SECRET_7f93a1';
+  const parsed = JSON.parse(await readFile(path)); parsed.target.headers = { Authorization: 'Bearer ${PERFLENS_TEST_TOKEN}', 'X-Tenant': 'tenant-a' }; await writeFile(path, JSON.stringify(parsed));
+  const previous = process.env.PERFLENS_TEST_TOKEN; process.env.PERFLENS_TEST_TOKEN = secret;
+  const observed = [];
+  const deps = fakeDependencies({ target: async (_config, _endpoint, _run, _signal, headers) => observed.push(headers) });
+  const originalProfile = deps.runner.profile;
+  deps.runner.profile = async (...args) => { observed.push(args[3]); return originalProfile(...args); };
+  try {
+    const result = await audit({ config: path }, undefined, deps);
+    assert.deepEqual(observed[0], { Authorization: `Bearer ${secret}`, 'X-Tenant': 'tenant-a' });
+    assert.deepEqual(observed[1], observed[0]);
+    const files = [];
+    async function walk(directory) { for (const entry of await readdir(directory, { withFileTypes: true })) { const full = join(directory, entry.name); if (entry.isDirectory()) await walk(full); else files.push(await readFile(full, 'utf8')); } }
+    await walk(result.directory);
+    assert.ok(files.every(value => !value.includes(secret)), 'resolved request secret must not enter any run artifact');
+    assert.ok(files.some(value => value.includes('PERFLENS_TEST_TOKEN')));
+  } finally { if (previous === undefined) delete process.env.PERFLENS_TEST_TOKEN; else process.env.PERFLENS_TEST_TOKEN = previous; }
+});
 test('failed preflight leaves failed artifacts and never starts k6 load', async t => {
   const dir = await temp(t), path = await project(dir); let started = false;
   const deps = fakeDependencies({ infrastructure: async () => { throw new CliError('not ready', 'start infra'); } });
@@ -122,12 +164,13 @@ test('target preflight sends correlation without redirects, rejects non-2xx, and
     assert.equal(options.redirect, 'manual');
     assert.equal(options.headers['X-PerfLens-Run-Id'], 'test-run');
     assert.equal(options.headers['X-PerfLens-Profile'], 'preflight');
+    assert.equal(options.headers.Authorization, 'Bearer runtime-token');
     return { status, body: { cancel: async () => cancelled++ } };
   };
   try {
-    await assert.rejects(checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal), /HTTP 302/);
+    await assert.rejects(checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal, { Authorization: 'Bearer runtime-token' }), /HTTP 302/);
     status = 200;
-    await checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal);
+    await checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal, { Authorization: 'Bearer runtime-token' });
     assert.equal(cancelled, 2);
     global.fetch = async () => { throw new Error('sensitive transport detail'); };
     await assert.rejects(checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal), error => /Target preflight failed/.test(error.message) && !error.message.includes('sensitive'));
@@ -199,13 +242,19 @@ test('cancellation persists cancelled status and stops further profiles', async 
 test('k6 runner isolates environment, uses local-only output, and pins supported summary adapter version', async t => {
   process.env.K6_OUT = 'cloud'; process.env.HTTPS_PROXY = 'https://secret.test';
   try { assert.equal(k6Environment().K6_OUT, undefined); assert.equal(k6Environment().HTTPS_PROXY, undefined); } finally { delete process.env.K6_OUT; delete process.env.HTTPS_PROXY; }
+  assert.equal(k6Environment({ PERFLENS_REQUEST_HEADER_0: 'runtime-only' }).PERFLENS_REQUEST_HEADER_0, 'runtime-only');
+  assert.equal(k6Environment().PERFLENS_REQUEST_HEADER_0, undefined);
   const runner = new K6Runner(async () => ({ code: 0, stdout: 'k6 v2.4.0', signal: null, cancelled: false, timedOut: false }));
   await assert.rejects(runner.version(new AbortController().signal), /k6 2.3.x/);
   const dir = await temp(t); const store = await RunStore.create(dir); let args;
-  const mock = new K6Runner(async (_, a) => { args = a; return {}; });
+  let childOptions;
+  const mock = new K6Runner(async (_, a, options) => { args = a; childOptions = options; return {}; });
   await mock.prepare(store.directory);
-  await mock.profile(store.directory, { schemaVersion: 1, runId: store.id, profile: 'baseline', baseUrl: base.target.baseUrl, workload: validateAudit(config.audit).profiles.baseline, endpoints: config.audit.endpoints, timeoutMs: 5000, summaryFile: join(store.directory, 'raw/baseline.summary.json') }, new AbortController().signal);
-  assert.ok(args.includes('--no-usage-report')); assert.ok(args.includes('--include-system-env-vars=false')); assert.ok(!args.includes('cloud'));
+  const secret = 'PERFLENS_TEST_SECRET_7f93a1';
+  await mock.profile(store.directory, { schemaVersion: 1, runId: store.id, profile: 'baseline', baseUrl: base.target.baseUrl, workload: validateAudit(config.audit).profiles.baseline, endpoints: config.audit.endpoints, requestHeaderEnv: [{ name: 'Authorization', envName: 'PERFLENS_REQUEST_HEADER_0' }], timeoutMs: 5000, summaryFile: join(store.directory, 'raw/baseline.summary.json') }, new AbortController().signal, { Authorization: `Bearer ${secret}` });
+  assert.ok(args.includes('--no-usage-report')); assert.ok(args.includes('--include-system-env-vars=true')); assert.ok(!args.includes('cloud'));
+  assert.equal(childOptions.env.PERFLENS_REQUEST_HEADER_0, `Bearer ${secret}`);
+  assert.ok(args.every(argument => !argument.includes(secret)));
 });
 test('process execution reports missing binary and terminates on cancellation/deadline', async () => {
   await assert.rejects(execute('perflens-nonexistent-test-binary', [], { timeoutMs: 500 }), /Could not execute/);

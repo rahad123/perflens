@@ -41,9 +41,9 @@ export const execute: Execute = async (executable, args, options) => {
     });
   } finally { await out?.close(); await err?.close(); }
 };
-export function k6Environment(): NodeJS.ProcessEnv {
+export function k6Environment(requestHeaders: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP']) if (process.env[key]) env[key] = process.env[key];
   // No inherited K6_*, proxy settings, telemetry exporters, or secret values.
-  return { ...env, K6_NO_USAGE_REPORT: 'true', K6_WEB_DASHBOARD: 'false' };
+  return { ...env, ...requestHeaders, K6_NO_USAGE_REPORT: 'true', K6_WEB_DASHBOARD: 'false' };
 }

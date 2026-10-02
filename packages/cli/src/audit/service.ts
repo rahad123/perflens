@@ -2,14 +2,14 @@ import { withAuditLock } from './lock';
 import { dirname, join } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { loadProject, ProjectConfig } from '../config/project';
+import { loadProject, ProjectConfig, resolveTargetHeaders } from '../config/project';
 import { CliError } from '../utils/errors';
 import { selectProfiles, ProfileName } from './config';
 import { K6Runner, Plan } from './k6';
 import { checkCancelled, checkInfrastructure, checkInstrumentation, checkTarget } from './preflight';
 import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
-export interface AuditOptions { config?: string; infraDir?: string; profile?: string }
+export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean }
 interface ProfileState { name: ProfileName; status: RunStatus; startedAt: string | null; endedAt: string | null; error: string | null; result: string | null }
 export interface AuditDependencies {
   runner: Pick<K6Runner, 'version' | 'prepare' | 'profile'>;
@@ -24,19 +24,23 @@ export async function audit(options: AuditOptions, signal = new AbortController(
   const loaded = await loadProject(options.config);
   const config: ProjectConfig = loaded.config;
   if (!config.audit) throw new CliError('No audit endpoints are configured.', 'Add audit.endpoints with GET paths to perflens.config.json. Existing Phase 1 configs still work for doctor/infra.', 2);
+  if (config.audit.endpoints.length > 1 && !options.confirmMultipleEndpoints) throw new CliError('Multiple endpoints require explicit load-test approval.', 'Review the configured GET endpoints and rerun interactively, or pass --yes to explicitly authorize this configured local endpoint set.', 2);
+  resolveTargetHeaders(config.target.headers);
   return withAuditLock(dirname(loaded.path), () => executeAudit(config, loaded.path, selected, signal, dependencies, options.infraDir));
 }
 async function executeAudit(config: ProjectConfig, configPath: string, selected: ProfileName[], signal: AbortSignal, dependencies: AuditDependencies, infraDir?: string) {
   const auditConfig = config.audit!;
+  const requestHeaders = resolveTargetHeaders(config.target.headers);
+  const requestHeaderEnv = Object.keys(requestHeaders).map((name, index) => ({ name, envName: `PERFLENS_REQUEST_HEADER_${index}` }));
   const store = await RunStore.create(dirname(configPath));
   const profiles: ProfileState[] = selected.map(name => ({ name, status: 'created', startedAt: null, endedAt: null, error: null, result: null }));
   const run = {
     schemaVersion: 1, runId: store.id, status: 'created' as RunStatus, startedAt: new Date().toISOString(), endedAt: null as string | null,
-    project: config.project, target: config.target, serviceName: config.observability.serviceName,
+    project: config.project, target: { baseUrl: config.target.baseUrl }, serviceName: config.observability.serviceName,
     profiles, errors: [] as string[], engine: { name: 'k6', version: null as string | null },
   };
   const metadata = {
-    schemaVersion: 1, auditRunId: store.id, serviceName: config.observability.serviceName, target: config.target,
+    schemaVersion: 1, auditRunId: store.id, serviceName: config.observability.serviceName, target: { baseUrl: config.target.baseUrl },
     auditStartedAt: run.startedAt, auditEndedAt: null as string | null, profiles,
     correlation: {
       requestHeaders: ['X-PerfLens-Run-Id', 'X-PerfLens-Profile'],
@@ -61,7 +65,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     dependencies.write('✓ Collector, Tempo, Prometheus, and Grafana ready');
     dependencies.write(`OTLP traces endpoint: ${metadata.infrastructure.otlpTracesEndpoint}`);
     for (const endpoint of auditConfig.endpoints) {
-      await dependencies.target(config, endpoint, store.id, signal);
+      await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
     }
     await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal);
@@ -74,12 +78,12 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       profile.status = 'running'; profile.startedAt = new Date().toISOString();
       currentPlan = {
         schemaVersion: 1, runId: store.id, profile: profile.name, baseUrl: config.target.baseUrl,
-        endpoints: auditConfig.endpoints, workload: auditConfig.profiles[profile.name], timeoutMs: auditConfig.timeoutMs,
+        endpoints: auditConfig.endpoints, requestHeaderEnv, workload: auditConfig.profiles[profile.name], timeoutMs: auditConfig.timeoutMs,
         summaryFile: join(store.directory, 'raw', `${profile.name}.summary.json`),
       };
       await save();
       dependencies.write(`${profile.name}: ${currentPlan.workload.vus} VUs, ${currentPlan.workload.duration}, ${currentPlan.workload.paceMs} ms minimum start interval/VU`);
-      const execution = await dependencies.runner.profile(store.directory, currentPlan, signal);
+      const execution = await dependencies.runner.profile(store.directory, currentPlan, signal, requestHeaders);
       profile.endedAt = new Date().toISOString();
       profile.status = signal.aborted || execution.cancelled ? 'cancelled' : execution.code !== 0 || execution.timedOut ? 'failed' : 'completed';
       await store.write(`raw/${profile.name}.execution.json`, { schemaVersion: 1, code: execution.code, signal: execution.signal, timedOut: execution.timedOut, cancelled: execution.cancelled });
