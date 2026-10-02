@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { readPerfLensCorrelation } = require('../dist/index.js');
+const { mkdtemp, mkdir, writeFile, rm } = require('node:fs/promises');
+const { join } = require('node:path');
+const { tmpdir } = require('node:os');
+const { readPerfLensCorrelation, configurePerfLensOtlpEndpoint } = require('../dist/index.js');
 
 const runId = 'pfl_20260930T120000000Z_123e4567-e89b-12d3-a456-426614174000';
 
@@ -15,4 +18,24 @@ test('allows absent and malformed correlation without creating metadata', () => 
   assert.deepEqual(readPerfLensCorrelation({ 'x-perflens-run-id': 'not-a-run', 'x-perflens-profile': 'stress' }), {});
   assert.deepEqual(readPerfLensCorrelation({ 'x-perflens-run-id': runId, 'x-perflens-profile': 'unknown' }), { runId });
   assert.deepEqual(readPerfLensCorrelation({ 'x-perflens-run-id': 'x'.repeat(100000), 'x-perflens-profile': 'normal' }), {});
+});
+
+test('configures the OpenTelemetry traces exporter from the consumer selected Collector port', async t => {
+  for (const port of [4318, 4319]) {
+    const project = await mkdtemp(join(tmpdir(), 'perflens-otel-env-'));
+    t.after(() => rm(project, { recursive: true, force: true }));
+    await mkdir(join(project, '.perflens', 'infra'), { recursive: true });
+    await writeFile(join(project, '.perflens', 'infra', '.env'), `OTLP_HTTP_PORT=${port}\n`);
+    const env = {};
+    assert.equal(configurePerfLensOtlpEndpoint(project, env), `http://127.0.0.1:${port}/v1/traces`);
+    assert.equal(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, `http://127.0.0.1:${port}/v1/traces`);
+  }
+});
+
+test('rejects a conflicting explicit traces endpoint instead of silently exporting to another port', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'perflens-otel-conflict-'));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  await mkdir(join(project, '.perflens', 'infra'), { recursive: true });
+  await writeFile(join(project, '.perflens', 'infra', '.env'), 'OTLP_HTTP_PORT=4319\n');
+  assert.throws(() => configurePerfLensOtlpEndpoint(project, { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://127.0.0.1:4318/v1/traces' }), /does not match this PerfLens project.*4319/);
 });

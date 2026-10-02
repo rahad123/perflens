@@ -1,6 +1,6 @@
 import { CliError } from '../utils/errors';
 import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
-import { infrastructureRoot } from '../services/workspace';
+import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { ProjectConfig } from '../config/project';
 import { Endpoint, targetUrl } from './config';
 export function checkCancelled(signal: AbortSignal): void {
@@ -17,7 +17,7 @@ export async function checkInfrastructure(infraDir?: string, projectDirectory = 
     const port = config.services[name].ports?.[0];
     urls[name] = port?.published ? `http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}` : null;
   }
-  return { composeProject: config.name, readiness: states, localUrls: urls };
+  return { composeProject: config.name, readiness: states, localUrls: urls, otlpTracesEndpoint: await otlpTracesEndpoint(infra.root) };
 }
 export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, runId: string, signal: AbortSignal): Promise<void> {
   checkCancelled(signal);

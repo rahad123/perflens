@@ -10,21 +10,32 @@ const packagedAssets = [resolve(__dirname, '../../assets/infra'), resolve(__dirn
 const required = ['docker-compose.yml', '.env', 'otel-collector.yaml', 'tempo.yaml', 'prometheus.yml', 'grafana/provisioning/datasources/datasources.yaml', 'grafana/provisioning/dashboards/dashboards.yaml', 'grafana/dashboards/perflens-performance.json'];
 
 async function portAvailable(port: number): Promise<boolean> {
-  return new Promise(resolvePort => {
+  return new Promise((resolvePort, rejectPort) => {
     const server = createServer();
-    server.once('error', (error: NodeJS.ErrnoException) => resolvePort(error.code === 'EADDRINUSE' ? false : true));
+    server.once('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRINUSE') resolvePort(false);
+      else rejectPort(new CliError(`Cannot check local port ${port}.`, `Allow PerfLens to test loopback ports and retry. Technical error: ${error.message}`));
+    });
     server.listen({ host: '127.0.0.1', port, exclusive: true }, () => server.close(() => resolvePort(true)));
   });
 }
-async function selectPort(preferred: number, reserved: Set<number>): Promise<number> {
+async function selectPort(preferred: number, reserved: Set<number>, probePort = portAvailable): Promise<number> {
   for (let port = preferred; port < preferred + 100; port++) {
-    if (!reserved.has(port) && await portAvailable(port)) { reserved.add(port); return port; }
+    if (reserved.has(port)) continue;
+    let available: boolean;
+    try { available = await probePort(port); }
+    catch (error) {
+      if (error instanceof CliError) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new CliError(`Cannot check local port ${port}.`, `Allow PerfLens to test loopback ports and retry. Technical error: ${detail}`);
+    }
+    if (available) { reserved.add(port); return port; }
   }
   throw new CliError(`No available local port near ${preferred}.`, 'Free an audit infrastructure port and retry. PerfLens will not stop another service.');
 }
 
 
-export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl = 'http://localhost:3000'): Promise<string> {
+export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl = 'http://localhost:3000', probePort = portAvailable): Promise<string> {
   const root = join(resolve(cwd), '.perflens', 'infra');
   try { await access(join(root, 'docker-compose.yml')); }
   catch {
@@ -37,8 +48,8 @@ export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl =
     const compose = await readFile(join(root, 'docker-compose.yml'), 'utf8');
     await writeFile(join(root, 'docker-compose.yml'), compose.replace('__PERFLENS_COMPOSE_NAME__', project), { flag: 'w', mode: 0o600 });
     const ports = new Set<number>();
-    const grafana = await selectPort(3001, ports), prometheus = await selectPort(9090, ports), tempo = await selectPort(3200, ports);
-    const grpc = await selectPort(4317, ports), http = await selectPort(4318, ports), health = await selectPort(13133, ports);
+    const grafana = await selectPort(3001, ports, probePort), prometheus = await selectPort(9090, ports, probePort), tempo = await selectPort(3200, ports, probePort);
+    const grpc = await selectPort(4317, ports, probePort), http = await selectPort(4318, ports, probePort), health = await selectPort(13133, ports, probePort);
     await writeFile(join(root, '.env'), `GRAFANA_PORT=${grafana}\nPROMETHEUS_PORT=${prometheus}\nTEMPO_PORT=${tempo}\nOTLP_GRPC_PORT=${grpc}\nOTLP_HTTP_PORT=${http}\nOTEL_HEALTH_PORT=${health}\n`, { flag: 'wx', mode: 0o600 });
   }
   const url = new URL(baseUrl);
@@ -51,6 +62,18 @@ export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl =
     await writeFile(source, `# PerfLens generated target: ${host}:${port}\n${template.replace('__PERFLENS_METRICS_HOST__', host).replace('__PERFLENS_METRICS_PORT__', port)}`, { mode: 0o600 });
   }
   return root;
+}
+
+export async function otlpTracesEndpoint(root: string): Promise<string> {
+  const environment = await readFile(join(root, '.env'), 'utf8').catch(() => {
+    throw new CliError('PerfLens infrastructure port configuration is missing.', 'Run perflens init or repair .perflens/infra/.env before starting the target.');
+  });
+  const match = /^OTLP_HTTP_PORT=(\d+)$/m.exec(environment);
+  const port = match ? Number(match[1]) : NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new CliError('PerfLens OTLP HTTP port is invalid.', 'Set OTLP_HTTP_PORT to a local TCP port in .perflens/infra/.env, then restart PerfLens infrastructure.');
+  }
+  return `http://127.0.0.1:${port}/v1/traces`;
 }
 
 export async function infrastructureRoot(explicit?: string, cwd = process.cwd(), baseUrl?: string): Promise<string> {

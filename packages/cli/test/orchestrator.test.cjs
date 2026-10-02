@@ -4,6 +4,7 @@ const { mkdtemp, mkdir, writeFile, readFile, rm } = require('node:fs/promises');
 const { join } = require('node:path');
 const { tmpdir } = require('node:os');
 const { runCompleteAudit } = require('../dist/audit/orchestrator');
+const { otlpTracesEndpoint } = require('../dist/services/workspace');
 
 const runId = 'pfl_20261002T120000000Z_12345678-1234-1234-1234-123456789abc';
 async function fixture(t) {
@@ -18,8 +19,14 @@ async function fixture(t) {
 function mockDependencies(t, overrides = {}) {
   const events = [];
   const dir = join(t.cwd, '.perflens', 'runs', runId);
+  const infraRoot = join(t.cwd, '.perflens', 'infra');
+  const setup = (async () => {
+    await mkdir(infraRoot, { recursive: true });
+    await writeFile(join(infraRoot, '.env'), 'OTLP_HTTP_PORT=4319\n');
+  })();
   return {
     events,
+    async infrastructureRoot() { await setup; return infraRoot; },
     infrastructure: () => ({
       async status() { events.push('status'); return [{ ready: true }]; },
       async up() { events.push('up'); throw new Error('must reuse healthy infrastructure'); },
@@ -52,6 +59,7 @@ test('one-command audit reuses healthy infrastructure and runs measurement, anal
   assert.match(output.join('\n'), /p50 ms.*p95 ms.*p99 ms/);
   assert.match(output.join('\n'), /No evidence-backed bottlenecks/);
   assert.match(output.join('\n'), /PostgreSQL spans: 222/);
+  assert.match(output.join('\n'), /OTLP traces endpoint http:\/\/127\.0\.0\.1:4319\/v1\/traces/);
   assert.match(output.join('\n'), /Grafana: http:\/\/127\.0\.0\.1:3001/);
   assert.match(output.join('\n'), new RegExp(runId));
 });
@@ -65,7 +73,15 @@ test('a k6/audit failure is stage-labelled and never proceeds to analysis or rep
 
 test('missing correlated telemetry fails after preserving audit evidence and skips reporting', async t => {
   t.cwd = await fixture(t); const deps = mockDependencies(t, { async analyze() { deps.events.push('analyze'); return { availability: { traces: false }, traceSummary: { requests: 0, databaseSpans: 0, externalClientSpans: 0 }, findings: [] }; } });
-  await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, () => undefined, deps), /Evidence analysis failed.*No correlated request traces/);
+  const output = [];
+  let failure;
+  try { await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps); }
+  catch (error) { failure = error; }
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /Evidence analysis failed.*No correlated request traces/);
   assert.deepEqual(deps.events, ['status', 'audit', 'analyze']);
   assert.match(await readFile(join(t.cwd, '.perflens', 'runs', runId, 'telemetry/metadata.json'), 'utf8'), /grafana/);
+  const endpoint = await otlpTracesEndpoint(join(t.cwd, '.perflens', 'infra'));
+  assert.ok(output.some(line => line.includes(`OTLP traces endpoint ${endpoint}`)));
+  assert.ok(failure.remediation.includes(endpoint));
 });

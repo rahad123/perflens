@@ -36,12 +36,10 @@ startExpressInstrumentation({
 Compile that file with the application and preload it before the server entrypoint imports Express, `pg`, TypeORM, or other instrumented modules:
 
 ```sh
-OTEL_SERVICE_NAME=my-api \
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
-node --require ./dist/perflens-instrumentation.js ./dist/server.js
+OTEL_SERVICE_NAME=my-api node --require ./dist/perflens-instrumentation.js ./dist/server.js
 ```
 
-The package adapter enables the generic Node HTTP and PostgreSQL instrumentation plus Express route instrumentation. OpenTelemetry exports traces to the local Collector. PerfLens does not capture arbitrary headers or request bodies. Keep OTLP pointed at the loopback receiver printed by `perflens infra up`; if PerfLens selected a different port, set that URL explicitly.
+The package adapter enables the generic Node HTTP and PostgreSQL instrumentation plus Express route instrumentation. At startup it reads the selected `OTLP_HTTP_PORT` from the nearest `.perflens/infra/.env` and sets the standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` variable before constructing the exporter. It does not fall back to the SDK's default port when project infrastructure selected another port. If an existing `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` conflicts with the selected local endpoint, bootstrap fails with both the mismatch and the expected URL. `perflens init`, `doctor`, `infra up`, and `audit` print this same endpoint. Apps using their own OpenTelemetry SDK can set the printed URL directly in `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. PerfLens does not capture arbitrary headers or request bodies.
 
 The `serviceName` passed to instrumentation must match `observability.serviceName` in `perflens.config.json`. PerfLens adds `X-PerfLens-Run-Id` and `X-PerfLens-Profile` to audit requests. The instrumentation maps valid values to `perflens.audit.run_id` and `perflens.audit.profile`; they are correlation metadata, never authorization. OpenTelemetry continues to create and propagate trace IDs.
 

@@ -6,7 +6,7 @@ const { tmpdir } = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { validateConfig, loadProject, initialize } = require('../dist/config/project');
 const { Infrastructure, parseContainers, assertLocalDocker } = require('../dist/services/infrastructure');
-const { INFRA_SERVICES, installInfrastructureAssets, infrastructureRoot } = require('../dist/services/workspace');
+const { INFRA_SERVICES, installInfrastructureAssets, infrastructureRoot, otlpTracesEndpoint } = require('../dist/services/workspace');
 const { doctor } = require('../dist/services/doctor');
 const { CliError, formatError } = require('../dist/utils/errors');
 const { docker } = require('../dist/services/process');
@@ -20,7 +20,7 @@ async function fixture(t) {
   t.after(() => rm(dir, { recursive: true, force: true }));
   await writeFile(join(dir, 'perflens.config.json'), JSON.stringify(config));
   for (const file of ['docker-compose.yml', '.env', 'infra/otel-collector/config.yaml', 'infra/tempo/tempo.yaml', 'infra/prometheus/prometheus.yml', 'infra/grafana/provisioning/datasources/datasources.yaml']) {
-    const path = join(dir, file); await mkdir(require('node:path').dirname(path), { recursive: true }); await writeFile(path, 'fixture');
+    const path = join(dir, file); await mkdir(require('node:path').dirname(path), { recursive: true }); await writeFile(path, file === '.env' ? 'OTLP_HTTP_PORT=4318\n' : 'fixture');
   }
   return dir;
 }
@@ -82,6 +82,15 @@ test('init is create-only and never changes application files', async t => {
   assert.equal(repeated.created, false); assert.equal(repeated.projectName, 'new-target');
   assert.equal(await readFile(join(empty, 'perflens.config.json'), 'utf8'), before);
 });
+test('init surfaces the selected project OTLP traces endpoint', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-init-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'package.json'), '{"name":"init-target"}');
+  const result = cli(['init'], dir, { PATH: '' });
+  assert.equal(result.status, 0, result.stderr);
+  const endpoint = await otlpTracesEndpoint(join(dir, '.perflens', 'infra'));
+  assert.ok(result.stdout.includes(endpoint));
+  assert.match(result.stdout, /bootstrap configures this automatically/);
+});
 test('installed infrastructure assets are package-relative, project-local, secret-free, and target the configured local metrics port', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-assets-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const root = await installInfrastructureAssets(dir, 'http://localhost:4567');
@@ -98,10 +107,25 @@ test('installed infrastructure assets are package-relative, project-local, secre
   assert.match(await readFile(join(root, 'prometheus.yml'), 'utf8'), /host\.docker\.internal:4568/);
   assert.equal(await infrastructureRoot(root), root);
 });
+test('installed OTLP endpoint follows selected ports with default and occupied 4318', async t => {
+  const available = await mkdtemp(join(tmpdir(), 'perflens-otlp-default-')); t.after(() => rm(available, { recursive: true, force: true }));
+  const defaultRoot = await installInfrastructureAssets(available, 'http://localhost:3000', async () => true);
+  assert.match(await readFile(join(defaultRoot, '.env'), 'utf8'), /OTLP_HTTP_PORT=4318\n/);
+  assert.equal(await otlpTracesEndpoint(defaultRoot), 'http://127.0.0.1:4318/v1/traces');
+
+  const occupied = await mkdtemp(join(tmpdir(), 'perflens-otlp-alternate-')); t.after(() => rm(occupied, { recursive: true, force: true }));
+  const alternateRoot = await installInfrastructureAssets(occupied, 'http://localhost:3000', async port => port !== 4318);
+  assert.match(await readFile(join(alternateRoot, '.env'), 'utf8'), /OTLP_HTTP_PORT=4319\n/);
+  assert.equal(await otlpTracesEndpoint(alternateRoot), 'http://127.0.0.1:4319/v1/traces');
+
+  const probeFailure = await mkdtemp(join(tmpdir(), 'perflens-otlp-probe-failure-')); t.after(() => rm(probeFailure, { recursive: true, force: true }));
+  await assert.rejects(installInfrastructureAssets(probeFailure, 'http://localhost:3000', async () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); }), /Cannot check local port 3001/);
+});
 test('doctor succeeds on its own occupied ports, fails on daemon/config/Compose errors with remediation', async t => {
   const dir = await fixture(t); const options = { config: join(dir, 'perflens.config.json'), infraDir: dir };
   const output = []; assert.equal(await doctor(options, line => output.push(line), fake(), async () => 'k6 v2.3.0'), true);
   assert.match(output.join('\n'), /used by this PerfLens/);
+  assert.match(output.join('\n'), /OTLP traces endpoint: http:\/\/127\.0\.0\.1:4318\/v1\/traces/);
   for (const failure of ['info', 'version', 'config']) {
     const output = []; const normal = fake();
     const run = async args => { if (args.includes(failure)) throw new Error('simulated failure'); return normal(args); };

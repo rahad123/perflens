@@ -82,7 +82,7 @@ npx perflens doctor
 npx perflens audit
 ```
 
-`init` asks for the local API URL and GET endpoint in an interactive terminal, detects Express from `package.json`, and preserves existing configuration on repeat runs. In non-interactive use, it creates a conservative `/health` example that you should update to a representative GET route. It never changes source code or package dependencies. Infrastructure Compose/config/dashboard assets are copied from the installed package into `.perflens/infra`, not read from this repository. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
+`init` asks for the local API URL and GET endpoint in an interactive terminal, detects Express from `package.json`, and preserves existing configuration on repeat runs. In non-interactive use, it creates a conservative `/health` example that you should update to a representative GET route. It copies infrastructure assets into `.perflens/infra`, selects and records local ports, and prints the consumer's OTLP traces endpoint. The Node instrumentation package reads that same project-local port and configures the standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` before creating its exporter. Init never changes application source code or package dependencies. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
 
 ### Local URLs
 
@@ -92,7 +92,7 @@ npx perflens audit
 | Grafana | `http://localhost:3001` (actual selected URL is printed) |
 | Prometheus | `http://localhost:9090` (actual selected URL is printed) |
 | Tempo query API | `http://localhost:3200` (actual selected URL is printed) |
-| OTLP HTTP receiver | `http://localhost:4318/v1/traces` (actual selected URL is printed) |
+| OTLP HTTP receiver | Selected loopback endpoint is printed by init, doctor, infra up, and audit; the Node bootstrap configures it automatically. |
 
 Grafana provisions the **PerfLens — Local API Performance** dashboard with request rate, 4xx/5xx rate, and p50/p95/p99 latency queries over the standard `perflens_http_*` metrics. The dashboard has data only when the target exposes those metrics. In Grafana → Explore → Tempo, query the run using `{ resource.service.name = "<service-name>" && span.perflens.audit.run_id = "<run-id>" }`.
 

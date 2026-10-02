@@ -5,7 +5,7 @@ import { loadProject } from '../config/project';
 import { report } from '../report/service';
 import { selectProfiles } from './config';
 import { Infrastructure } from '../services/infrastructure';
-import { infrastructureRoot } from '../services/workspace';
+import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { CliError } from '../utils/errors';
 import { audit, AuditOptions } from './service';
 
@@ -18,12 +18,14 @@ function display(value: unknown, digits = 2): string {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : 'unavailable';
 }
 export interface CompleteAuditDependencies {
+  infrastructureRoot(projectDirectory: string, baseUrl: string): Promise<string>;
   infrastructure(root: string): Pick<Infrastructure, 'status' | 'up'>;
   audit: typeof audit;
   analyze: typeof analyze;
   report: typeof report;
 }
 const defaults: CompleteAuditDependencies = {
+  infrastructureRoot: (projectDirectory, baseUrl) => infrastructureRoot(undefined, projectDirectory, baseUrl),
   infrastructure: root => new Infrastructure(root), audit, analyze, report,
 };
 
@@ -35,11 +37,13 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   catch (error) { throw stageError('Configuration validation', error); }
   const projectDirectory = dirname(project.path);
   let root: string;
-  try { root = await infrastructureRoot(options.infraDir, projectDirectory, project.config.target.baseUrl); }
+  try { root = options.infraDir ? await infrastructureRoot(options.infraDir, projectDirectory, project.config.target.baseUrl) : await dependencies.infrastructureRoot(projectDirectory, project.config.target.baseUrl); }
   catch (error) { throw stageError('Infrastructure asset setup', error); }
+  const otlpEndpoint = await otlpTracesEndpoint(root);
   const infra = dependencies.infrastructure(root);
   write(`PerfLens Performance Audit\nProject  ${project.config.project.name}\nTarget   ${project.config.target.baseUrl}\nEndpoints ${project.config.audit?.endpoints.map(e => `GET ${e.path}`).join(', ') ?? 'not configured'}`);
   write('✓ Configuration valid');
+  write(`OTLP traces endpoint ${otlpEndpoint}`);
   try {
     let states = await infra.status();
     if (states.every(item => item.ready)) write('✓ Observability infrastructure already ready');
@@ -60,7 +64,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   try {
     analysis = await dependencies.analyze(options, executed.run.runId, () => undefined);
     if (!analysis.availability.traces || analysis.traceSummary.requests === 0) {
-      throw new CliError('No correlated request traces were collected for this audit.', 'Confirm the target loads @perflens/cli/instrumentation before its framework and database imports, sends OTLP to localhost:4318, and uses the configured service.name. The completed load evidence remains under .perflens/runs.');
+      throw new CliError('No correlated request traces were collected for this audit.', `Confirm the target loads @perflens/cli/instrumentation before its framework and database imports, sends OTLP traces to ${otlpEndpoint}, and uses the configured service.name. The PerfLens bootstrap reads .perflens/infra/.env automatically; the completed load evidence remains under .perflens/runs.`);
     }
   }
   catch (error) { throw stageError('Evidence analysis', error); }

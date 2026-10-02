@@ -9,7 +9,7 @@ import { Command } from 'commander';
 import { initialize, loadProject } from '../config/project';
 import { doctor, Options } from '../services/doctor';
 import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
-import { infrastructureRoot, LABELS } from '../services/workspace';
+import { infrastructureRoot, LABELS, otlpTracesEndpoint } from '../services/workspace';
 import { runCompleteAudit } from '../audit/orchestrator';
 
 export function registerCommands(program: Command): void {
@@ -36,6 +36,9 @@ export function registerCommands(program: Command): void {
       }
       const result = await initialize(process.cwd(), { projectName, baseUrl, endpoint });
       console.log(`${result.created ? 'Created' : 'Found and preserved'} ${result.path}\n${result.created ? 'Created' : 'Verified'} .perflens/{runs,results,logs}. No application source or dependencies were changed.`);
+      const initializedProject = await loadProject(result.path);
+      const root = await infrastructureRoot(undefined, dirname(result.path), initializedProject.config.target.baseUrl);
+      console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(root)} (the PerfLens Node bootstrap configures this automatically).`);
       console.log(express ? 'Express project detected.' : 'Node project detected where package.json is present; framework support is not inferred.');
       let bootstrapped = false;
       for (const file of ['src/perflens-instrumentation.ts', 'src/perflens-instrumentation.js', 'src/instrumentation.ts', 'src/instrumentation.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'index.js', 'server.js']) {
@@ -93,15 +96,17 @@ export function registerCommands(program: Command): void {
       for (const name of ['grafana', 'prometheus']) {
         for (const port of config.services[name].ports ?? []) console.log(`${LABELS[name]}: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       }
-      for (const port of config.services['otel-collector'].ports ?? []) if (Number(port.target) === 4318) console.log(`OTLP HTTP endpoint: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}/v1/traces`);
+      console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
       for (const port of config.services.tempo.ports ?? []) console.log(`Tempo query API: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       console.log('The target application and its database are started separately.');
     });
   infra.command('status').description('Show stopped, ready, or not-ready infrastructure services')
     .action(async () => {
       console.log('PerfLens Infrastructure');
-      const states = await (await service()).status();
+      const control = await service();
+      const states = await control.status();
       for (const state of states) console.log(`${LABELS[state.service].padEnd(20)} ${state.state}`);
+      console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
       if (states.some(s => s.failed)) process.exitCode = 1;
     });
   infra.command('down').description('Stop only audit infrastructure; preserve containers, volumes, and target services')

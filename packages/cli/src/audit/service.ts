@@ -58,6 +58,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     dependencies.write(`✓ ${run.engine.version}`);
     metadata.infrastructure = await dependencies.infrastructure(infraDir, dirname(configPath), config.target.baseUrl); checkCancelled(signal);
     dependencies.write('✓ Collector, Tempo, Prometheus, and Grafana ready');
+    dependencies.write(`OTLP traces endpoint: ${metadata.infrastructure.otlpTracesEndpoint}`);
     for (const endpoint of auditConfig.endpoints) {
       await dependencies.target(config, endpoint, store.id, signal);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
