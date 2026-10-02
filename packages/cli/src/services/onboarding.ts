@@ -18,9 +18,18 @@ export async function ensureProjectForAudit(cwd = process.cwd(), configPath?: st
   if (!ask) throw new CliError('First-time audit setup needs a local target and representative GET endpoint.', 'Run `npx perflens audit` in an interactive terminal and answer the two setup questions. No files were changed.');
 
   const baseUrl = (await ask('Local API base URL', 'http://localhost:3000')).trim() || 'http://localhost:3000';
-  const endpoint = (await ask('Representative GET endpoint (for example /api/orders)')).trim();
-  if (!endpoint) throw new CliError('First-time audit setup requires a representative GET endpoint.', 'Rerun the audit and provide an application route. Health and metrics routes are excluded from request tracing. No configuration was written.');
-  const result = await initialize(cwd, { baseUrl, endpoint });
+  const selection = (await ask('Endpoint selection: 1 recommended safe GET routes, 2 choose multiple routes, 3 one route', '3')).trim() || '3';
+  if (!['1', '2', '3'].includes(selection)) throw new CliError('Invalid endpoint selection.', 'Choose 1, 2, or 3 and rerun the audit. No configuration was written.', 2);
+  const endpointPrompt = selection === '1'
+    ? 'Automatic route recommendations are unavailable for this app. Enter known safe GET paths manually (comma-separated)'
+    : selection === '3' ? 'GET endpoint to audit (for example /api/orders)' : 'GET endpoints to audit (comma-separated paths)';
+  const entered = (await ask(endpointPrompt)).trim();
+  const endpoints = entered.split(',').map(path => path.trim()).filter(Boolean);
+  if (!endpoints.length) throw new CliError('First-time audit setup requires at least one representative GET endpoint.', 'Rerun the audit and provide application routes. Health and metrics routes are excluded from request tracing. No configuration was written.');
+  if (endpoints.length > 8) throw new CliError('PerfLens supports at most 8 selected GET endpoints.', 'Choose a smaller representative endpoint set. No configuration was written.', 2);
+  const excluded = endpoints.find(path => /^\/(?:health|metrics)(?:\/|$)/i.test(path));
+  if (excluded) throw new CliError(`The route ${excluded} is excluded from representative auditing.`, 'Select a business GET route instead. No configuration was written.', 2);
+  const result = await initialize(cwd, { baseUrl, endpoint: endpoints });
   const project = await loadProject(result.path, cwd);
   return { created: result.created, path: result.path, projectName: project.config.project.name, framework: await projectFramework(cwd) };
 }

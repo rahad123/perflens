@@ -66,8 +66,20 @@ test('one-command audit reuses healthy infrastructure and runs measurement, anal
 
 test('a k6/audit failure is stage-labelled and never proceeds to analysis or report', async t => {
   t.cwd = await fixture(t);
-  const deps = mockDependencies(t, { async audit() { deps.events.push('audit'); throw new Error('k6 exited 1'); } });
-  await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, () => undefined, deps), /Audit execution or telemetry preflight failed.*k6 exited 1/);
+  const deps = mockDependencies(t, { async audit() { deps.events.push('audit'); throw new Error('k6 exited 1 after HTTP 500 responses'); } });
+  await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, () => undefined, deps), error => /Load execution failed.*k6 exited 1 after HTTP 500/.test(error.message) && /Load test: failed or incomplete/.test(error.message) && !/Load test: not started/.test(error.message) && /Analysis: not run/.test(error.message) && /Report: not generated/.test(error.message));
+  assert.deepEqual(deps.events, ['status', 'audit']);
+});
+test('HTTP 401 preflight explicitly reports that load, analysis, and report did not run', async t => {
+  t.cwd = await fixture(t); const deps = mockDependencies(t, { async audit() { deps.events.push('audit'); throw new Error('Target preflight returned HTTP 401 for GET /api/private'); } });
+  let failure;
+  try { await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, () => undefined, deps); } catch (error) { failure = error; }
+  assert.ok(failure);
+  assert.match(failure.message, /Audit stopped before load testing/);
+  assert.match(failure.message, /Load test: not started/);
+  assert.match(failure.message, /Analysis: not run/);
+  assert.match(failure.message, /Report: not generated/);
+  assert.match(failure.remediation, /target\.headers.*environment-variable references/);
   assert.deepEqual(deps.events, ['status', 'audit']);
 });
 
@@ -79,6 +91,8 @@ test('missing correlated telemetry fails after preserving audit evidence and ski
   catch (error) { failure = error; }
   assert.ok(failure instanceof Error);
   assert.match(failure.message, /Evidence analysis failed.*No correlated request traces/);
+  assert.match(failure.message, /Load test: completed \(evidence preserved\)/);
+  assert.match(failure.message, /Report: not generated/);
   assert.deepEqual(deps.events, ['status', 'audit', 'analyze']);
   assert.match(await readFile(join(t.cwd, '.perflens', 'runs', runId, 'telemetry/metadata.json'), 'utf8'), /grafana/);
   const endpoint = await otlpTracesEndpoint(join(t.cwd, '.perflens', 'infra'));

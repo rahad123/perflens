@@ -45,6 +45,27 @@ test('zero-finding runs remain valid and produce conservative report language', 
   assert.match(html, /Latency by profile/);
   assert.match(html, /p99/);
 });
+test('multi-endpoint report comparison uses endpoint-scoped k6 samples and existing Phase 3 findings only', () => {
+  const input = fixture({ findings: [finding({ target: { method: 'GET', path: '/products' }, severity: 'P1', confidence: 'medium' })] });
+  const profile = input.profiles[0].result;
+  const products = { method: 'GET', path: '/products' };
+  profile.target.endpoints.push(products);
+  input.run.profiles[0].result = profile;
+  profile.metrics.endpointResults = [
+    { target: { method: 'GET', path: '/orders' }, metrics: { requests: 12, rps: 1.2, errorRate: 0, latencyMs: { p50: 10, p95: 25, p99: 30 } } },
+    { target: products, metrics: { requests: 9, rps: 0.9, errorRate: 0.1, latencyMs: { p50: 50, p95: 150, p99: 200 } } },
+  ];
+  const model = build(input);
+  const html = renderHtml(model), markdown = renderMarkdown(model);
+  assert.match(html, /Endpoint comparison/);
+  assert.match(html, /GET \/products/);
+  assert.match(html, /150/);
+  assert.match(html, /P1 Repeated &lt;query&gt; pattern/);
+  assert.match(markdown, /GET \/products/);
+  assert.ok(markdown.includes('P1 Repeated \\<query\\> pattern'));
+  assert.equal(model.findings[0].severity, 'P1');
+  assert.equal(model.findings[0].confidence, 'medium');
+});
 
 test('HTML comparison visualizations use only measured percentiles and conditionally show component evidence', () => {
   const model = build(fixture({ findings: [finding({ category: 'dependency', title: 'External dependency latency', evidence: [{ observation: '75% contribution in 12 traces', source: 'Tempo' }] })] }));

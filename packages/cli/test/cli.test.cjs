@@ -71,9 +71,12 @@ test('config discovery searches parents, explicit paths work, malformed/missing 
 test('init is create-only and never changes application files', async t => {
   const dir = await fixture(t); const empty = join(dir, 'new-target'); await mkdir(empty);
   await writeFile(join(empty, 'package.json'), '{"private":true}');
+  await writeFile(join(empty, '.gitignore'), 'node_modules/\n# existing project ignores\n');
   const first = await initialize(empty);
   assert.equal(first.created, true);
   for (const folder of ['runs', 'results', 'logs']) await access(join(empty, '.perflens', folder));
+  const expectedGitignore = 'node_modules/\n# existing project ignores\n.perflens/\n';
+  assert.equal(await readFile(join(empty, '.gitignore'), 'utf8'), expectedGitignore);
   assert.equal(await readFile(join(empty, 'package.json'), 'utf8'), '{"private":true}');
   const custom = JSON.parse(await readFile(join(empty, 'perflens.config.json'), 'utf8'));
   custom.target.baseUrl = 'http://localhost:4310'; custom.audit.endpoints[0].path = '/api/orders';
@@ -82,6 +85,7 @@ test('init is create-only and never changes application files', async t => {
   const repeated = await initialize(empty, { baseUrl: 'http://localhost:9999', endpoint: '/replace-me' });
   assert.equal(repeated.created, false); assert.equal(repeated.projectName, 'new-target');
   assert.equal(await readFile(join(empty, 'perflens.config.json'), 'utf8'), before);
+  assert.equal(await readFile(join(empty, '.gitignore'), 'utf8'), expectedGitignore, 'existing ignore content is preserved and the rule is not duplicated');
 });
 test('first audit setup asks only for target details, creates config through init service, and recognizes Express', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-onboarding-')); t.after(() => rm(dir, { recursive: true, force: true }));
@@ -89,12 +93,32 @@ test('first audit setup asks only for target details, creates config through ini
   const prompts = [];
   const result = await ensureProjectForAudit(dir, undefined, async (question, defaultValue) => {
     prompts.push({ question, defaultValue });
-    return question.includes('base URL') ? 'http://localhost:4567' : '/api/orders';
+    if (question.includes('base URL')) return 'http://localhost:4567';
+    if (question.startsWith('Endpoint selection')) return '3';
+    return '/api/orders';
   });
-  assert.equal(result.created, true); assert.equal(result.framework, 'express'); assert.deepEqual(prompts.map(p => p.defaultValue), ['http://localhost:3000', undefined]);
+  assert.equal(result.created, true); assert.equal(result.framework, 'express'); assert.deepEqual(prompts.map(p => p.defaultValue), ['http://localhost:3000', '3', undefined]);
   const saved = await loadProject(result.path);
   assert.equal(saved.config.target.baseUrl, 'http://localhost:4567');
   assert.deepEqual(saved.config.audit.endpoints, [{ method: 'GET', path: '/api/orders' }]);
+});
+test('onboarding can select several explicit safe routes and falls back honestly when route discovery is unavailable', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-multi-onboarding-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const questions = [];
+  const result = await ensureProjectForAudit(dir, undefined, async (question, fallback) => {
+    questions.push(question);
+    if (question.includes('base URL')) return 'http://localhost:4567';
+    if (question.startsWith('Endpoint selection')) return '2';
+    return '/api/orders,/api/products';
+  });
+  assert.equal(result.created, true);
+  assert.deepEqual((await loadProject(result.path)).config.audit.endpoints, [{ method: 'GET', path: '/api/orders' }, { method: 'GET', path: '/api/products' }]);
+  assert.ok(questions.some(question => question.includes('comma-separated')));
+});
+test('automatic route recommendation selection falls back to manual path entry and excludes health endpoints', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-route-fallback-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : question.startsWith('Endpoint selection') ? '1' : '/health'), /excluded from representative auditing/);
+  await assert.rejects(readFile(join(dir, 'perflens.config.json'), 'utf8'), { code: 'ENOENT' });
 });
 test('existing audit project is reused without prompts or config changes; repeat setup remains idempotent', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-existing-')); t.after(() => rm(dir, { recursive: true, force: true }));
@@ -108,7 +132,7 @@ test('existing audit project is reused without prompts or config changes; repeat
 });
 test('first audit setup refuses missing required target details without writing config', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-no-target-')); t.after(() => rm(dir, { recursive: true, force: true }));
-  await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : ''), /requires a representative GET endpoint/);
+  await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : question.startsWith('Endpoint selection') ? '3' : ''), /requires at least one representative GET endpoint/);
   await assert.rejects(readFile(join(dir, 'perflens.config.json'), 'utf8'), { code: 'ENOENT' });
   await assert.rejects(ensureProjectForAudit(dir, undefined), /needs a local target and representative GET endpoint/);
 });

@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { analyze } from '../analysis/service';
-import { loadProject } from '../config/project';
+import { loadProject, resolveTargetHeaders } from '../config/project';
 import { report } from '../report/service';
 import { selectProfiles } from './config';
 import { Infrastructure } from '../services/infrastructure';
@@ -13,6 +13,25 @@ function stageError(stage: string, error: unknown): CliError {
   const detail = error instanceof Error ? error.message : String(error);
   const remediation = error instanceof CliError ? error.remediation : 'Inspect the preserved run artifacts and local service logs before retrying.';
   return new CliError(`${stage} failed. ${detail}`, remediation, error instanceof CliError ? error.exitCode : 1);
+}
+function preLoadStageError(stage: string, error: unknown): CliError {
+  const detail = error instanceof Error ? error.message : String(error);
+  const remediation = error instanceof CliError ? error.remediation : 'Inspect local service state and retry.';
+  const authHint = /HTTP 401|HTTP 403/.test(detail) ? '\nIf this endpoint is private, configure target.headers with environment-variable references; PerfLens does not store credential values.' : '';
+  return new CliError(`${stage} failed. ${detail}\n\nAudit stopped before load testing.\nLoad test: not started\nAnalysis: not run\nReport: not generated.`, `${remediation}${authHint}`, error instanceof CliError ? error.exitCode : 1);
+}
+function auditStageError(error: unknown): CliError {
+  const detail = error instanceof Error ? error.message : String(error);
+  const preflight = /Target preflight|correlated OpenTelemetry|instrumentation in Tempo|target preflight/i.test(detail);
+  if (preflight) return preLoadStageError('Target or telemetry preflight', error);
+  const remediation = error instanceof CliError ? error.remediation : 'Inspect preserved run artifacts and local service logs before retrying.';
+  return new CliError(`Load execution failed. ${detail}\n\nLoad test: failed or incomplete\nAnalysis: not run\nReport: not generated.`, remediation, error instanceof CliError ? error.exitCode : 1);
+}
+function completedLoadStageError(stage: string, error: unknown, next: 'analysis' | 'report'): CliError {
+  const detail = error instanceof Error ? error.message : String(error);
+  const remediation = error instanceof CliError ? error.remediation : 'Inspect the preserved run artifacts before retrying.';
+  const state = next === 'analysis' ? 'Analysis: failed\nReport: not generated.' : 'Analysis: completed\nReport: failed.';
+  return new CliError(`${stage} failed. ${detail}\n\nLoad test: completed (evidence preserved)\n${state}`, remediation, error instanceof CliError ? error.exitCode : 1);
 }
 function display(value: unknown, digits = 2): string {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : 'unavailable';
@@ -36,6 +55,9 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   try { project = await loadProject(options.config); }
   catch (error) { throw stageError('Configuration validation', error); }
   const projectDirectory = dirname(project.path);
+  if ((project.config.audit?.endpoints.length ?? 0) > 1 && !options.confirmMultipleEndpoints) throw new CliError('Multiple endpoints require explicit load-test approval.', 'Review the configured GET endpoint list and rerun interactively, or pass --yes to explicitly authorize these local targets. No load was started.', 2);
+  try { resolveTargetHeaders(project.config.target.headers); }
+  catch (error) { throw preLoadStageError('Request context validation', error); }
   let root: string;
   try { root = options.infraDir ? await infrastructureRoot(options.infraDir, projectDirectory, project.config.target.baseUrl) : await dependencies.infrastructureRoot(projectDirectory, project.config.target.baseUrl); }
   catch (error) { throw stageError('Infrastructure asset setup', error); }
@@ -54,11 +76,11 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
       if (!states.every(item => item.ready)) throw new CliError('Infrastructure readiness checks did not pass.', states.map(item => `${item.service}: ${item.state}`).join('\n'));
       write('✓ Observability infrastructure ready');
     }
-  } catch (error) { throw stageError('Observability startup', error); }
+  } catch (error) { throw preLoadStageError('Observability startup', error); }
 
   let executed;
   try { executed = await dependencies.audit(options, signal); }
-  catch (error) { throw stageError('Audit execution or telemetry preflight', error); }
+  catch (error) { throw auditStageError(error); }
 
   let analysis;
   try {
@@ -67,10 +89,10 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
       throw new CliError('No correlated request traces were collected for this audit.', `Confirm the target loads @perflens/cli/instrumentation before its framework and database imports, sends OTLP traces to ${otlpEndpoint}, and uses the configured service.name. The PerfLens bootstrap reads .perflens/infra/.env automatically; the completed load evidence remains under .perflens/runs.`);
     }
   }
-  catch (error) { throw stageError('Evidence analysis', error); }
+  catch (error) { throw completedLoadStageError('Evidence analysis', error, 'analysis'); }
   let reportModel;
   try { reportModel = await dependencies.report(options, executed.run.runId, () => undefined); }
-  catch (error) { throw stageError('Report generation', error); }
+  catch (error) { throw completedLoadStageError('Report generation', error, 'report'); }
 
   const profileResults = [];
   for (const profile of executed.run.profiles) {

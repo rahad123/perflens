@@ -19,7 +19,7 @@ export async function checkInfrastructure(infraDir?: string, projectDirectory = 
   }
   return { composeProject: config.name, readiness: states, localUrls: urls, otlpTracesEndpoint: await otlpTracesEndpoint(infra.root) };
 }
-export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, runId: string, signal: AbortSignal): Promise<void> {
+export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, runId: string, signal: AbortSignal, requestHeaders: Record<string, string> = {}): Promise<void> {
   checkCancelled(signal);
   const url = new URL(targetUrl(config.target.baseUrl, endpoint));
   // Match k6's fixed localhost mapping; do not use proxy env or follow redirects.
@@ -28,7 +28,7 @@ export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, run
   try {
     response = await fetch(url, {
       method: 'GET', redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(config.audit!.timeoutMs)]),
-      headers: { 'X-PerfLens-Run-Id': runId, 'X-PerfLens-Profile': 'preflight' },
+      headers: { ...requestHeaders, 'X-PerfLens-Run-Id': runId, 'X-PerfLens-Profile': 'preflight' },
     });
     await response.body?.cancel();
   } catch {
