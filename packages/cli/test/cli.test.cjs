@@ -94,15 +94,15 @@ test('first audit setup asks only for target details, creates config through ini
   const result = await ensureProjectForAudit(dir, undefined, async (question, defaultValue) => {
     prompts.push({ question, defaultValue });
     if (question.includes('base URL')) return 'http://localhost:4567';
-    if (question.startsWith('Endpoint selection')) return '3';
+    if (question.startsWith('Endpoint selection')) return '1';
     return '/api/orders';
   });
-  assert.equal(result.created, true); assert.equal(result.framework, 'express'); assert.deepEqual(prompts.map(p => p.defaultValue), ['http://localhost:3000', '3', undefined]);
+  assert.equal(result.created, true); assert.equal(result.framework, 'express'); assert.deepEqual(prompts.map(p => p.defaultValue), ['http://localhost:3000', '1', undefined]);
   const saved = await loadProject(result.path);
   assert.equal(saved.config.target.baseUrl, 'http://localhost:4567');
   assert.deepEqual(saved.config.audit.endpoints, [{ method: 'GET', path: '/api/orders' }]);
 });
-test('onboarding can select several explicit safe routes and falls back honestly when route discovery is unavailable', async t => {
+test('onboarding can select several explicit safe routes and does not claim route discovery', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-multi-onboarding-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const questions = [];
   const result = await ensureProjectForAudit(dir, undefined, async (question, fallback) => {
@@ -113,9 +113,9 @@ test('onboarding can select several explicit safe routes and falls back honestly
   });
   assert.equal(result.created, true);
   assert.deepEqual((await loadProject(result.path)).config.audit.endpoints, [{ method: 'GET', path: '/api/orders' }, { method: 'GET', path: '/api/products' }]);
-  assert.ok(questions.some(question => question.includes('comma-separated')));
+  assert.ok(questions.some(question => question.includes('comma-separated') && question.includes('does not discover routes automatically')));
 });
-test('automatic route recommendation selection falls back to manual path entry and excludes health endpoints', async t => {
+test('single-route onboarding uses honest manual selection and excludes health endpoints', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-route-fallback-')); t.after(() => rm(dir, { recursive: true, force: true }));
   await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : question.startsWith('Endpoint selection') ? '1' : '/health'), /excluded from representative auditing/);
   await assert.rejects(readFile(join(dir, 'perflens.config.json'), 'utf8'), { code: 'ENOENT' });
@@ -132,7 +132,7 @@ test('existing audit project is reused without prompts or config changes; repeat
 });
 test('first audit setup refuses missing required target details without writing config', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-no-target-')); t.after(() => rm(dir, { recursive: true, force: true }));
-  await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : question.startsWith('Endpoint selection') ? '3' : ''), /requires at least one representative GET endpoint/);
+  await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : question.startsWith('Endpoint selection') ? '1' : ''), /requires at least one representative GET endpoint/);
   await assert.rejects(readFile(join(dir, 'perflens.config.json'), 'utf8'), { code: 'ENOENT' });
   await assert.rejects(ensureProjectForAudit(dir, undefined), /needs a local target and representative GET endpoint/);
 });

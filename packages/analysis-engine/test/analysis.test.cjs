@@ -81,6 +81,45 @@ test('many fast different queries do not trigger N+1 or database dominance', () 
   assert.equal(result.findings.some(item => item.ruleId.startsWith('database.')), false);
 });
 
+test('multi-endpoint DB findings and supporting trace evidence remain isolated by http.route', () => {
+  const endpoints = [
+    { method: 'GET', path: '/orders' },
+    { method: 'GET', path: '/performance/n-plus-one' },
+    { method: 'GET', path: '/performance/slow-query' },
+  ];
+  const traces = [];
+  for (const endpoint of endpoints) for (let index = 0; index < 10; index++) {
+    const traceId = `${endpoint.path}-${index}`;
+    const rootSpan = root(traceId, index, 700);
+    rootSpan.name = `GET ${endpoint.path}`;
+    rootSpan.attributes['http.route'] = endpoint.path;
+    traces.push(rootSpan);
+    if (endpoint.path === '/performance/n-plus-one') {
+      traces.push(span(traceId, `list-${index}`, rootSpan.spanId, 'client', 1, 2, 'pg.query: SELECT * FROM orders LIMIT 20', { 'db.system': 'postgresql', 'db.query.sanitized': 'SELECT * FROM orders LIMIT ?' }));
+      for (let query = 0; query < 20; query++) traces.push(span(traceId, `item-${index}-${query}`, rootSpan.spanId, 'client', 3 + query, 4 + query, 'pg.query: SELECT * FROM order_items WHERE order_id = $1', { 'db.system': 'postgresql', 'db.query.sanitized': 'SELECT * FROM order_items WHERE order_id = $?' }));
+    } else if (endpoint.path === '/performance/slow-query') {
+      traces.push(span(traceId, `slow-${index}`, rootSpan.spanId, 'client', 20, 620, 'pg.query: SELECT * FROM slow_rows WHERE id = $1', { 'db.system': 'postgresql', 'db.query.sanitized': 'SELECT * FROM slow_rows WHERE id = $?' }));
+    } else {
+      traces.push(span(traceId, `orders-${index}`, rootSpan.spanId, 'client', 1, 2, 'pg.query: SELECT id FROM orders LIMIT 20', { 'db.system': 'postgresql', 'db.query.sanitized': 'SELECT id FROM orders LIMIT ?' }));
+    }
+  }
+  const input = evidence({ traces });
+  input.target.endpoints = endpoints;
+  input.profiles.forEach(item => { item.target.endpoints = endpoints; });
+  const findings = analyzeEvidence(input).findings;
+  const repeated = findings.filter(item => item.ruleId === 'database.repeated-operation');
+  const slow = findings.filter(item => item.ruleId === 'database.slow-operation');
+  assert.deepEqual(repeated.map(item => item.target.path), ['/performance/n-plus-one']);
+  assert.deepEqual(slow.map(item => item.target.path), ['/performance/slow-query']);
+  assert.equal(findings.some(item => item.target.path === '/orders'), false);
+  assert.equal(findings.some(item => item.target.path === '/performance/n-plus-one' && item.ruleId === 'database.slow-operation'), false);
+  assert.equal(findings.some(item => item.target.path === '/performance/slow-query' && item.ruleId === 'database.repeated-operation'), false);
+  for (const finding of findings) for (const item of finding.evidence) {
+    const referenced = item.value?.sampleTraceIds ?? [];
+    for (const id of referenced) assert.ok(String(id).includes(finding.target.path), `trace ${id} must belong to ${finding.target.path}`);
+  }
+});
+
 test('generic SELECT span names without a relation-bearing query shape are not grouped as repeated queries', () => {
   const traces = [];
   for (let i = 0; i < 10; i++) {

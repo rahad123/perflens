@@ -18,11 +18,11 @@ export async function ensureProjectForAudit(cwd = process.cwd(), configPath?: st
   if (!ask) throw new CliError('First-time audit setup needs a local target and representative GET endpoint.', 'Run `npx perflens audit` in an interactive terminal and answer the two setup questions. No files were changed.');
 
   const baseUrl = (await ask('Local API base URL', 'http://localhost:3000')).trim() || 'http://localhost:3000';
-  const selection = (await ask('Endpoint selection: 1 recommended safe GET routes, 2 choose multiple routes, 3 one route', '3')).trim() || '3';
-  if (!['1', '2', '3'].includes(selection)) throw new CliError('Invalid endpoint selection.', 'Choose 1, 2, or 3 and rerun the audit. No configuration was written.', 2);
+  const selection = (await ask('Endpoint selection: 1 enter one known safe GET path, 2 enter multiple known safe GET paths', '1')).trim() || '1';
+  if (!['1', '2'].includes(selection)) throw new CliError('Invalid endpoint selection.', 'Choose 1 or 2 and rerun the audit. No configuration was written.', 2);
   const endpointPrompt = selection === '1'
-    ? 'Automatic route recommendations are unavailable for this app. Enter known safe GET paths manually (comma-separated)'
-    : selection === '3' ? 'GET endpoint to audit (for example /api/orders)' : 'GET endpoints to audit (comma-separated paths)';
+    ? 'Known GET path to audit (for example /api/orders; PerfLens does not discover routes automatically)'
+    : 'Known safe GET paths to audit (comma-separated; PerfLens does not discover routes automatically)';
   const entered = (await ask(endpointPrompt)).trim();
   const endpoints = entered.split(',').map(path => path.trim()).filter(Boolean);
   if (!endpoints.length) throw new CliError('First-time audit setup requires at least one representative GET endpoint.', 'Rerun the audit and provide application routes. Health and metrics routes are excluded from request tracing. No configuration was written.');
