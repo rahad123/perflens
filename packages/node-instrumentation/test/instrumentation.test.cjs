@@ -32,6 +32,18 @@ test('configures the OpenTelemetry traces exporter from the consumer selected Co
   }
 });
 
+test('a previously PerfLens-managed OTLP endpoint follows recovered infrastructure ports', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'perflens-otel-recovered-port-'));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  const infra = join(project, '.perflens', 'infra'); await mkdir(infra, { recursive: true });
+  const env = {};
+  await writeFile(join(infra, '.env'), 'OTLP_HTTP_PORT=4333\n');
+  assert.equal(configurePerfLensOtlpEndpoint(project, env), 'http://127.0.0.1:4333/v1/traces');
+  await writeFile(join(infra, '.env'), 'OTLP_HTTP_PORT=4335\n');
+  assert.equal(configurePerfLensOtlpEndpoint(project, env), 'http://127.0.0.1:4335/v1/traces');
+  assert.equal(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, 'http://127.0.0.1:4335/v1/traces');
+});
+
 test('rejects a conflicting explicit traces endpoint instead of silently exporting to another port', async t => {
   const project = await mkdtemp(join(tmpdir(), 'perflens-otel-conflict-'));
   t.after(() => rm(project, { recursive: true, force: true }));

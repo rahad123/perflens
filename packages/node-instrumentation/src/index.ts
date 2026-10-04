@@ -16,6 +16,7 @@ export interface PerfLensCorrelation {
 
 const runIdPattern = /^pfl_\d{8}T\d{9}Z_[0-9a-f-]{36}$/;
 const profiles = new Set(['preflight', 'baseline', 'normal', 'peak', 'stress']);
+const managedExporterEndpoints = new WeakMap<NodeJS.ProcessEnv, string>();
 
 /** Read only the bounded PerfLens metadata contract; other headers are never copied to spans. */
 export function readPerfLensCorrelation(headers: Record<string, unknown>): PerfLensCorrelation {
@@ -63,10 +64,12 @@ export function configurePerfLensOtlpEndpoint(cwd = process.cwd(), env: NodeJS.P
   }
   const selected = `http://127.0.0.1:${port}/v1/traces`;
   const configured = env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
-  if (configured && new URL(configured).href !== selected) {
+  const previouslyManaged = managedExporterEndpoints.get(env);
+  if (configured && new URL(configured).href !== selected && configured !== previouslyManaged) {
     throw new Error(`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT does not match this PerfLens project. Use ${selected} or unset the override.`);
   }
   env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = selected;
+  managedExporterEndpoints.set(env, selected);
   return selected;
 }
 

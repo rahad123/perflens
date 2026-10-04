@@ -5,7 +5,7 @@ import { docker, Runner } from './process';
 import { infrastructureRoot, otlpTracesEndpoint } from './workspace';
 import { K6Runner } from '../audit/k6';
 export interface Options { config?: string; infraDir?: string }
-export async function doctor(options: Options, write: (line: string) => void = console.log, run: Runner = docker, checkLoadEngine: () => Promise<string> = () => new K6Runner().version(new AbortController().signal)): Promise<boolean> {
+export async function doctor(options: Options, write: (line: string) => void = console.log, run: Runner = docker, checkLoadEngine: () => Promise<string> = () => new K6Runner().version(new AbortController().signal), makeInfrastructure: (root: string) => Infrastructure = root => new Infrastructure(root, run)): Promise<boolean> {
   let failures = 0;
   async function check(label: string, fn: () => Promise<unknown>): Promise<boolean> {
     try { await fn(); write(`✓ ${label}`); return true; }
@@ -30,7 +30,7 @@ export async function doctor(options: Options, write: (line: string) => void = c
   await check('PerfLens infrastructure assets available', async () => { root = await infrastructureRoot(options.infraDir, projectDirectory, baseUrl); });
   if (root) await check('Consumer OTLP traces endpoint configured', async () => { write(`OTLP traces endpoint: ${await otlpTracesEndpoint(root!)}`); });
   if (root && compose) {
-    const infra = new Infrastructure(root, run);
+    const infra = makeInfrastructure(root);
     await check('Compose configuration valid', async () => {
       const config = await infra.configuration();
       if (daemon) for (const message of await infra.checkPorts(config)) write(`✓ ${message}`);

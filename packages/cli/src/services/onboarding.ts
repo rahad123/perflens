@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
 import { findProject, initialize, loadProject } from '../config/project';
+import { Endpoint, validateSelectedEndpoints } from '../audit/config';
 import { CliError } from '../utils/errors';
 
 export interface FirstAuditSetup {
@@ -8,6 +9,17 @@ export interface FirstAuditSetup {
   path: string;
   projectName: string;
   framework: 'express' | 'node' | 'unknown';
+}
+
+export async function chooseAuditEndpoints(current: Endpoint[], ask: (question: string, defaultValue?: string) => Promise<string>): Promise<{ endpoints: Endpoint[]; changed: boolean }> {
+  const choice = (await ask(`Current audit targets:\n${current.map(endpoint => `  GET ${endpoint.path}`).join('\n')}\nWhat would you like to audit?\n1. Use current endpoints\n2. Choose different endpoints\n3. Audit one endpoint`, '1')).trim() || '1';
+  if (choice === '1') return { endpoints: current, changed: false };
+  if (choice !== '2' && choice !== '3') throw new CliError('Invalid endpoint selection.', 'Choose 1, 2, or 3. No load was started.', 2);
+  const entered = (await ask(choice === '3'
+    ? 'Known safe GET path (PerfLens does not discover routes)'
+    : 'Known safe GET paths (comma-separated; PerfLens does not discover routes)')).trim();
+  const endpoints = validateSelectedEndpoints(entered.split(',').map(path => ({ method: 'GET', path: path.trim() })));
+  return { endpoints, changed: endpoints.length !== current.length || endpoints.some((endpoint, index) => endpoint.path !== current[index]?.path) };
 }
 
 /** Reuses the create-only init service for first audit; never edits existing config. */

@@ -27,10 +27,9 @@ export function durationMs(duration: unknown): number {
   if (typeof duration !== 'string' || !/^[1-9]\d?s$|^1[01]\ds$|^120s$/.test(duration)) invalid('Profile duration must be 1s–120s (whole seconds).');
   return Number(duration.slice(0, -1)) * 1000;
 }
-export function validateAudit(value: unknown): AuditConfig {
-  const input = fields(value, ['endpoints', 'profiles', 'timeoutMs'], 'audit');
-  if (!Array.isArray(input.endpoints) || input.endpoints.length < 1 || input.endpoints.length > 8) invalid('Configure 1–8 audit endpoints.');
-  const endpoints = input.endpoints.map(item => {
+export function validateEndpoints(value: unknown): Endpoint[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) invalid('Configure 1–8 audit endpoints.');
+  const endpoints = value.map(item => {
     const endpoint = fields(item, ['method', 'path'], 'endpoint');
     if (endpoint.method !== 'GET') invalid('Phase 2 audit endpoints must use GET.');
     if (typeof endpoint.path !== 'string' || endpoint.path.length > 200 || !/^\/[a-zA-Z0-9._~/-]*$/.test(endpoint.path) || endpoint.path.includes('//') || endpoint.path.split('/').some(part => ['.', '..'].includes(part))) {
@@ -38,7 +37,17 @@ export function validateAudit(value: unknown): AuditConfig {
     }
     return { method: 'GET' as const, path: endpoint.path };
   });
-  if (new Set(endpoints.map(e => e.path)).size !== endpoints.length) invalid('Duplicate audit endpoints are not allowed.');
+  if (new Set(endpoints.map(endpoint => endpoint.path)).size !== endpoints.length) invalid('Duplicate audit endpoints are not allowed.');
+  return endpoints;
+}
+export function validateSelectedEndpoints(value: unknown): Endpoint[] {
+  const endpoints = validateEndpoints(value);
+  if (endpoints.some(endpoint => /^\/(?:health|metrics)(?:\/|$)/i.test(endpoint.path))) invalid('Health and metrics routes are excluded from representative auditing.');
+  return endpoints;
+}
+export function validateAudit(value: unknown): AuditConfig {
+  const input = fields(value, ['endpoints', 'profiles', 'timeoutMs'], 'audit');
+  const endpoints = validateEndpoints(input.endpoints);
   const overrides = input.profiles === undefined ? {} : fields(input.profiles, [...PROFILE_NAMES], 'profiles');
   const profiles = {} as Record<ProfileName, Profile>;
   for (const name of PROFILE_NAMES) {
