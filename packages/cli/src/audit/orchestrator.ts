@@ -88,6 +88,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
     }
     otlpEndpoint = await otlpTracesEndpoint(root);
     write(`OTLP traces endpoint ${otlpEndpoint}`);
+    write(`Docker container traces endpoint ${await otlpTracesEndpoint(root, 'container')} (set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT in the consumer container)`);
   } catch (error) { throw preLoadStageError('Observability startup', error); }
 
   let executed;

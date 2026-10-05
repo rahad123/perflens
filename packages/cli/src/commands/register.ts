@@ -39,7 +39,8 @@ export function registerCommands(program: Command): void {
       console.log(`${result.created ? 'Created' : 'Found and preserved'} ${result.path}\n${result.created ? 'Created' : 'Verified'} .perflens/{runs,results,logs}. No application source or dependencies were changed.`);
       const initializedProject = await loadProject(result.path);
       const root = await infrastructureRoot(undefined, dirname(result.path), initializedProject.config.target.baseUrl);
-      console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(root)} (the PerfLens Node bootstrap configures this automatically).`);
+      console.log(`Host OTLP traces endpoint: ${await otlpTracesEndpoint(root)} (the PerfLens Node bootstrap configures this automatically).`);
+      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(root, 'container')} (pass as OTEL_EXPORTER_OTLP_TRACES_ENDPOINT when starting the app container).`);
       console.log(express ? 'Express project detected.' : 'Node project detected where package.json is present; framework support is not inferred.');
       let bootstrapped = false;
       for (const file of ['src/perflens-instrumentation.ts', 'src/perflens-instrumentation.js', 'src/instrumentation.ts', 'src/instrumentation.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'index.js', 'server.js']) {
@@ -137,6 +138,7 @@ export function registerCommands(program: Command): void {
         for (const port of config.services[name].ports ?? []) console.log(`${LABELS[name]}: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       }
       console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
+      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(control.root, 'container')}`);
       for (const port of config.services.tempo.ports ?? []) console.log(`Tempo query API: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       console.log('The target application and its database are started separately.');
     });
@@ -147,6 +149,7 @@ export function registerCommands(program: Command): void {
       const states = await control.status();
       for (const state of states) console.log(`${LABELS[state.service].padEnd(20)} ${state.state}`);
       console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
+      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(control.root, 'container')}`);
       if (states.some(s => s.failed)) process.exitCode = 1;
     });
   infra.command('down').description('Stop only audit infrastructure; preserve containers, volumes, and target services')

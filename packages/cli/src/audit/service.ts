@@ -69,7 +69,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
     }
-    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal);
+    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal, undefined, metadata.infrastructure.containerOtlpTracesEndpoint);
     dependencies.write('✓ Correlated OpenTelemetry traces verified before load');
     await dependencies.runner.prepare(store.directory);
     await store.write('raw/engine.json', { schemaVersion: 1, ...run.engine, scriptSha256: createHash('sha256').update(await readFile(join(store.directory, 'load-test.js'))).digest('hex') });

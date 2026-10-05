@@ -81,7 +81,7 @@ export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl =
   return root;
 }
 
-export async function otlpTracesEndpoint(root: string): Promise<string> {
+export async function otlpTracesEndpoint(root: string, mode: 'host' | 'container' = 'host'): Promise<string> {
   const environment = await readFile(join(root, '.env'), 'utf8').catch(() => {
     throw new CliError('PerfLens infrastructure port configuration is missing.', 'Run perflens init or repair .perflens/infra/.env before starting the target.');
   });
@@ -90,7 +90,7 @@ export async function otlpTracesEndpoint(root: string): Promise<string> {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new CliError('PerfLens OTLP HTTP port is invalid.', 'Set OTLP_HTTP_PORT to a local TCP port in .perflens/infra/.env, then restart PerfLens infrastructure.');
   }
-  return `http://127.0.0.1:${port}/v1/traces`;
+  return `http://${mode === 'container' ? 'host.docker.internal' : '127.0.0.1'}:${port}/v1/traces`;
 }
 
 export async function infrastructureRoot(explicit?: string, cwd = process.cwd(), baseUrl?: string): Promise<string> {

@@ -194,6 +194,31 @@ test('Tempo instrumentation probe is run/profile scoped and accepts a real corre
     await assert.rejects(checkInstrumentation('http://127.0.0.1:3200', 'service-a', 'run-b', new AbortController().signal, { attempts: 1, intervalMs: 0, timeoutMs: 1000 }), /could not find its correlated OpenTelemetry server span/);
   } finally { global.fetch = original; }
 });
+test('missing correlated trace provides the selected Docker host endpoint without starting load', async () => {
+  const original = global.fetch;
+  global.fetch = async url => new URL(url).pathname === '/ready'
+    ? { ok: true, body: null }
+    : { ok: true, json: async () => ({ traces: [] }) };
+  try {
+    await assert.rejects(
+      checkInstrumentation('http://127.0.0.1:3200', 'service-a', 'run-c', new AbortController().signal, { attempts: 1, intervalMs: 0, timeoutMs: 1000 }, 'http://host.docker.internal:4335/v1/traces'),
+      error => /could not find its correlated OpenTelemetry server span/.test(error.message)
+        && /127\.0\.0\.1 refers to that container/.test(error.remediation)
+        && /host\.docker\.internal:4335\/v1\/traces/.test(error.remediation)
+        && /No load was started/.test(error.remediation),
+    );
+  } finally { global.fetch = original; }
+});
+test('telemetry preflight distinguishes unavailable Tempo from a reachable target without traces', async () => {
+  const original = global.fetch;
+  global.fetch = async () => { throw new Error('connection refused'); };
+  try {
+    await assert.rejects(
+      checkInstrumentation('http://127.0.0.1:3200', 'service-a', 'run-d', new AbortController().signal, { attempts: 1, intervalMs: 0, timeoutMs: 1000 }),
+      error => /PerfLens Tempo is unavailable/.test(error.message) && /No load was started/.test(error.remediation),
+    );
+  } finally { global.fetch = original; }
+});
 test('failed k6 preserves completed profiles and failure evidence, never completing the audit', async t => {
   const dir = await temp(t), path = await project(dir); const deps = fakeDependencies();
   const original = deps.runner.profile;

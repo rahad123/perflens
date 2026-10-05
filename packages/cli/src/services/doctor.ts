@@ -28,7 +28,10 @@ export async function doctor(options: Options, write: (line: string) => void = c
   }
   let root: string | undefined;
   await check('PerfLens infrastructure assets available', async () => { root = await infrastructureRoot(options.infraDir, projectDirectory, baseUrl); });
-  if (root) await check('Consumer OTLP traces endpoint configured', async () => { write(`OTLP traces endpoint: ${await otlpTracesEndpoint(root!)}`); });
+  if (root) await check('Consumer OTLP traces endpoint configured', async () => {
+    write(`Host OTLP traces endpoint: ${await otlpTracesEndpoint(root!)}`);
+    write(`Docker consumer endpoint: ${await otlpTracesEndpoint(root!, 'container')}`);
+  });
   if (root && compose) {
     const infra = makeInfrastructure(root);
     await check('Compose configuration valid', async () => {

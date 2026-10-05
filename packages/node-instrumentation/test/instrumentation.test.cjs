@@ -32,7 +32,26 @@ test('configures the OpenTelemetry traces exporter from the consumer selected Co
   }
 });
 
-test('a previously PerfLens-managed OTLP endpoint follows recovered infrastructure ports', async t => {
+test('host consumers retain loopback while Docker consumers may use the same authoritative port through host.docker.internal', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'perflens-otel-container-host-'));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  const infra = join(project, '.perflens', 'infra'); await mkdir(infra, { recursive: true });
+  await writeFile(join(infra, '.env'), 'OTLP_HTTP_PORT=4335\n');
+  assert.equal(configurePerfLensOtlpEndpoint(project, {}), 'http://127.0.0.1:4335/v1/traces');
+  const containerEnv = { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://host.docker.internal:4335/v1/traces' };
+  assert.equal(configurePerfLensOtlpEndpoint(project, containerEnv), 'http://host.docker.internal:4335/v1/traces');
+});
+
+test('Docker consumer endpoint cannot select a different port or an arbitrary remote host', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'perflens-otel-container-conflict-'));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  await mkdir(join(project, '.perflens', 'infra'), { recursive: true });
+  await writeFile(join(project, '.perflens', 'infra', '.env'), 'OTLP_HTTP_PORT=4335\n');
+  assert.throws(() => configurePerfLensOtlpEndpoint(project, { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://host.docker.internal:4333/v1/traces' }), /does not match this PerfLens project.*4335/);
+  assert.throws(() => configurePerfLensOtlpEndpoint(project, { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'https://collector.example:4335/v1/traces' }), /supported local host/);
+});
+
+test('a previously PerfLens-managed OTLP endpoint follows recovered infrastructure ports and preserves its consumer host', async t => {
   const project = await mkdtemp(join(tmpdir(), 'perflens-otel-recovered-port-'));
   t.after(() => rm(project, { recursive: true, force: true }));
   const infra = join(project, '.perflens', 'infra'); await mkdir(infra, { recursive: true });
@@ -42,6 +61,10 @@ test('a previously PerfLens-managed OTLP endpoint follows recovered infrastructu
   await writeFile(join(infra, '.env'), 'OTLP_HTTP_PORT=4335\n');
   assert.equal(configurePerfLensOtlpEndpoint(project, env), 'http://127.0.0.1:4335/v1/traces');
   assert.equal(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, 'http://127.0.0.1:4335/v1/traces');
+  env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://host.docker.internal:4335/v1/traces';
+  assert.equal(configurePerfLensOtlpEndpoint(project, env), 'http://host.docker.internal:4335/v1/traces');
+  await writeFile(join(infra, '.env'), 'OTLP_HTTP_PORT=4336\n');
+  assert.equal(configurePerfLensOtlpEndpoint(project, env), 'http://host.docker.internal:4336/v1/traces');
 });
 
 test('rejects a conflicting explicit traces endpoint instead of silently exporting to another port', async t => {

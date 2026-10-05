@@ -190,11 +190,13 @@ test('installed OTLP endpoint follows selected ports with default and occupied 4
   const defaultRoot = await installInfrastructureAssets(available, 'http://localhost:3000', async () => true);
   assert.match(await readFile(join(defaultRoot, '.env'), 'utf8'), /OTLP_HTTP_PORT=4318\n/);
   assert.equal(await otlpTracesEndpoint(defaultRoot), 'http://127.0.0.1:4318/v1/traces');
+  assert.equal(await otlpTracesEndpoint(defaultRoot, 'container'), 'http://host.docker.internal:4318/v1/traces');
 
   const occupied = await mkdtemp(join(tmpdir(), 'perflens-otlp-alternate-')); t.after(() => rm(occupied, { recursive: true, force: true }));
   const alternateRoot = await installInfrastructureAssets(occupied, 'http://localhost:3000', async port => port !== 4318);
   assert.match(await readFile(join(alternateRoot, '.env'), 'utf8'), /OTLP_HTTP_PORT=4319\n/);
   assert.equal(await otlpTracesEndpoint(alternateRoot), 'http://127.0.0.1:4319/v1/traces');
+  assert.equal(await otlpTracesEndpoint(alternateRoot, 'container'), 'http://host.docker.internal:4319/v1/traces');
 
   const probeFailure = await mkdtemp(join(tmpdir(), 'perflens-otlp-probe-failure-')); t.after(() => rm(probeFailure, { recursive: true, force: true }));
   await assert.rejects(installInfrastructureAssets(probeFailure, 'http://localhost:3000', async () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); }), /Cannot check local port 3001/);
