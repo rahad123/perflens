@@ -118,6 +118,20 @@ async function getJson(url: URL): Promise<Json> {
 }
 
 export interface TraceSnapshot { spans: SanitizedSpan[]; traceCount: number; spanCount: number; truncated: boolean }
+export async function collectTempoEvidenceWithRetry(
+  collect: () => Promise<TraceSnapshot>,
+  options: { attempts?: number; intervalMs?: number; wait?: (ms: number) => Promise<void> } = {},
+): Promise<TraceSnapshot> {
+  const attempts = options.attempts ?? 12, intervalMs = options.intervalMs ?? 500;
+  const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  let snapshot: TraceSnapshot = { spans: [], traceCount: 0, spanCount: 0, truncated: false };
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    snapshot = await collect();
+    if (snapshot.traceCount > 0 || attempt === attempts - 1) return snapshot;
+    await wait(intervalMs);
+  }
+  return snapshot;
+}
 export async function collectTempoEvidence(tempoUrl: string, runId: string, serviceName: string, endpoints: string[], profiles: { profile: string; startedAt: string; endedAt: string }[]): Promise<TraceSnapshot> {
   const base = new URL(tempoUrl);
   const spans: SanitizedSpan[] = [];

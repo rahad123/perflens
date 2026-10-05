@@ -5,7 +5,7 @@ import { loadProject } from '../config/project';
 import { infrastructureRoot } from '../services/workspace';
 import { Infrastructure } from '../services/infrastructure';
 import { CliError } from '../utils/errors';
-import { collectTempoEvidence } from './tempo';
+import { collectTempoEvidence, collectTempoEvidenceWithRetry } from './tempo';
 
 export interface AnalyzeOptions { config?: string; infraDir?: string; offline?: boolean }
 interface RunRecord { schemaVersion: number; runId: string; status: string; startedAt: string; endedAt: string; target: { baseUrl: string }; serviceName: string; profiles: { name: string; status: string; startedAt: string | null; endedAt: string | null; result: string | null }[] }
@@ -109,7 +109,10 @@ export async function analyze(options: AnalyzeOptions, requestedId?: string, wri
     if (options.offline) throw new CliError('No valid evidence snapshot is available for offline analysis.', 'Run perflens analyze once while local PerfLens infrastructure and Tempo retention are available.');
     const profileWindows = run.profiles.flatMap(profile => profile.status === 'completed' && profile.startedAt && profile.endedAt ? [{ profile: profile.name, startedAt: profile.startedAt, endedAt: profile.endedAt }] : []);
     let snapshot: Awaited<ReturnType<typeof collectTempoEvidence>>;
-    try { snapshot = await collectTempoEvidence(await tempoUrl(options), id, run.serviceName, endpointSet(profiles).map(endpoint => endpoint.path), profileWindows); }
+    try {
+      const endpoint = await tempoUrl(options);
+      snapshot = await collectTempoEvidenceWithRetry(() => collectTempoEvidence(endpoint, id, run.serviceName, endpointSet(profiles).map(item => item.path), profileWindows));
+    }
     catch (cause) {
       if (cause instanceof CliError) throw cause;
       throw new CliError('Could not collect correlated Tempo evidence.', 'Start local PerfLens infrastructure and confirm the audit traces are retained.');

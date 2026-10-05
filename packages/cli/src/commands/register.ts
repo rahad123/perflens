@@ -56,7 +56,8 @@ export function registerCommands(program: Command): void {
   program.command('audit').description('Run a bounded local audit, collect telemetry, analyze evidence, and generate reports')
     .option('--profile <names>', 'Comma-separated baseline,normal,peak,stress; default: baseline,normal')
     .option('--yes', 'Explicitly authorize load against all selected local GET endpoints (for non-interactive use)')
-    .action(async (options: { profile?: string; yes?: boolean }) => {
+    .option('--restart-app', 'Explicitly authorize recreating the identified local Compose application service for instrumentation')
+    .action(async (options: { profile?: string; yes?: boolean; restartApp?: boolean }) => {
       const abort = new AbortController();
       const cancel = () => abort.abort();
       process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
@@ -97,7 +98,25 @@ export function registerCommands(program: Command): void {
             finally { prompt.close(); }
           }
         } else if (endpoints.length === 1) console.log(`Selected endpoint: GET ${endpoints[0].path}`);
-        await runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || !requiresApproval || (stdin.isTTY && stdout.isTTY) }, abort.signal);
+        const approveApplicationRestart = async (service: string) => {
+          if (options.restartApp) return true;
+          if (!stdin.isTTY || !stdout.isTTY) return false;
+          const prompt = createInterface({ input: stdin, output: stdout });
+          try {
+            return /^y(?:es)?$/i.test((await prompt.question(`PerfLens needs to restart the local Docker service "${service}" with temporary instrumentation. No application source or Compose file will be changed. Continue? (y/N): `)).trim());
+          } finally { prompt.close(); }
+        };
+        const selectApplicationService = async (services: string[]) => {
+          if (!stdin.isTTY || !stdout.isTTY) return undefined;
+          const prompt = createInterface({ input: stdin, output: stdout });
+          try {
+            const choices = services.map((service, index) => `${index + 1}. ${service}`).join('\n');
+            const answer = (await prompt.question(`PerfLens found multiple Node services for this target:\n${choices}\nChoose service [1]: `)).trim() || '1';
+            const index = Number(answer) - 1;
+            return Number.isInteger(index) && index >= 0 ? services[index] : undefined;
+          } finally { prompt.close(); }
+        };
+        await runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || !requiresApproval || (stdin.isTTY && stdout.isTTY), approveApplicationRestart, selectApplicationService }, abort.signal);
       }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });

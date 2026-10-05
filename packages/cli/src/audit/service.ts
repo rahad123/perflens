@@ -9,7 +9,7 @@ import { K6Runner, Plan } from './k6';
 import { checkCancelled, checkInfrastructure, checkInstrumentation, checkTarget } from './preflight';
 import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
-export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[] }
+export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[]; approveApplicationRestart?: (service: string) => Promise<boolean>; selectApplicationService?: (services: string[]) => Promise<string | undefined> }
 interface ProfileState { name: ProfileName; status: RunStatus; startedAt: string | null; endedAt: string | null; error: string | null; result: string | null }
 export interface AuditDependencies {
   runner: Pick<K6Runner, 'version' | 'prepare' | 'profile'>;
@@ -69,7 +69,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
     }
-    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal, undefined, metadata.infrastructure.containerOtlpTracesEndpoint);
+    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal, undefined, metadata.infrastructure.containerOtlpTracesEndpoint, metadata.infrastructure.otlpTracesEndpoint);
     dependencies.write('✓ Correlated OpenTelemetry traces verified before load');
     await dependencies.runner.prepare(store.directory);
     await store.write('raw/engine.json', { schemaVersion: 1, ...run.engine, scriptSha256: createHash('sha256').update(await readFile(join(store.directory, 'load-test.js'))).digest('hex') });

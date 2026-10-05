@@ -8,6 +8,7 @@ import { assertLocalDocker, Infrastructure, infrastructureReady } from '../servi
 import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { CliError } from '../utils/errors';
 import { audit, AuditOptions } from './service';
+import { activateComposeInstrumentation, RuntimeActivationResult } from '../services/runtime-instrumentation';
 
 function stageError(stage: string, error: unknown): CliError {
   const detail = error instanceof Error ? error.message : String(error);
@@ -40,6 +41,7 @@ export interface CompleteAuditDependencies {
   infrastructureRoot(projectDirectory: string, baseUrl: string): Promise<string>;
   assertLocalDocker(): Promise<void>;
   infrastructure(root: string): Pick<Infrastructure, 'status' | 'up'>;
+  activateInstrumentation?: (input: { projectDirectory: string; baseUrl: string; probePath?: string; serviceName: string; approveRestart: (service: string) => Promise<boolean>; selectService?: (services: string[]) => Promise<string | undefined>; write: (line: string) => void }) => Promise<RuntimeActivationResult>;
   audit: typeof audit;
   analyze: typeof analyze;
   report: typeof report;
@@ -47,7 +49,9 @@ export interface CompleteAuditDependencies {
 const defaults: CompleteAuditDependencies = {
   infrastructureRoot: (projectDirectory, baseUrl) => infrastructureRoot(undefined, projectDirectory, baseUrl),
   assertLocalDocker: () => assertLocalDocker(),
-  infrastructure: root => new Infrastructure(root), audit, analyze, report,
+  infrastructure: root => new Infrastructure(root),
+  activateInstrumentation: activateComposeInstrumentation,
+  audit, analyze, report,
 };
 /** Coordinates existing Phase 2, 3, and 4 services; it contains no audit or diagnosis rules. */
 export async function runCompleteAudit(options: AuditOptions, signal: AbortSignal, write: (line: string) => void = console.log, dependencies: CompleteAuditDependencies = defaults) {
@@ -87,6 +91,17 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
     write(`OTLP traces endpoint ${otlpEndpoint}`);
     write(`Docker container traces endpoint ${await otlpTracesEndpoint(root, 'container')} (set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT in the consumer container)`);
   } catch (error) { throw preLoadStageError('Observability startup', error); }
+
+  if (dependencies.activateInstrumentation) {
+    try {
+      const activation = await dependencies.activateInstrumentation({
+        projectDirectory, baseUrl: project.config.target.baseUrl, probePath: selectedEndpoints[0]?.path, serviceName: project.config.observability.serviceName,
+        approveRestart: options.approveApplicationRestart ?? (async () => false),
+        selectService: options.selectApplicationService, write,
+      });
+      if (activation.mode === 'docker') write(activation.restarted ? `✓ PerfLens instrumentation activated for ${activation.service}` : `✓ PerfLens instrumentation already active for ${activation.service}`);
+    } catch (error) { throw preLoadStageError('Instrumentation activation', error); }
+  }
 
   let executed;
   try { executed = await dependencies.audit({ ...options, endpoints: selectedEndpoints }, signal); }
