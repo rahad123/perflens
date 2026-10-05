@@ -46,9 +46,13 @@ export async function readSamples(file: string): Promise<SampleEvidence> {
   } finally { lines.close(); input.destroy(); }
   if (events.length) {
     events.sort((a, b) => a.time - b.time || a.delta - b.delta);
-    let inFlight = 0, maximum = 0;
-    for (const event of events) { inFlight += event.delta; maximum = Math.max(maximum, inFlight); }
-    result.maxObservedInFlight = maximum;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    for (const event of events) {
+      inFlight += event.delta;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+    }
+    result.maxObservedInFlight = maxInFlight;
   }
   return result;
 }

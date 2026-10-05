@@ -4,12 +4,12 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { loadProject, ProjectConfig, resolveTargetHeaders } from '../config/project';
 import { CliError } from '../utils/errors';
-import { selectProfiles, ProfileName } from './config';
+import { selectProfiles, ProfileName, validateAudit, Endpoint } from './config';
 import { K6Runner, Plan } from './k6';
 import { checkCancelled, checkInfrastructure, checkInstrumentation, checkTarget } from './preflight';
 import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
-export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean }
+export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[] }
 interface ProfileState { name: ProfileName; status: RunStatus; startedAt: string | null; endedAt: string | null; error: string | null; result: string | null }
 export interface AuditDependencies {
   runner: Pick<K6Runner, 'version' | 'prepare' | 'profile'>;
@@ -24,9 +24,10 @@ export async function audit(options: AuditOptions, signal = new AbortController(
   const loaded = await loadProject(options.config);
   const config: ProjectConfig = loaded.config;
   if (!config.audit) throw new CliError('No audit endpoints are configured.', 'Add audit.endpoints with GET paths to perflens.config.json. Existing Phase 1 configs still work for doctor/infra.', 2);
-  if (config.audit.endpoints.length > 1 && !options.confirmMultipleEndpoints) throw new CliError('Multiple endpoints require explicit load-test approval.', 'Review the configured GET endpoints and rerun interactively, or pass --yes to explicitly authorize this configured local endpoint set.', 2);
+  const endpoints = options.endpoints ? validateAudit({ ...config.audit, endpoints: options.endpoints }).endpoints : config.audit.endpoints;
+  if (endpoints.length > 1 && !options.confirmMultipleEndpoints) throw new CliError('Multiple endpoints require explicit load-test approval.', 'Review the selected GET endpoints and rerun interactively, or pass --yes to explicitly authorize this local endpoint set.', 2);
   resolveTargetHeaders(config.target.headers);
-  return withAuditLock(dirname(loaded.path), () => executeAudit(config, loaded.path, selected, signal, dependencies, options.infraDir));
+  return withAuditLock(dirname(loaded.path), () => executeAudit({ ...config, audit: { ...config.audit!, endpoints } }, loaded.path, selected, signal, dependencies, options.infraDir));
 }
 async function executeAudit(config: ProjectConfig, configPath: string, selected: ProfileName[], signal: AbortSignal, dependencies: AuditDependencies, infraDir?: string) {
   const auditConfig = config.audit!;
@@ -68,7 +69,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
     }
-    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal);
+    await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal, undefined, metadata.infrastructure.containerOtlpTracesEndpoint);
     dependencies.write('✓ Correlated OpenTelemetry traces verified before load');
     await dependencies.runner.prepare(store.directory);
     await store.write('raw/engine.json', { schemaVersion: 1, ...run.engine, scriptSha256: createHash('sha256').update(await readFile(join(store.directory, 'load-test.js'))).digest('hex') });

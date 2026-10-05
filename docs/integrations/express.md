@@ -38,7 +38,26 @@ Compile that file with the application and preload it before the server entrypoi
 OTEL_SERVICE_NAME=my-api node --require ./dist/perflens-instrumentation.js ./dist/server.js
 ```
 
-The package adapter enables the generic Node HTTP and PostgreSQL instrumentation plus Express route instrumentation. At startup it reads the selected `OTLP_HTTP_PORT` from the nearest `.perflens/infra/.env` and sets the standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` variable before constructing the exporter. It does not fall back to the SDK's default port when project infrastructure selected another port. If an existing `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` conflicts with the selected local endpoint, bootstrap fails with both the mismatch and the expected URL. `perflens init`, `doctor`, `infra up`, and `audit` print this same endpoint. Apps using their own OpenTelemetry SDK can set the printed URL directly in `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. PerfLens does not capture arbitrary headers or request bodies.
+The package adapter enables generic Node HTTP and PostgreSQL instrumentation plus Express route instrumentation. For a host-run process, it reads the selected `OTLP_HTTP_PORT` from the nearest `.perflens/infra/.env` and sets `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to `http://127.0.0.1:<port>/v1/traces` before constructing the exporter. It follows a changed port on export; it does not fall back to the SDK's default port. `init`, `doctor`, `infra up`, and `audit` show both the host endpoint and a Docker-consumer endpoint built from the same authoritative port.
+
+### Express app running in Docker
+
+Do not use `127.0.0.1` or `localhost` as the Collector host from inside the app container. On Docker Desktop for macOS/Windows, use `host.docker.internal` and inject the current port from PerfLens's project-local infra env file when starting/recreating the consumer container. For example, add this to the existing app service (PerfLens does not edit it):
+
+```yaml
+services:
+  api:
+    environment:
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://host.docker.internal:${OTLP_HTTP_PORT}/v1/traces
+```
+
+Start or recreate that service with the PerfLens env file as Compose's interpolation source:
+
+```sh
+docker compose --env-file .perflens/infra/.env up -d --force-recreate api
+```
+
+Compose substitutes the current `OTLP_HTTP_PORT`; the instrumentation validates that the explicit URL uses that same selected port when the project infra file is visible in the container. If PerfLens reallocates ports after stale infra recovery, recreate the app container with the same command so it receives the new port. PerfLens never changes application Compose or source files. Confirm the printed Docker-consumer endpoint and complete the correlated telemetry preflight before allowing load. Docker Desktop normally provides `host.docker.internal`; Linux Docker Engine may require `extra_hosts: ["host.docker.internal:host-gateway"]` and reachable host networking. Because the packaged Collector binds host published ports to loopback for local-only safety, Linux bridge access to that loopback binding has not been verified and is not claimed as supported.
 
 For a private GET route, configure request headers without committing their values:
 
@@ -54,6 +73,8 @@ For a private GET route, configure request headers without committing their valu
 ```
 
 Export the variables in the shell that runs `npx perflens audit`. PerfLens applies resolved headers consistently to reachability preflight, correlated telemetry verification, and k6 requests. Values are not persisted in run metadata, evidence, findings, or reports. Missing variables fail before infrastructure/load. A 401/403 stops before load and explicitly says that no analysis/report was produced. Target preflight does not follow redirects.
+
+If a correlated trace is missing although the HTTP target responds, PerfLens stops before load and names the current Docker-consumer endpoint. This check does not itself prove whether instrumentation is absent or an endpoint cannot be reached; verify bootstrap order, service identity, and container-to-host connectivity.
 
 The `serviceName` passed to instrumentation must match `observability.serviceName` in `perflens.config.json`. PerfLens adds `X-PerfLens-Run-Id` and `X-PerfLens-Profile` to audit requests. The instrumentation maps valid values to `perflens.audit.run_id` and `perflens.audit.profile`; they are correlation metadata, never authorization. OpenTelemetry continues to create and propagate trace IDs.
 
@@ -77,4 +98,4 @@ For multi-endpoint runs, the report includes endpoint-scoped request counts, sta
 
 ## Limits and safety
 
-Only loopback HTTP(S) targets are accepted. Profiles are bounded; peak and stress are not run by default. Use the tool only against systems you own or are authorized to test. PerfLens starts no target app or database, resets no data, and does not stop infrastructure on audit completion. The generated dashboard depends on the documented metrics being present. If the application itself runs in Docker, `localhost` refers to that application container, not the host. The selected OTLP endpoint is loopback-bound for local safety; containerized apps need an explicitly configured route to a collector reachable in their network. PerfLens does not mutate consumer Compose files or expose a host receiver automatically. Only the Node instrumentation and Express integration path are documented here; other frameworks and languages are not claimed as supported.
+Only loopback HTTP(S) audit targets are accepted. Profiles are bounded; peak and stress are not run by default. Use the tool only against systems you own or are authorized to test. PerfLens starts no target app or database, resets no data, and does not stop infrastructure on audit completion. The generated dashboard depends on the documented metrics being present. Container access to the host receiver is explicit and uses the selected local port; no port is exposed beyond the existing loopback binding. PerfLens does not mutate consumer Compose files. Only the Node instrumentation and Express integration path are documented here; other frameworks and languages are not claimed as supported.

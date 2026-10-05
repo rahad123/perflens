@@ -11,7 +11,7 @@ import { doctor, Options } from '../services/doctor';
 import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
 import { infrastructureRoot, LABELS, otlpTracesEndpoint } from '../services/workspace';
 import { runCompleteAudit } from '../audit/orchestrator';
-import { ensureProjectForAudit } from '../services/onboarding';
+import { chooseAuditEndpoints, ensureProjectForAudit } from '../services/onboarding';
 
 export function registerCommands(program: Command): void {
   program.command('init').description('Guided onboarding for a local backend project; never rewrites application code')
@@ -39,7 +39,8 @@ export function registerCommands(program: Command): void {
       console.log(`${result.created ? 'Created' : 'Found and preserved'} ${result.path}\n${result.created ? 'Created' : 'Verified'} .perflens/{runs,results,logs}. No application source or dependencies were changed.`);
       const initializedProject = await loadProject(result.path);
       const root = await infrastructureRoot(undefined, dirname(result.path), initializedProject.config.target.baseUrl);
-      console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(root)} (the PerfLens Node bootstrap configures this automatically).`);
+      console.log(`Host OTLP traces endpoint: ${await otlpTracesEndpoint(root)} (the PerfLens Node bootstrap configures this automatically).`);
+      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(root, 'container')} (pass as OTEL_EXPORTER_OTLP_TRACES_ENDPOINT when starting the app container).`);
       console.log(express ? 'Express project detected.' : 'Node project detected where package.json is present; framework support is not inferred.');
       let bootstrapped = false;
       for (const file of ['src/perflens-instrumentation.ts', 'src/perflens-instrumentation.js', 'src/instrumentation.ts', 'src/instrumentation.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'index.js', 'server.js']) {
@@ -54,7 +55,7 @@ export function registerCommands(program: Command): void {
     .action(async () => { if (!await doctor(program.opts<Options>())) process.exitCode = 1; });
   program.command('audit').description('Run a bounded local audit, collect telemetry, analyze evidence, and generate reports')
     .option('--profile <names>', 'Comma-separated baseline,normal,peak,stress; default: baseline,normal')
-    .option('--yes', 'Explicitly authorize load against all configured local GET endpoints (for non-interactive use)')
+    .option('--yes', 'Explicitly authorize load against all selected local GET endpoints (for non-interactive use)')
     .action(async (options: { profile?: string; yes?: boolean }) => {
       const abort = new AbortController();
       const cancel = () => abort.abort();
@@ -74,17 +75,29 @@ export function registerCommands(program: Command): void {
           console.log('No application source or dependencies were changed.');
         }
         const project = await loadProject(globalOptions.config);
-        const endpoints = project.config.audit?.endpoints ?? [];
-        if (endpoints.length > 1) {
+        let endpoints = project.config.audit?.endpoints ?? [];
+        let endpointsChanged = false;
+        if (!setup.created && !options.yes && stdin.isTTY && stdout.isTTY && endpoints.length) {
+          const choice = await chooseAuditEndpoints(endpoints, async (question, defaultValue) => {
+            const prompt = createInterface({ input: stdin, output: stdout });
+            try { return (await prompt.question(`${question}${defaultValue ? ` [${defaultValue}]` : ''}: `)).trim() || defaultValue || ''; }
+            finally { prompt.close(); }
+          });
+          endpoints = choice.endpoints;
+          endpointsChanged = choice.changed;
+          if (endpointsChanged) console.log('These endpoint choices apply to this audit only; perflens.config.json was not changed.');
+        }
+        const requiresApproval = endpoints.length > 1 || endpointsChanged;
+        if (requiresApproval) {
           console.log(`PerfLens will run bounded local load against:\n${endpoints.map(endpoint => `  GET ${endpoint.path}`).join('\n')}\nProfiles: ${(options.profile ?? 'baseline,normal').split(',').join(', ')}`);
           if (!options.yes) {
-            if (!stdin.isTTY || !stdout.isTTY) throw new Error('Multiple configured endpoints require interactive approval. Rerun with --yes only after reviewing the endpoint list. No load was started.');
+            if (!stdin.isTTY || !stdout.isTTY) throw new Error('Selected endpoint changes or multiple endpoints require interactive approval. Review the endpoint list and rerun with --yes only after authorizing these local targets. No load was started.');
             const prompt = createInterface({ input: stdin, output: stdout });
             try { if (!/^y(?:es)?$/i.test((await prompt.question('Proceed? (y/N): ')).trim())) throw new Error('Endpoint load-test permission was not granted. No load was started.'); }
             finally { prompt.close(); }
           }
         } else if (endpoints.length === 1) console.log(`Selected endpoint: GET ${endpoints[0].path}`);
-        await runCompleteAudit({ ...globalOptions, ...options, confirmMultipleEndpoints: options.yes || endpoints.length <= 1 || (stdin.isTTY && stdout.isTTY) }, abort.signal);
+        await runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || !requiresApproval || (stdin.isTTY && stdout.isTTY) }, abort.signal);
       }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });
@@ -125,6 +138,7 @@ export function registerCommands(program: Command): void {
         for (const port of config.services[name].ports ?? []) console.log(`${LABELS[name]}: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       }
       console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
+      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(control.root, 'container')}`);
       for (const port of config.services.tempo.ports ?? []) console.log(`Tempo query API: http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}`);
       console.log('The target application and its database are started separately.');
     });
@@ -135,6 +149,7 @@ export function registerCommands(program: Command): void {
       const states = await control.status();
       for (const state of states) console.log(`${LABELS[state.service].padEnd(20)} ${state.state}`);
       console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
+      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(control.root, 'container')}`);
       if (states.some(s => s.failed)) process.exitCode = 1;
     });
   infra.command('down').description('Stop only audit infrastructure; preserve containers, volumes, and target services')

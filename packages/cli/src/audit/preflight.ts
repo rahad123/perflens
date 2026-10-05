@@ -17,7 +17,11 @@ export async function checkInfrastructure(infraDir?: string, projectDirectory = 
     const port = config.services[name].ports?.[0];
     urls[name] = port?.published ? `http://${port.host_ip === '::1' ? '[::1]' : '127.0.0.1'}:${port.published}` : null;
   }
-  return { composeProject: config.name, readiness: states, localUrls: urls, otlpTracesEndpoint: await otlpTracesEndpoint(infra.root) };
+  return {
+    composeProject: config.name, readiness: states, localUrls: urls,
+    otlpTracesEndpoint: await otlpTracesEndpoint(infra.root),
+    containerOtlpTracesEndpoint: await otlpTracesEndpoint(infra.root, 'container'),
+  };
 }
 export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, runId: string, signal: AbortSignal, requestHeaders: Record<string, string> = {}): Promise<void> {
   checkCancelled(signal);
@@ -39,8 +43,16 @@ export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, run
 }
 
 /** Check one lightweight correlated probe in Tempo before any k6 profile runs. */
-export async function checkInstrumentation(tempoUrl: string | null, serviceName: string, runId: string, signal: AbortSignal, polling = { attempts: 36, intervalMs: 1000, timeoutMs: 5000 }): Promise<void> {
+export async function checkInstrumentation(tempoUrl: string | null, serviceName: string, runId: string, signal: AbortSignal, polling = { attempts: 36, intervalMs: 1000, timeoutMs: 5000 }, containerOtlpEndpoint?: string): Promise<void> {
   if (!tempoUrl) throw new CliError('Tempo query endpoint is unavailable.', 'Start PerfLens infrastructure and verify the local Tempo port. No load was started.');
+  try {
+    const ready = await fetch(new URL('/ready', tempoUrl), { signal: AbortSignal.any([signal, AbortSignal.timeout(polling.timeoutMs)]) });
+    await ready.body?.cancel();
+    if (!ready.ok) throw new Error(`Tempo returned HTTP ${ready.status}`);
+  } catch (error) {
+    checkCancelled(signal);
+    throw new CliError('PerfLens Tempo is unavailable during telemetry verification.', `Check the current project's Tempo service and query port. No load was started. Technical detail: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const url = new URL('/api/search', tempoUrl);
   url.searchParams.set('limit', '1');
   // Use Tempo's indexed tag search for a single, narrowly correlated preflight span.
@@ -63,5 +75,6 @@ export async function checkInstrumentation(tempoUrl: string | null, serviceName:
     }
     if (attempt < polling.attempts - 1) await new Promise(resolve => setTimeout(resolve, polling.intervalMs));
   }
-  throw new CliError('Target is reachable but PerfLens could not find its correlated OpenTelemetry server span.', 'No load was started. Confirm the endpoint is a representative application route (health and metrics routes are excluded), and that the app initializes startExpressInstrumentation from @perflens/cli/express-instrumentation before importing Express or PostgreSQL. Restart the app, set service.name to the configured observability.serviceName, and export to the OTLP traces endpoint printed by PerfLens. Generic Node apps can preload startNodeInstrumentation from @perflens/cli/instrumentation.');
+  const containerGuidance = containerOtlpEndpoint ? ` If the target runs inside Docker, 127.0.0.1 refers to that container, not the host. Set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${containerOtlpEndpoint} in the application container and recreate it using the current PerfLens OTLP_HTTP_PORT from .perflens/infra/.env. On Linux Docker Engine, map host.docker.internal to host-gateway; this host-side receiver is loopback-bound, so verify that the platform permits container access before auditing.` : '';
+  throw new CliError('Target is reachable but PerfLens could not find its correlated OpenTelemetry server span.', `No load was started. Confirm the endpoint is a representative application route (health and metrics routes are excluded), and that the app initializes startExpressInstrumentation from @perflens/cli/express-instrumentation before importing Express or PostgreSQL. Restart the app, set service.name to the configured observability.serviceName, and export to the OTLP traces endpoint printed by PerfLens. Generic Node apps can preload startNodeInstrumentation from @perflens/cli/instrumentation.${containerGuidance}`);
 }

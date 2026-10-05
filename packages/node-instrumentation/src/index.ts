@@ -16,6 +16,7 @@ export interface PerfLensCorrelation {
 
 const runIdPattern = /^pfl_\d{8}T\d{9}Z_[0-9a-f-]{36}$/;
 const profiles = new Set(['preflight', 'baseline', 'normal', 'peak', 'stress']);
+const managedExporterEndpoints = new WeakMap<NodeJS.ProcessEnv, { endpoint: string; hostname: string }>();
 
 /** Read only the bounded PerfLens metadata contract; other headers are never copied to spans. */
 export function readPerfLensCorrelation(headers: Record<string, unknown>): PerfLensCorrelation {
@@ -61,12 +62,28 @@ export function configurePerfLensOtlpEndpoint(cwd = process.cwd(), env: NodeJS.P
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Invalid OTLP_HTTP_PORT in ${environmentFile}; run perflens doctor to validate local infrastructure.`);
   }
-  const selected = `http://127.0.0.1:${port}/v1/traces`;
   const configured = env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
-  if (configured && new URL(configured).href !== selected) {
-    throw new Error(`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT does not match this PerfLens project. Use ${selected} or unset the override.`);
+  const previouslyManaged = managedExporterEndpoints.get(env);
+  let hostname = '127.0.0.1';
+  if (configured) {
+    let candidate: URL;
+    try { candidate = new URL(configured); }
+    catch { throw new Error('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT must be a valid local PerfLens traces URL.'); }
+    const allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', 'host.docker.internal']);
+    if (candidate.protocol !== 'http:' || !allowedHosts.has(candidate.hostname) || candidate.username || candidate.password || candidate.search || candidate.hash || candidate.pathname !== '/v1/traces') {
+      throw new Error('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT must use a supported local host and the /v1/traces path; credentials and query parameters are not allowed.');
+    }
+    const matchesPort = Number(candidate.port) === port;
+    if (!matchesPort && configured !== previouslyManaged?.endpoint) {
+      throw new Error(`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT does not match this PerfLens project. Use http://${candidate.hostname}:${port}/v1/traces or unset the override.`);
+    }
+    // An unchanged PerfLens-managed endpoint may follow a port rotation, while
+    // an explicit user endpoint must already name the authoritative port.
+    hostname = matchesPort ? candidate.hostname : previouslyManaged!.hostname;
   }
+  const selected = `http://${hostname}:${port}/v1/traces`;
   env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = selected;
+  managedExporterEndpoints.set(env, { endpoint: selected, hostname });
   return selected;
 }
 

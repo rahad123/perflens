@@ -3,9 +3,9 @@ import { dirname, join } from 'node:path';
 import { analyze } from '../analysis/service';
 import { loadProject, resolveTargetHeaders } from '../config/project';
 import { report } from '../report/service';
-import { selectProfiles } from './config';
-import { Infrastructure } from '../services/infrastructure';
-import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
+import { Endpoint, selectProfiles, validateSelectedEndpoints } from './config';
+import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
+import { INFRA_SERVICES, infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { CliError } from '../utils/errors';
 import { audit, AuditOptions } from './service';
 
@@ -38,6 +38,7 @@ function display(value: unknown, digits = 2): string {
 }
 export interface CompleteAuditDependencies {
   infrastructureRoot(projectDirectory: string, baseUrl: string): Promise<string>;
+  assertLocalDocker(): Promise<void>;
   infrastructure(root: string): Pick<Infrastructure, 'status' | 'up'>;
   audit: typeof audit;
   analyze: typeof analyze;
@@ -45,8 +46,12 @@ export interface CompleteAuditDependencies {
 }
 const defaults: CompleteAuditDependencies = {
   infrastructureRoot: (projectDirectory, baseUrl) => infrastructureRoot(undefined, projectDirectory, baseUrl),
+  assertLocalDocker: () => assertLocalDocker(),
   infrastructure: root => new Infrastructure(root), audit, analyze, report,
 };
+function infrastructureReady(states: Awaited<ReturnType<Infrastructure['status']>>): boolean {
+  return states.length === INFRA_SERVICES.length && INFRA_SERVICES.every(service => states.some(state => state.service === service && state.ready));
+}
 
 /** Coordinates existing Phase 2, 3, and 4 services; it contains no audit or diagnosis rules. */
 export async function runCompleteAudit(options: AuditOptions, signal: AbortSignal, write: (line: string) => void = console.log, dependencies: CompleteAuditDependencies = defaults) {
@@ -55,31 +60,39 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   try { project = await loadProject(options.config); }
   catch (error) { throw stageError('Configuration validation', error); }
   const projectDirectory = dirname(project.path);
-  if ((project.config.audit?.endpoints.length ?? 0) > 1 && !options.confirmMultipleEndpoints) throw new CliError('Multiple endpoints require explicit load-test approval.', 'Review the configured GET endpoint list and rerun interactively, or pass --yes to explicitly authorize these local targets. No load was started.', 2);
+  const selectedEndpoints: Endpoint[] = project.config.audit ? options.endpoints ? validateSelectedEndpoints(options.endpoints) : validateSelectedEndpoints(project.config.audit.endpoints) : [];
+  const savedEndpoints = project.config.audit?.endpoints ?? [];
+  const endpointSelectionChanged = Boolean(options.endpoints) && (selectedEndpoints.length !== savedEndpoints.length || selectedEndpoints.some((endpoint, index) => endpoint.path !== savedEndpoints[index]?.path));
+  if ((selectedEndpoints.length > 1 || endpointSelectionChanged) && !options.confirmMultipleEndpoints) throw new CliError('Selected endpoints require explicit load-test approval.', 'Review the selected GET endpoint list and rerun interactively, or pass --yes to explicitly authorize these local targets. No load was started.', 2);
   try { resolveTargetHeaders(project.config.target.headers); }
   catch (error) { throw preLoadStageError('Request context validation', error); }
   let root: string;
   try { root = options.infraDir ? await infrastructureRoot(options.infraDir, projectDirectory, project.config.target.baseUrl) : await dependencies.infrastructureRoot(projectDirectory, project.config.target.baseUrl); }
   catch (error) { throw stageError('Infrastructure asset setup', error); }
-  const otlpEndpoint = await otlpTracesEndpoint(root);
   const infra = dependencies.infrastructure(root);
-  write(`PerfLens Performance Audit\nProject  ${project.config.project.name}\nTarget   ${project.config.target.baseUrl}\nEndpoints ${project.config.audit?.endpoints.map(e => `GET ${e.path}`).join(', ') ?? 'not configured'}`);
+  write(`PerfLens Performance Audit\nProject  ${project.config.project.name}\nTarget   ${project.config.target.baseUrl}\nEndpoints ${selectedEndpoints.map(e => `GET ${e.path}`).join(', ') || 'not configured'}`);
   write('✓ Configuration valid');
-  write(`OTLP traces endpoint ${otlpEndpoint}`);
+  let otlpEndpoint = '';
   try {
-    let states = await infra.status();
-    if (states.every(item => item.ready)) write('✓ Observability infrastructure already ready');
+    await dependencies.assertLocalDocker();
+    let states: Awaited<ReturnType<Infrastructure['status']>>;
+    try { states = await infra.status(); }
+    catch { states = []; }
+    if (infrastructureReady(states)) write('✓ Observability infrastructure already ready');
     else {
-      write('Starting local observability infrastructure...');
-      await infra.up();
+      write('Current project observability infrastructure is missing, stale, or unhealthy. Repairing local services...');
+      await infra.up(120000, true);
       states = await infra.status();
-      if (!states.every(item => item.ready)) throw new CliError('Infrastructure readiness checks did not pass.', states.map(item => `${item.service}: ${item.state}`).join('\n'));
+      if (!infrastructureReady(states)) throw new CliError('Infrastructure readiness checks did not pass.', states.map(item => `${item.service}: ${item.state}`).join('\n'));
       write('✓ Observability infrastructure ready');
     }
+    otlpEndpoint = await otlpTracesEndpoint(root);
+    write(`OTLP traces endpoint ${otlpEndpoint}`);
+    write(`Docker container traces endpoint ${await otlpTracesEndpoint(root, 'container')} (set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT in the consumer container)`);
   } catch (error) { throw preLoadStageError('Observability startup', error); }
 
   let executed;
-  try { executed = await dependencies.audit(options, signal); }
+  try { executed = await dependencies.audit({ ...options, endpoints: selectedEndpoints }, signal); }
   catch (error) { throw auditStageError(error); }
 
   let analysis;

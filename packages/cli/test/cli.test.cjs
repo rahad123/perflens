@@ -8,20 +8,26 @@ const { validateConfig, loadProject, initialize } = require('../dist/config/proj
 const { Infrastructure, parseContainers, assertLocalDocker } = require('../dist/services/infrastructure');
 const { INFRA_SERVICES, installInfrastructureAssets, infrastructureRoot, otlpTracesEndpoint } = require('../dist/services/workspace');
 const { doctor } = require('../dist/services/doctor');
-const { ensureProjectForAudit } = require('../dist/services/onboarding');
+const { chooseAuditEndpoints, ensureProjectForAudit } = require('../dist/services/onboarding');
 const { CliError, formatError } = require('../dist/utils/errors');
 const { docker } = require('../dist/services/process');
 const bin = resolve(__dirname, '../bin/perflens.cjs');
 const version = require('../package.json').version;
 const config = { project: { name: 'backend' }, target: { baseUrl: 'http://localhost:3000' }, observability: { serviceName: 'backend' } };
-const compose = { name: 'perflens', services: Object.fromEntries(INFRA_SERVICES.map(s => [s, s === 'grafana' ? { ports: [{ host_ip: '127.0.0.1', published: '3001', target: 3000 }] } : {}])) };
-const running = INFRA_SERVICES.map(Service => ({ Service, State: 'running', Health: '', ExitCode: 0, Publishers: Service === 'grafana' ? [{ PublishedPort: 3001, URL: '127.0.0.1' }] : [] }));
+const portBindings = {
+  'otel-collector': [{ host_ip: '127.0.0.1', published: '4317', target: 4317 }, { host_ip: '127.0.0.1', published: '4318', target: 4318 }, { host_ip: '127.0.0.1', published: '13133', target: 13133 }],
+  tempo: [{ host_ip: '127.0.0.1', published: '3200', target: 3200 }],
+  prometheus: [{ host_ip: '127.0.0.1', published: '9090', target: 9090 }],
+  grafana: [{ host_ip: '127.0.0.1', published: '3001', target: 3000 }],
+};
+const compose = { name: 'perflens', services: Object.fromEntries(INFRA_SERVICES.map(service => [service, { ports: portBindings[service] }])) };
+const running = INFRA_SERVICES.map(Service => ({ Service, Project: 'perflens', State: 'running', Health: 'healthy', ExitCode: 0, Publishers: portBindings[Service].map(port => ({ PublishedPort: Number(port.published), TargetPort: port.target, URL: port.host_ip, Protocol: 'tcp' })) }));
 async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-cli-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   await writeFile(join(dir, 'perflens.config.json'), JSON.stringify(config));
   for (const file of ['docker-compose.yml', '.env', 'infra/otel-collector/config.yaml', 'infra/tempo/tempo.yaml', 'infra/prometheus/prometheus.yml', 'infra/grafana/provisioning/datasources/datasources.yaml']) {
-    const path = join(dir, file); await mkdir(require('node:path').dirname(path), { recursive: true }); await writeFile(path, file === '.env' ? 'OTLP_HTTP_PORT=4318\n' : 'fixture');
+    const path = join(dir, file); await mkdir(require('node:path').dirname(path), { recursive: true }); await writeFile(path, file === '.env' ? 'OTLP_GRPC_PORT=4317\nOTLP_HTTP_PORT=4318\nOTEL_HEALTH_PORT=13133\nTEMPO_PORT=3200\nPROMETHEUS_PORT=9090\nGRAFANA_PORT=3001\n' : 'fixture');
   }
   return dir;
 }
@@ -130,6 +136,18 @@ test('existing audit project is reused without prompts or config changes; repeat
   assert.equal(existing.created, false); assert.equal(existing.framework, 'express');
   assert.equal(repeated.created, false); assert.equal(await readFile(created.path, 'utf8'), before);
 });
+test('interactive audit endpoint selection defaults to saved routes or chooses run-scoped alternatives', async () => {
+  const saved = [{ method: 'GET', path: '/api/orders' }, { method: 'GET', path: '/api/products' }];
+  const defaultChoice = await chooseAuditEndpoints(saved, async () => '');
+  assert.deepEqual(defaultChoice, { endpoints: saved, changed: false });
+  const selected = await chooseAuditEndpoints(saved, async question => question.startsWith('Current audit targets') ? '2' : '/api/industries,/api/templates');
+  assert.deepEqual(selected.endpoints, [{ method: 'GET', path: '/api/industries' }, { method: 'GET', path: '/api/templates' }]);
+  assert.equal(selected.changed, true);
+  const one = await chooseAuditEndpoints(saved, async question => question.startsWith('Current audit targets') ? '3' : '/api/audit-logs/42');
+  assert.deepEqual(one.endpoints, [{ method: 'GET', path: '/api/audit-logs/42' }]);
+  assert.equal(one.changed, true);
+  await assert.rejects(chooseAuditEndpoints(saved, async question => question.startsWith('Current audit targets') ? '2' : '/health'), /excluded from representative auditing/);
+});
 test('first audit setup refuses missing required target details without writing config', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-audit-no-target-')); t.after(() => rm(dir, { recursive: true, force: true }));
   await assert.rejects(ensureProjectForAudit(dir, undefined, async question => question.includes('base URL') ? 'http://localhost:3000' : question.startsWith('Endpoint selection') ? '1' : ''), /requires at least one representative GET endpoint/);
@@ -172,11 +190,13 @@ test('installed OTLP endpoint follows selected ports with default and occupied 4
   const defaultRoot = await installInfrastructureAssets(available, 'http://localhost:3000', async () => true);
   assert.match(await readFile(join(defaultRoot, '.env'), 'utf8'), /OTLP_HTTP_PORT=4318\n/);
   assert.equal(await otlpTracesEndpoint(defaultRoot), 'http://127.0.0.1:4318/v1/traces');
+  assert.equal(await otlpTracesEndpoint(defaultRoot, 'container'), 'http://host.docker.internal:4318/v1/traces');
 
   const occupied = await mkdtemp(join(tmpdir(), 'perflens-otlp-alternate-')); t.after(() => rm(occupied, { recursive: true, force: true }));
   const alternateRoot = await installInfrastructureAssets(occupied, 'http://localhost:3000', async port => port !== 4318);
   assert.match(await readFile(join(alternateRoot, '.env'), 'utf8'), /OTLP_HTTP_PORT=4319\n/);
   assert.equal(await otlpTracesEndpoint(alternateRoot), 'http://127.0.0.1:4319/v1/traces');
+  assert.equal(await otlpTracesEndpoint(alternateRoot, 'container'), 'http://host.docker.internal:4319/v1/traces');
 
   const probeFailure = await mkdtemp(join(tmpdir(), 'perflens-otlp-probe-failure-')); t.after(() => rm(probeFailure, { recursive: true, force: true }));
   await assert.rejects(installInfrastructureAssets(probeFailure, 'http://localhost:3000', async () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); }), /Cannot check local port 3001/);
@@ -194,20 +214,21 @@ test('partial infrastructure setup restores missing files and port settings with
 });
 test('doctor succeeds on its own occupied ports, fails on daemon/config/Compose errors with remediation', async t => {
   const dir = await fixture(t); const options = { config: join(dir, 'perflens.config.json'), infraDir: dir };
-  const output = []; assert.equal(await doctor(options, line => output.push(line), fake(), async () => 'k6 v2.3.0'), true);
+  const makeInfrastructure = (root, run) => new Infrastructure(root, run, undefined, async () => true);
+  const output = []; const healthyRun = fake(); assert.equal(await doctor(options, line => output.push(line), healthyRun, async () => 'k6 v2.3.0', root => makeInfrastructure(root, healthyRun)), true, output.join('\n'));
   assert.match(output.join('\n'), /used by this PerfLens/);
   assert.match(output.join('\n'), /OTLP traces endpoint: http:\/\/127\.0\.0\.1:4318\/v1\/traces/);
   for (const failure of ['info', 'version', 'config']) {
     const output = []; const normal = fake();
     const run = async args => { if (args.includes(failure)) throw new Error('simulated failure'); return normal(args); };
-    assert.equal(await doctor(options, line => output.push(line), run, async () => 'k6 v2.3.0'), false);
+    assert.equal(await doctor(options, line => output.push(line), run, async () => 'k6 v2.3.0', root => makeInfrastructure(root, run)), false);
     assert.match(output.join('\n'), /Not ready/); assert.doesNotMatch(output.join('\n'), /Ready to run PerfLens/);
   }
 });
 test('doctor reports missing or incompatible k6 without hiding the load-test prerequisite', async t => {
   const dir = await fixture(t); const options = { config: join(dir, 'perflens.config.json'), infraDir: dir };
   for (const check of [async () => { throw new CliError('PerfLens could not find k6.', 'Install k6 2.3.x.'); }, async () => 'k6 v1.2.3']) {
-    const output = []; assert.equal(await doctor(options, line => output.push(line), fake(), check), false);
+    const output = []; assert.equal(await doctor(options, line => output.push(line), fake(), check, root => new Infrastructure(root, fake(), undefined, async () => true)), false);
     assert.match(output.join('\n'), /k6/); assert.match(output.join('\n'), /Not ready/);
   }
 });
@@ -219,19 +240,22 @@ test('missing Docker produces a useful CLI failure, not an unhandled stack', asy
 test('remote Docker contexts are rejected before infrastructure mutation', async () => {
   await assert.rejects(assertLocalDocker(async () => JSON.stringify([{ Endpoints: { docker: { Host: 'ssh://production' } } }])), /local Docker/);
 });
-test('up manages only infrastructure, preserves paths with spaces, and probes actual readiness', async () => {
-  const calls = []; const infra = new Infrastructure('/tmp/target with spaces', fake(calls));
+test('up manages only infrastructure, preserves paths with spaces, and probes actual readiness', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'target with spaces')); t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, '.env'), 'OTLP_GRPC_PORT=4317\nOTLP_HTTP_PORT=4318\nOTEL_HEALTH_PORT=13133\nTEMPO_PORT=3200\nPROMETHEUS_PORT=9090\nGRAFANA_PORT=3001\n');
+  const calls = []; const infra = new Infrastructure(root, fake(calls), undefined, async () => true);
   await infra.up(0);
   const up = calls.find(args => args.includes('up'));
-  assert.ok(up.includes('/tmp/target with spaces/docker-compose.yml'));
+  assert.ok(up.includes(join(root, 'docker-compose.yml')));
   assert.deepEqual(up.slice(-4), [...INFRA_SERVICES]); assert.ok(!up.includes('demo-api'));
-  assert.equal(calls.filter(args => args.includes('wget')).length, 4);
 });
-test('running containers alone do not imply readiness, and failed startup never succeeds', async () => {
+test('running containers alone do not imply readiness, and failed startup never succeeds', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'perflens-up-failure-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, '.env'), 'OTLP_GRPC_PORT=4317\nOTLP_HTTP_PORT=4318\nOTEL_HEALTH_PORT=13133\nTEMPO_PORT=3200\nPROMETHEUS_PORT=9090\nGRAFANA_PORT=3001\n');
   const normal = fake();
-  const infra = new Infrastructure('/tmp/test', async args => { if (args.includes('wget')) throw new Error('endpoint unavailable'); return normal(args); });
+  const infra = new Infrastructure(root, normal, undefined, async () => false);
   await assert.rejects(infra.up(0), /did not become ready/);
-  const failed = new Infrastructure('/tmp/test', async args => { if (args.includes('up')) throw new Error('pull failed'); return normal(args); });
+  const failed = new Infrastructure(root, async args => { if (args.includes('up')) throw new Error('pull failed'); return normal(args); });
   await assert.rejects(failed.up(0), /pull failed/);
 });
 test('doctor/up port check distinguishes unrelated conflicts from owned ports', async () => {
@@ -253,6 +277,63 @@ test('status understands stopped/crashed services and both Compose JSON represen
   assert.equal(parseContainers(JSON.stringify(running)).length, 4); assert.deepEqual(parseContainers(''), []);
   const crashed = running.map(c => ({ ...c, State: 'exited', ExitCode: 1 }));
   assert.ok((await new Infrastructure('/tmp/test', fake([], crashed)).status()).every(s => s.failed));
+});
+test('infrastructure status requires this Compose project, exact port bindings, and reachable host health endpoints', async () => {
+  const unrelated = running.map(container => ({ ...container, Project: 'another-perflens-project' }));
+  const absent = await new Infrastructure('/tmp/test', fake([], unrelated), undefined, async () => true).status();
+  assert.ok(absent.every(item => !item.ready && item.state === 'not created'));
+  const stale = running.map(container => ({ ...container, Publishers: [] }));
+  const staleStatus = await new Infrastructure('/tmp/test', fake([], stale), undefined, async () => true).status();
+  assert.ok(staleStatus.every(item => !item.ready && /stale or missing published ports/.test(item.state)));
+  const stopped = running.map(container => ({ ...container, State: 'exited', Health: 'unhealthy' }));
+  const stoppedStatus = await new Infrastructure('/tmp/test', fake([], stopped), undefined, async () => true).status();
+  assert.ok(stoppedStatus.every(item => !item.ready && item.state === 'exited'));
+  const partial = running.filter(container => container.Service !== 'tempo');
+  const partialStatus = await new Infrastructure('/tmp/test', fake([], partial), undefined, async () => true).status();
+  assert.equal(partialStatus.find(item => item.service === 'tempo').state, 'not created');
+  assert.equal(partialStatus.some(item => item.ready && item.service === 'tempo'), false);
+  const unreachable = await new Infrastructure('/tmp/test', fake(), undefined, async () => false).status();
+  assert.ok(unreachable.every(item => !item.ready && /not ready/.test(item.state)));
+  const healthy = await new Infrastructure('/tmp/test', fake(), undefined, async () => true).status();
+  assert.ok(healthy.every(item => item.ready));
+});
+test('infrastructure recovery reallocates stale occupied ports and recreates only this project stack without volumes', async t => {
+  const calls = []; const root = await mkdtemp(join(tmpdir(), 'perflens-repair-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, '.env'), 'OTLP_GRPC_PORT=4317\nOTLP_HTTP_PORT=4318\nOTEL_HEALTH_PORT=13133\nTEMPO_PORT=3200\nPROMETHEUS_PORT=9090\nGRAFANA_PORT=3001\n');
+  let containers = running.map(container => ({ ...container, Publishers: [] }));
+  const effectiveCompose = async () => {
+    const env = await readFile(join(root, '.env'), 'utf8');
+    const services = Object.fromEntries(INFRA_SERVICES.map(service => [service, { ports: portBindings[service].map(port => {
+      const key = { 'otel-collector:4317': 'OTLP_GRPC_PORT', 'otel-collector:4318': 'OTLP_HTTP_PORT', 'otel-collector:13133': 'OTEL_HEALTH_PORT', 'tempo:3200': 'TEMPO_PORT', 'prometheus:9090': 'PROMETHEUS_PORT', 'grafana:3000': 'GRAFANA_PORT' }[`${service}:${port.target}`];
+      return { ...port, published: new RegExp(`^${key}=(\\d+)$`, 'm').exec(env)[1] };
+    }) }]));
+    return { name: 'perflens', services };
+  };
+  const run = async args => {
+    calls.push(args);
+    if (args.includes('config')) return JSON.stringify(await effectiveCompose());
+    if (args.includes('ps')) return JSON.stringify(containers);
+    if (args.includes('up')) {
+      const current = await effectiveCompose();
+      containers = running.map(container => ({ ...container, Publishers: current.services[container.Service].ports.map(port => ({ PublishedPort: Number(port.published), TargetPort: port.target, URL: port.host_ip, Protocol: 'tcp' })) }));
+    }
+    return '';
+  };
+  let checks = [];
+  const infra = new Infrastructure(root, run, async port => { checks.push(port); return port !== 4318; }, async () => true);
+  const config = await infra.up(0, true);
+  assert.equal(await otlpTracesEndpoint(root), 'http://127.0.0.1:4319/v1/traces');
+  assert.equal(config.services['otel-collector'].ports.find(port => port.target === 4318).published, '4319');
+  const persisted = await readFile(join(root, '.env'), 'utf8');
+  for (const service of INFRA_SERVICES) for (const binding of config.services[service].ports) {
+    const key = { 'otel-collector:4317': 'OTLP_GRPC_PORT', 'otel-collector:4318': 'OTLP_HTTP_PORT', 'otel-collector:13133': 'OTEL_HEALTH_PORT', 'tempo:3200': 'TEMPO_PORT', 'prometheus:9090': 'PROMETHEUS_PORT', 'grafana:3000': 'GRAFANA_PORT' }[`${service}:${binding.target}`];
+    assert.equal(new RegExp(`^${key}=(\\d+)$`, 'm').exec(persisted)?.[1], binding.published, `${key} must match Compose's authoritative port`);
+  }
+  assert.ok(checks.includes(4318));
+  const up = calls.find(args => args.includes('up'));
+  assert.ok(up.includes('--force-recreate'));
+  assert.ok(!up.includes('-v') && !up.includes('--volumes') && !up.includes('rm'));
+  assert.match(persisted, /OTLP_HTTP_PORT=4319/);
 });
 test('failure formatting retains remediation without stack traces', () => {
   assert.equal(formatError(new CliError('Docker unavailable.', 'Start Docker.')), '✗ Docker unavailable.\nStart Docker.');
