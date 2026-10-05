@@ -909,3 +909,47 @@ A separate packed host-run Express consumer on `127.0.0.1:38472` retained loopba
 The full workspace build, typecheck, and test suite passed after the implementation: 119 tests (25 analysis engine, 8 Node instrumentation, 69 CLI, 13 reporting, 4 Express integration). Two initial sandboxed test attempts received `listen EPERM` while probing local ports; the authorized loopback-enabled suite passed. `git diff --check` passed. The `ignoreDeprecations: "5.0"` additions to six `tsconfig.json` files were removed: they are unrelated to container OTLP, not required by the workspace's installed TypeScript 5.7.3 build/typecheck, and are not part of this hardening change. No lint script is configured.
 
 Limitation: Docker Desktop itself was unavailable, so its macOS host alias behavior has not been independently verified. The required packed container flow was proven against the active OrbStack Docker Engine; do not treat this as a Docker Desktop acceptance claim. Linux-native Docker networking remains unverified. The packaged Collector binds published ports to host loopback for local-only safety; the integration guide describes Linux `host-gateway` setup as a prerequisite but does not claim it works with that loopback binding. No other project's containers or volumes were cleaned up.
+
+## Phase 6.2.2 — false-ready infrastructure regression — 2026-10-05
+
+### Root cause and correction
+
+The earlier status hardening checked container names, published port mappings, and health endpoints, but `docker compose` was not given an explicit consumer project name. Compose can resolve its project identity from inherited `COMPOSE_PROJECT_NAME`, and host port variables can override values from `--env-file`. That allowed Compose's resolved configuration/container lookup to describe a different project or different ports while PerfLens separately printed the OTLP endpoint read directly from the consumer `.perflens/infra/.env`. In addition, the audit preflight used `states.every(...)` without checking the required service count; an empty status array therefore passed (`[].every(...) === true`). The orchestrator had a stricter count check, so the two readiness paths had diverged.
+
+All Compose operations now pass the deterministic project name `perflens-<sha256(consumer-root)[0:10]>`, including `config`, `ps`, `up`, and `stop`. The generated Compose template uses the same identity. The Compose child process removes inherited infrastructure-port variables and supplies the values read from the current consumer's `.perflens/infra/.env`, so resolved published ports cannot silently disagree with the endpoint PerfLens reports. Reallocated `.env` state is written through an atomic rename.
+
+Readiness is one shared fail-closed predicate used by audit startup, audit preflight, `infra up`, `infra status`, and `doctor`: exactly one status per expected service (`otel-collector`, `tempo`, `prometheus`, `grafana`), every status ready, and no unknown/duplicate names. `Infrastructure.status()` additionally requires the explicit current project identity, one matching running container per service, exact expected published bindings, container health where provided, and a successful request to that service's health endpoint. Missing services produce explicit `not created` statuses; an identity mismatch is rejected before inspecting containers. Tempo's exact project-local `/ready` endpoint is checked before the audit's correlated search uses the query URL from the same Compose configuration.
+
+The prior synthetic tests supplied matching resolved Compose configuration and container lists, and did not combine orphaned persisted state with inherited project/port overrides. They also had no empty-status regression for the separate preflight path. New tests cover the exact saved ports below, unrelated healthy containers, an overridden Compose name, conflicting shell ports, empty/partial/duplicate statuses, and audit recovery from a four-service `not created` result.
+
+### Packed external stale-state acceptance
+
+`npm pack --cache /private/tmp/perflens-npm-cache --pack-destination /private/tmp/perflens-pr7-packed` built `@perflens/cli@0.1.0` from `packages/cli`. The tarball was 91.1 kB (362.7 kB unpacked, 36 files) and was installed with npm into `/private/tmp/perflens-pr7-consumer`, outside the PerfLens workspace. `npx --no-install perflens --version` returned `0.1.0`; no workspace links were used.
+
+The isolated consumer began with the dogfood `.env` values `3003 / 9098 / 3208 / 4332 / 4333 / 13140` (Grafana / Prometheus / Tempo / OTLP gRPC / OTLP HTTP / Collector health). No current project containers existed. Its Dockerized Express service was `perflens-pr7-consumer-app-1`, reachable from the host at `http://127.0.0.1:38991`; PostgreSQL ran in `perflens-pr7-consumer-db-1`. A separate fixture service, `perflens-pr7-consumer-unrelated-port-holder-1`, held `127.0.0.1:4333`. The first command was `npx --no-install perflens audit`; no `init`, `doctor`, or `infra up` command was run manually.
+
+The CLI printed all four services as `not created` and the recovery message; it did not say infrastructure was already ready. It kept the existing persisted ports except for the occupied OTLP HTTP port and atomically updated `OTLP_HTTP_PORT=4334`. The authoritative Compose project was `perflens-f1d3039cbf`. Its exact running containers and published ports were:
+
+| Current consumer service container | Published endpoint |
+| --- | --- |
+| `perflens-f1d3039cbf-otel-collector-1` | `127.0.0.1:4332→4317`, `127.0.0.1:4334→4318`, `127.0.0.1:13140→13133` |
+| `perflens-f1d3039cbf-tempo-1` | `127.0.0.1:3208→3200` |
+| `perflens-f1d3039cbf-prometheus-1` | `127.0.0.1:9098→9090` |
+| `perflens-f1d3039cbf-grafana-1` | `127.0.0.1:3003→3000` |
+
+All four health checks passed. PerfLens printed host OTLP `http://127.0.0.1:4334/v1/traces`, container OTLP `http://host.docker.internal:4334/v1/traces`, and Tempo query URL `http://127.0.0.1:3208`. The Dockerized app had initially been given the old `host.docker.internal:4333` endpoint; its package instrumentation followed the updated project `.env`. The correlated preflight passed before load. The completed run ID was `pfl_20261005T172513191Z_bb710a17-4475-4edb-bcd7-50d0e466108b`:
+
+| Profile | Requests | Failures | RPS | p50 / p95 / p99 (ms) | Configured / observed concurrency |
+| --- | ---: | ---: | ---: | --- | --- |
+| baseline | 5 | 0 | 0.9903 | 4.311 / 18.1512 / 20.0174 | 1 / 1 |
+| normal | 10 | 0 | 1.9985 | 37.429 / 175.1073 / 175.3543 | 2 / 2 |
+
+The first immediate analysis query ran before Tempo had indexed the just-finished profile traces; it returned zero, so the one-command audit correctly failed analysis and did not print success or generate a report. After preserving that initial empty snapshot and waiting for Tempo indexing, `npx --no-install perflens analyze <run-id>` queried the same run and found **15 correlated `/orders` request traces** (5 baseline, 10 normal), **32 PostgreSQL spans**, and no external HTTP spans. `npx --no-install perflens report <run-id>` then generated a valid zero-finding report at `/private/tmp/perflens-pr7-consumer/.perflens/runs/pfl_20261005T172513191Z_bb710a17-4475-4edb-bcd7-50d0e466108b/report/{report.json,report.md,report.html}`. A direct query to the current project's Tempo port 3208 returned the same run ID and service/route evidence. The initial timing-related analysis failure is recorded; it is distinct from infrastructure readiness and remains a limitation of immediate Tempo indexing.
+
+With deliberately conflicting inherited values (`COMPOSE_PROJECT_NAME=perflens-old-demo`, OTLP HTTP 4318, gRPC 4317, health 13133, Tempo 3200, Prometheus 9090, Grafana 3001), the packed `npx --no-install perflens infra status` still reported the four exact current consumer services ready and printed OTLP port 4334. This verifies inherited environment values do not redirect status to the older stack or change the endpoint authority.
+
+The Docker engine was macOS arm64 OrbStack, not Docker Desktop; the packed Dockerized-consumer run used `host.docker.internal` and was observed to deliver run-correlated traces to the current Tempo instance. Docker Desktop was not independently tested. The isolated consumer and temporary port-holder were the only test resources created; no unrelated or official-project containers, volumes, configuration, or files were removed or changed. Endpoint reselection and explicit load approval regressions passed in the CLI suite. No `tsconfig.json` or `ignoreDeprecations` changes were needed. No Phase 7 functionality was added.
+
+### Quality results
+
+`pnpm -r build`, `pnpm typecheck`, `pnpm test`, and `git diff --check` passed. The final test suite reported **122 passing tests**: 25 analysis-engine, 8 Node instrumentation, 72 CLI, 13 reporting, and 4 Express integration tests. The sandbox initially denied loopback port probes; the final complete suite was rerun with local socket access. No lint script is configured.

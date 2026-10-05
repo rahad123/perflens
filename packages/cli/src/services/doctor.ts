@@ -1,6 +1,6 @@
 import { loadProject } from '../config/project';
 import { CliError, formatError } from '../utils/errors';
-import { assertLocalDocker, Infrastructure } from './infrastructure';
+import { assertLocalDocker, Infrastructure, infrastructureReady } from './infrastructure';
 import { docker, Runner } from './process';
 import { infrastructureRoot, otlpTracesEndpoint } from './workspace';
 import { K6Runner } from '../audit/k6';
@@ -38,9 +38,9 @@ export async function doctor(options: Options, write: (line: string) => void = c
       const config = await infra.configuration();
       if (daemon) for (const message of await infra.checkPorts(config)) write(`✓ ${message}`);
     });
-    if (daemon) await check('Existing infrastructure has no readiness failures', async () => {
+    if (daemon) await check('Current-project infrastructure services ready', async () => {
       const status = await infra.status();
-      if (status.some(s => s.failed)) throw new CliError('Some running infrastructure services are not ready.', status.map(s => `${s.service}: ${s.state}`).join('\n') + '\nRun perflens infra up and inspect Docker logs.');
+      if (!infrastructureReady(status)) throw new CliError('The current project infrastructure is incomplete or not ready.', status.map(s => `${s.service}: ${s.state}`).join('\n') + '\nRun perflens infra up and inspect Docker logs.');
     });
   }
   write(failures ? `Not ready: ${failures} check(s) failed. Resolve the issues above and retry.` : 'Ready to run PerfLens. The target application is started separately.');

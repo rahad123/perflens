@@ -1,11 +1,19 @@
 import { access, chmod, cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { resolve, join, dirname } from 'node:path';
+import { resolve, join, dirname, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { CliError } from '../utils/errors';
 export const INFRA_SERVICES = ['otel-collector', 'tempo', 'prometheus', 'grafana'] as const;
 export const LABELS: Record<string, string> = { 'otel-collector': 'OTel Collector', tempo: 'Tempo', prometheus: 'Prometheus', grafana: 'Grafana' };
+/** Stable identity for exactly one consumer project's PerfLens stack. */
+export function infrastructureProjectName(root: string): string {
+  const resolved = resolve(root);
+  const consumerRoot = basename(dirname(resolved)) === '.perflens' && basename(resolved) === 'infra'
+    ? dirname(dirname(resolved))
+    : resolved;
+  return `perflens-${createHash('sha256').update(consumerRoot).digest('hex').slice(0, 10)}`;
+}
 const packagedAssets = [resolve(__dirname, '../../assets/infra'), resolve(__dirname, '../assets/infra')].find(existsSync) ?? resolve(__dirname, '../assets/infra');
 const required = ['docker-compose.yml', '.env', 'otel-collector.yaml', 'tempo.yaml', 'prometheus.yml', 'grafana/provisioning/datasources/datasources.yaml', 'grafana/provisioning/dashboards/dashboards.yaml', 'grafana/dashboards/perflens-performance.json'];
 
@@ -39,7 +47,7 @@ export async function installInfrastructureAssets(cwd = process.cwd(), baseUrl =
   const root = join(resolve(cwd), '.perflens', 'infra');
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
-  const project = `perflens-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 10)}`;
+  const project = infrastructureProjectName(root);
   // Restore missing packaged files without replacing consumer-owned/customized assets.
   for (const file of required.filter(item => item !== '.env')) {
     const target = join(root, file);

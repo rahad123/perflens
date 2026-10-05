@@ -1,5 +1,5 @@
 import { CliError } from '../utils/errors';
-import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
+import { assertLocalDocker, Infrastructure, infrastructureReady } from '../services/infrastructure';
 import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { ProjectConfig } from '../config/project';
 import { Endpoint, targetUrl } from './config';
@@ -11,7 +11,10 @@ export async function checkInfrastructure(infraDir?: string, projectDirectory = 
   const infra = new Infrastructure(await infrastructureRoot(infraDir, projectDirectory, baseUrl));
   const config = await infra.configuration();
   const states = await infra.status();
-  if (!states.every(s => s.ready)) throw new CliError('Audit infrastructure is not ready.', 'Run perflens infra up; inspect perflens infra status before retrying.');
+  if (!infrastructureReady(states)) {
+    const details = states.map(s => `${s.service}: ${s.state}`).join('\n') || 'No current-project infrastructure services were discovered.';
+    throw new CliError('Audit infrastructure is not ready.', `${details}\nRun perflens infra up; inspect perflens infra status before retrying.`);
+  }
   const urls: Record<string, string | null> = {};
   for (const name of ['prometheus', 'grafana', 'tempo']) {
     const port = config.services[name].ports?.[0];

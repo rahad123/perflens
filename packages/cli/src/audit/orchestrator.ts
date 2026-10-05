@@ -4,8 +4,8 @@ import { analyze } from '../analysis/service';
 import { loadProject, resolveTargetHeaders } from '../config/project';
 import { report } from '../report/service';
 import { Endpoint, selectProfiles, validateSelectedEndpoints } from './config';
-import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
-import { INFRA_SERVICES, infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
+import { assertLocalDocker, Infrastructure, infrastructureReady } from '../services/infrastructure';
+import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { CliError } from '../utils/errors';
 import { audit, AuditOptions } from './service';
 
@@ -49,10 +49,6 @@ const defaults: CompleteAuditDependencies = {
   assertLocalDocker: () => assertLocalDocker(),
   infrastructure: root => new Infrastructure(root), audit, analyze, report,
 };
-function infrastructureReady(states: Awaited<ReturnType<Infrastructure['status']>>): boolean {
-  return states.length === INFRA_SERVICES.length && INFRA_SERVICES.every(service => states.some(state => state.service === service && state.ready));
-}
-
 /** Coordinates existing Phase 2, 3, and 4 services; it contains no audit or diagnosis rules. */
 export async function runCompleteAudit(options: AuditOptions, signal: AbortSignal, write: (line: string) => void = console.log, dependencies: CompleteAuditDependencies = defaults) {
   selectProfiles(options.profile);
@@ -80,7 +76,8 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
     catch { states = []; }
     if (infrastructureReady(states)) write('✓ Observability infrastructure already ready');
     else {
-      write('Current project observability infrastructure is missing, stale, or unhealthy. Repairing local services...');
+      const unavailable = states.filter(item => !item.ready).map(item => `${item.service}: ${item.state}`);
+      write(`Current project infrastructure is missing, stale, or unhealthy (${unavailable.join('; ') || 'service set incomplete'}). Recovering local services...`);
       await infra.up(120000, true);
       states = await infra.status();
       if (!infrastructureReady(states)) throw new CliError('Infrastructure readiness checks did not pass.', states.map(item => `${item.service}: ${item.state}`).join('\n'));

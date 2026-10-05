@@ -1,13 +1,22 @@
 import { createServer } from 'node:net';
 import { join } from 'node:path';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { CliError } from '../utils/errors';
 import { docker, Runner } from './process';
-import { INFRA_SERVICES, LABELS } from './workspace';
+import { INFRA_SERVICES, infrastructureProjectName, LABELS } from './workspace';
 
 export interface Container { Service: string; Project?: string; State: string; Health?: string; ExitCode?: number; Publishers?: { PublishedPort: number; TargetPort?: number; URL: string; Protocol?: string }[] }
 interface ServiceConfig { ports?: { host_ip?: string; published?: string; target: number }[] }
 export interface ComposeConfig { name: string; services: Record<string, ServiceConfig> }
+export type ServiceReadiness = { service: string; state: string; ready: boolean; failed: boolean };
+/** Fail closed: missing, duplicate, unknown, or unhealthy services are never ready. */
+export function infrastructureReady(states: readonly Pick<ServiceReadiness, 'service' | 'ready'>[]): boolean {
+  return states.length === INFRA_SERVICES.length
+    && new Set(states.map(state => state.service)).size === INFRA_SERVICES.length
+    && INFRA_SERVICES.every(service => states.some(state => state.service === service && state.ready))
+    && states.every(state => (INFRA_SERVICES as readonly string[]).includes(state.service) && state.ready);
+}
 type HealthProbe = (url: string) => Promise<boolean>;
 const HEALTH_ENDPOINT: Record<string, { target: number; path: string }> = {
   'otel-collector': { target: 13133, path: '/' }, tempo: { target: 3200, path: '/ready' },
@@ -47,8 +56,23 @@ export async function availablePort(port: number, host = '127.0.0.1'): Promise<b
 }
 export class Infrastructure {
   constructor(readonly root: string, readonly run: Runner = docker, readonly portAvailable = availablePort, readonly healthProbe: HealthProbe = probeHttp) {}
-  compose(args: string[], stream = false, timeout = 20000) {
-    return this.run(['compose', '--project-directory', this.root, '--env-file', join(this.root, '.env'), '-f', join(this.root, 'docker-compose.yml'), ...args], { cwd: this.root, stream, timeout });
+  async compose(args: string[], stream = false, timeout = 20000) {
+    // Always override ambient COMPOSE_PROJECT_NAME and legacy Compose `name:` values.
+    // Every operation (including config, ps, up, stop) uses this consumer identity.
+    const envFile = await readFile(join(this.root, '.env'), 'utf8').catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      throw error;
+    });
+    const env: NodeJS.ProcessEnv = {};
+    const unsetEnv = [...new Set(Object.values(PORT_ENV))];
+    for (const key of unsetEnv) {
+      const match = new RegExp(`^${key}=(\\d+)$`, 'm').exec(envFile);
+      if (!match) continue;
+      const port = Number(match[1]);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new CliError(`Invalid local infrastructure port ${key}.`, 'Repair the project-local .perflens/infra/.env values and retry.');
+      env[key] = String(port);
+    }
+    return this.run(['compose', '--project-name', infrastructureProjectName(this.root), '--project-directory', this.root, '--env-file', join(this.root, '.env'), '-f', join(this.root, 'docker-compose.yml'), ...args], { cwd: this.root, stream, timeout, env, unsetEnv });
   }
   async configuration(): Promise<ComposeConfig> {
     const config: ComposeConfig = JSON.parse(await this.compose(['config', '--format', 'json']));
@@ -71,9 +95,13 @@ export class Infrastructure {
   }
   async status(): Promise<{ service: string; state: string; ready: boolean; failed: boolean }[]> {
     const config = await this.configuration();
+    const expectedProject = infrastructureProjectName(this.root);
+    if (config.name !== expectedProject) throw new CliError('PerfLens Compose project identity did not resolve to this consumer project.', `Expected ${expectedProject} but Compose resolved ${config.name}. All infrastructure commands must target the consumer's project-local stack.`);
     const containers = await this.containers();
     return Promise.all(INFRA_SERVICES.map(async service => {
-      const container = containers.find(c => c.Project === config.name && c.Service === service);
+      const matching = containers.filter(c => c.Project === expectedProject && c.Service === service);
+      if (matching.length > 1) return { service, state: 'duplicate service containers found', ready: false, failed: true };
+      const container = matching[0];
       if (!container) return { service, state: 'not created', ready: false, failed: false };
       if (container.State !== 'running') return { service, state: container.State, ready: false, failed: !['exited', 'created'].includes(container.State) || Boolean(container.ExitCode) };
       const expected = config.services[service].ports ?? [];
@@ -137,7 +165,11 @@ export class Infrastructure {
         reserved.add(replacement); changed = true;
       } else reserved.add(configured);
     }
-    if (changed) await writeFile(envPath, content, { mode: 0o600 });
+    if (changed) {
+      const temporaryPath = `${envPath}.${randomUUID()}.tmp`;
+      await writeFile(temporaryPath, content, { mode: 0o600, flag: 'wx' });
+      await rename(temporaryPath, envPath);
+    }
   }
   async up(readinessTimeout = 120000, forceRecreate = false): Promise<ComposeConfig> {
     await this.repairUnavailablePorts(await this.configuration());
@@ -146,16 +178,17 @@ export class Infrastructure {
     await this.compose(['up', '-d', ...(forceRecreate ? ['--force-recreate'] : []), '--wait', '--wait-timeout', '120', ...INFRA_SERVICES], true, 600000);
     const deadline = Date.now() + readinessTimeout;
     let states = await this.status();
-    while (!states.every(s => s.ready) && Date.now() < deadline) {
+    while (!infrastructureReady(states) && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 2000));
       states = await this.status();
     }
-    if (!states.every(s => s.ready)) throw new CliError('PerfLens infrastructure did not become ready.', `Inspect docker compose logs in ${this.root}.\n${states.map(s => `${LABELS[s.service]}: ${s.state}`).join('\n')}`);
+    if (!infrastructureReady(states)) throw new CliError('PerfLens infrastructure did not become ready.', `Inspect the current project's Docker Compose logs in ${this.root}.\n${states.map(s => `${LABELS[s.service] ?? s.service}: ${s.state}`).join('\n')}`);
     return config;
   }
   async down(): Promise<void> {
     // Stop only our allowlisted services. Never compose down -v or stop the target.
     await this.compose(['stop', '--timeout', '30', ...INFRA_SERVICES], true, 180000);
-    if ((await this.containers()).some(c => !['exited', 'created'].includes(c.State))) throw new CliError('Some infrastructure containers did not stop.', 'Inspect perflens infra status and Docker logs. Persistent volumes were preserved.');
+    const project = infrastructureProjectName(this.root);
+    if ((await this.containers()).some(c => c.Project === project && !['exited', 'created'].includes(c.State))) throw new CliError('Some current-project infrastructure containers did not stop.', 'Inspect perflens infra status and Docker logs. Persistent volumes were preserved.');
   }
 }

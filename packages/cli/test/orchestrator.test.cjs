@@ -27,6 +27,7 @@ function mockDependencies(t, overrides = {}) {
   })();
   return {
     events,
+    ready: setup,
     async infrastructureRoot() { await setup; return infraRoot; },
     async assertLocalDocker() {},
     infrastructure: () => ({
@@ -112,10 +113,35 @@ test('stale partial current-project infrastructure is repaired before audit with
       async up(timeout, forceRecreate) { deps.events.push(`recover:${timeout}:${forceRecreate}`); },
     }),
   });
+  await deps.ready;
   const output = [];
   await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps);
   assert.deepEqual(deps.events.slice(0, 4), ['status-1', 'recover:120000:true', 'status-2', 'audit']);
-  assert.match(output.join('\n'), /Current project observability infrastructure is missing, stale, or unhealthy/);
+  assert.match(output.join('\n'), /Current project infrastructure is missing, stale, or unhealthy/);
+  assert.doesNotMatch(output.join('\n'), /Observability infrastructure already ready/);
+});
+
+test('orphaned persisted ports with no current-project containers trigger recovery despite unrelated healthy stacks', async t => {
+  t.cwd = await fixture(t);
+  let statusCalls = 0;
+  const deps = mockDependencies(t, {
+    infrastructure: () => ({
+      async status() {
+        statusCalls++;
+        deps.events.push(`status-${statusCalls}`);
+        return statusCalls === 1
+          ? infraServices.map(service => ({ service, state: 'not created', ready: false, failed: false }))
+          : infraServices.map(service => ({ service, state: 'ready', ready: true, failed: false }));
+      },
+      async up(timeout, forceRecreate) { deps.events.push(`recover:${timeout}:${forceRecreate}`); },
+    }),
+  });
+  await deps.ready;
+  await writeFile(join(t.cwd, '.perflens', 'infra', '.env'), 'GRAFANA_PORT=3003\nPROMETHEUS_PORT=9098\nTEMPO_PORT=3208\nOTLP_GRPC_PORT=4332\nOTLP_HTTP_PORT=4333\nOTEL_HEALTH_PORT=13140\n');
+  const output = [];
+  await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps);
+  assert.deepEqual(deps.events.slice(0, 4), ['status-1', 'recover:120000:true', 'status-2', 'audit']);
+  assert.match(output.join('\n'), /not created/);
   assert.doesNotMatch(output.join('\n'), /Observability infrastructure already ready/);
 });
 

@@ -5,8 +5,8 @@ const { join, resolve } = require('node:path');
 const { tmpdir } = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { validateConfig, loadProject, initialize } = require('../dist/config/project');
-const { Infrastructure, parseContainers, assertLocalDocker } = require('../dist/services/infrastructure');
-const { INFRA_SERVICES, installInfrastructureAssets, infrastructureRoot, otlpTracesEndpoint } = require('../dist/services/workspace');
+const { Infrastructure, parseContainers, assertLocalDocker, infrastructureReady } = require('../dist/services/infrastructure');
+const { INFRA_SERVICES, infrastructureProjectName, installInfrastructureAssets, infrastructureRoot, otlpTracesEndpoint } = require('../dist/services/workspace');
 const { doctor } = require('../dist/services/doctor');
 const { chooseAuditEndpoints, ensureProjectForAudit } = require('../dist/services/onboarding');
 const { CliError, formatError } = require('../dist/utils/errors');
@@ -35,8 +35,10 @@ function fake(calls = [], containers = running) {
   return async (args) => {
     calls.push(args);
     if (args.includes('inspect')) return JSON.stringify([{ Endpoints: { docker: { Host: 'unix:///var/run/docker.sock' } } }]);
-    if (args.includes('config')) return JSON.stringify(compose);
-    if (args.includes('ps')) return JSON.stringify(containers);
+    const projectIndex = args.indexOf('--project-name');
+    const projectName = projectIndex >= 0 ? args[projectIndex + 1] : compose.name;
+    if (args.includes('config')) return JSON.stringify({ ...compose, name: projectName });
+    if (args.includes('ps')) return JSON.stringify(containers.map(container => container.Project === compose.name ? { ...container, Project: projectName } : container));
     return '';
   };
 }
@@ -279,6 +281,9 @@ test('status understands stopped/crashed services and both Compose JSON represen
   assert.ok((await new Infrastructure('/tmp/test', fake([], crashed)).status()).every(s => s.failed));
 });
 test('infrastructure status requires this Compose project, exact port bindings, and reachable host health endpoints', async () => {
+  assert.equal(infrastructureReady([]), false, 'an empty discovered service set is never ready');
+  assert.equal(infrastructureReady(running.slice(0, 3).map(item => ({ service: item.Service, ready: true }))), false, 'a partial service set is never ready');
+  assert.equal(infrastructureReady([...running.slice(0, 3).map(item => ({ service: item.Service, ready: true })), { service: 'tempo', ready: true }, { service: 'tempo', ready: true }]), false, 'duplicates cannot substitute for a missing expected service');
   const unrelated = running.map(container => ({ ...container, Project: 'another-perflens-project' }));
   const absent = await new Infrastructure('/tmp/test', fake([], unrelated), undefined, async () => true).status();
   assert.ok(absent.every(item => !item.ready && item.state === 'not created'));
@@ -297,6 +302,44 @@ test('infrastructure status requires this Compose project, exact port bindings, 
   const healthy = await new Infrastructure('/tmp/test', fake(), undefined, async () => true).status();
   assert.ok(healthy.every(item => item.ready));
 });
+test('Compose commands pin one consumer-derived identity and orphaned .env ports do not prove readiness', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'perflens-orphaned-env-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, '.env'), 'GRAFANA_PORT=3003\nPROMETHEUS_PORT=9098\nTEMPO_PORT=3208\nOTLP_GRPC_PORT=4332\nOTLP_HTTP_PORT=4333\nOTEL_HEALTH_PORT=13140\n');
+  const calls = [], stalePorts = { 'otel-collector': [4332, 4333, 13140], tempo: [3208], prometheus: [9098], grafana: [3003] };
+  const previousProject = process.env.COMPOSE_PROJECT_NAME, previousOtlp = process.env.OTLP_HTTP_PORT;
+  process.env.COMPOSE_PROJECT_NAME = 'older-shared-perflens-project'; process.env.OTLP_HTTP_PORT = '4318';
+  t.after(() => { if (previousProject === undefined) delete process.env.COMPOSE_PROJECT_NAME; else process.env.COMPOSE_PROJECT_NAME = previousProject; if (previousOtlp === undefined) delete process.env.OTLP_HTTP_PORT; else process.env.OTLP_HTTP_PORT = previousOtlp; });
+  let composeOptions;
+  const run = async (args, options) => {
+    calls.push(args);
+    if (args.includes('--project-directory')) composeOptions = options;
+    if (args.includes('config')) return JSON.stringify({ name: args[args.indexOf('--project-name') + 1], services: Object.fromEntries(INFRA_SERVICES.map(service => [service, { ports: portBindings[service].map(port => ({ ...port, published: String(stalePorts[service][portBindings[service].filter(item => item.target < port.target).length]) })) }])) });
+    if (args.includes('ps')) return JSON.stringify(running.map(container => ({ ...container, Project: 'unrelated-perflens-stack', Publishers: container.Publishers.map(port => ({ ...port, PublishedPort: stalePorts[container.Service][container.Publishers.indexOf(port)] })) })));
+    return '';
+  };
+  const infra = new Infrastructure(root, run, undefined, async () => true);
+  const status = await infra.status();
+  assert.equal(infrastructureReady(status), false);
+  assert.equal(status.length, INFRA_SERVICES.length);
+  assert.ok(status.every(service => service.state === 'not created'));
+  const identity = infrastructureProjectName(root);
+  assert.ok(calls.length > 0 && calls.every(args => args[args.indexOf('--project-name') + 1] === identity));
+  assert.equal(composeOptions.env.OTLP_HTTP_PORT, '4333', 'the project .env overrides conflicting shell ports');
+  assert.ok(composeOptions.unsetEnv.includes('OTLP_HTTP_PORT'));
+});
+test('a healthy stack returned under an overridden Compose project name cannot satisfy consumer readiness', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'perflens-compose-identity-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, '.env'), 'GRAFANA_PORT=3003\nPROMETHEUS_PORT=9098\nTEMPO_PORT=3208\nOTLP_GRPC_PORT=4332\nOTLP_HTTP_PORT=4333\nOTEL_HEALTH_PORT=13140\n');
+  const calls = [];
+  const run = async args => {
+    calls.push(args);
+    if (args.includes('config')) return JSON.stringify({ ...compose, name: 'older-shared-perflens-stack' });
+    if (args.includes('ps')) return JSON.stringify(running.map(container => ({ ...container, Project: 'older-shared-perflens-stack' })));
+    return '';
+  };
+  await assert.rejects(new Infrastructure(root, run, undefined, async () => true).status(), /project identity did not resolve to this consumer/);
+  assert.equal(calls.some(args => args.includes('ps')), false, 'identity mismatch is rejected before service inspection');
+});
 test('infrastructure recovery reallocates stale occupied ports and recreates only this project stack without volumes', async t => {
   const calls = []; const root = await mkdtemp(join(tmpdir(), 'perflens-repair-')); t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(join(root, '.env'), 'OTLP_GRPC_PORT=4317\nOTLP_HTTP_PORT=4318\nOTEL_HEALTH_PORT=13133\nTEMPO_PORT=3200\nPROMETHEUS_PORT=9090\nGRAFANA_PORT=3001\n');
@@ -307,21 +350,23 @@ test('infrastructure recovery reallocates stale occupied ports and recreates onl
       const key = { 'otel-collector:4317': 'OTLP_GRPC_PORT', 'otel-collector:4318': 'OTLP_HTTP_PORT', 'otel-collector:13133': 'OTEL_HEALTH_PORT', 'tempo:3200': 'TEMPO_PORT', 'prometheus:9090': 'PROMETHEUS_PORT', 'grafana:3000': 'GRAFANA_PORT' }[`${service}:${port.target}`];
       return { ...port, published: new RegExp(`^${key}=(\\d+)$`, 'm').exec(env)[1] };
     }) }]));
-    return { name: 'perflens', services };
+    return { name: infrastructureProjectName(root), services };
   };
   const run = async args => {
     calls.push(args);
+    const projectIndex = args.indexOf('--project-name'); const projectName = args[projectIndex + 1];
     if (args.includes('config')) return JSON.stringify(await effectiveCompose());
     if (args.includes('ps')) return JSON.stringify(containers);
     if (args.includes('up')) {
       const current = await effectiveCompose();
-      containers = running.map(container => ({ ...container, Publishers: current.services[container.Service].ports.map(port => ({ PublishedPort: Number(port.published), TargetPort: port.target, URL: port.host_ip, Protocol: 'tcp' })) }));
+      containers = running.map(container => ({ ...container, Project: projectName, Publishers: current.services[container.Service].ports.map(port => ({ PublishedPort: Number(port.published), TargetPort: port.target, URL: port.host_ip, Protocol: 'tcp' })) }));
     }
     return '';
   };
   let checks = [];
   const infra = new Infrastructure(root, run, async port => { checks.push(port); return port !== 4318; }, async () => true);
   const config = await infra.up(0, true);
+  assert.equal(config.name, infrastructureProjectName(root));
   assert.equal(await otlpTracesEndpoint(root), 'http://127.0.0.1:4319/v1/traces');
   assert.equal(config.services['otel-collector'].ports.find(port => port.target === 4318).published, '4319');
   const persisted = await readFile(join(root, '.env'), 'utf8');

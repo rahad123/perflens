@@ -8,7 +8,7 @@ import { listRuns } from '../audit/storage';
 import { Command } from 'commander';
 import { initialize, loadProject } from '../config/project';
 import { doctor, Options } from '../services/doctor';
-import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
+import { assertLocalDocker, Infrastructure, infrastructureReady } from '../services/infrastructure';
 import { infrastructureRoot, LABELS, otlpTracesEndpoint } from '../services/workspace';
 import { runCompleteAudit } from '../audit/orchestrator';
 import { chooseAuditEndpoints, ensureProjectForAudit } from '../services/onboarding';
@@ -150,7 +150,7 @@ export function registerCommands(program: Command): void {
       for (const state of states) console.log(`${LABELS[state.service].padEnd(20)} ${state.state}`);
       console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
       console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(control.root, 'container')}`);
-      if (states.some(s => s.failed)) process.exitCode = 1;
+      if (!infrastructureReady(states)) process.exitCode = 1;
     });
   infra.command('down').description('Stop only audit infrastructure; preserve containers, volumes, and target services')
     .action(async () => { await (await service()).down(); console.log('PerfLens infrastructure stopped. Persistent volumes and target services preserved.'); });
