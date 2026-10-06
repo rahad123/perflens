@@ -117,6 +117,9 @@ export async function analyze(options: AnalyzeOptions, requestedId?: string, wri
       if (cause instanceof CliError) throw cause;
       throw new CliError('Could not collect correlated Tempo evidence.', 'Start local PerfLens infrastructure and confirm the audit traces are retained.');
     }
+    if (snapshot.traceCount === 0) {
+      throw new CliError('No correlated request traces became available in Tempo.', 'The load results are preserved. Check the selected service logs and Collector delivery, then retry `perflens analyze <run-id>`; PerfLens did not save an empty telemetry snapshot.');
+    }
     evidence = {
       schemaVersion: 1, runId: id,
       target: { baseUrl: run.target.baseUrl, serviceName: run.serviceName, endpoints: endpointSet(profiles) },

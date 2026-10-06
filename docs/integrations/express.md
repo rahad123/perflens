@@ -42,22 +42,13 @@ The package adapter enables generic Node HTTP and PostgreSQL instrumentation plu
 
 ### Express app running in Docker
 
-Do not use `127.0.0.1` or `localhost` as the Collector host from inside the app container. On Docker Desktop for macOS/Windows, use `host.docker.internal` and inject the current port from PerfLens's project-local infra env file when starting/recreating the consumer container. For example, add this to the existing app service (PerfLens does not edit it):
+For a supported local Docker Compose Node service, the normal command is still `npx perflens audit`. PerfLens identifies a running Node service by its target port and runtime evidence, asks before restarting it, and temporarily mounts its self-contained OpenTelemetry preload read-only at `/opt/perflens/runtime/perflens-preload.cjs`. It sets `NODE_OPTIONS` before the app command starts, so HTTP, Express, and PostgreSQL instrumentation initialize before the app imports those modules. The selected application image does not need `@perflens/cli` or OpenTelemetry dependencies installed.
 
-```yaml
-services:
-  api:
-    environment:
-      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://host.docker.internal:${OTLP_HTTP_PORT}/v1/traces
-```
+The temporary Compose override is stored under `.perflens/runtime/` and applies only to the selected app service. It adds the current project’s `host.docker.internal:<OTLP_HTTP_PORT>` endpoint, configured service name, bundle version marker, and a read-only bind mount. It does not rewrite the user's Compose files, Dockerfile, package scripts, or application source, and does not recreate database/cache/worker services. The app container remains running with the audit preload after the audit; a later user-initiated recreation with the original Compose configuration removes the temporary runtime settings. Repeated PerfLens audits reuse the service when endpoint, service identity, and bundle hash still match.
 
-Start or recreate that service with the PerfLens env file as Compose's interpolation source:
+PerfLens verifies a correlated Tempo server span before starting k6. If Compose service detection is ambiguous, select the service that serves the configured target. Host-run applications are not restarted or modified; launch them with the package preload before the app entrypoint instead. Docker Desktop on macOS/Windows provides `host.docker.internal`; Linux Docker Engine may require `extra_hosts: ["host.docker.internal:host-gateway"]`, and access to the local-only Collector binding has not been verified or claimed as supported.
 
-```sh
-docker compose --env-file .perflens/infra/.env up -d --force-recreate api
-```
-
-Compose substitutes the current `OTLP_HTTP_PORT`; the instrumentation validates that the explicit URL uses that same selected port when the project infra file is visible in the container. If PerfLens reallocates ports after stale infra recovery, recreate the app container with the same command so it receives the new port. PerfLens never changes application Compose or source files. Confirm the printed Docker-consumer endpoint and complete the correlated telemetry preflight before allowing load. Docker Desktop normally provides `host.docker.internal`; Linux Docker Engine may require `extra_hosts: ["host.docker.internal:host-gateway"]` and reachable host networking. Because the packaged Collector binds host published ports to loopback for local-only safety, Linux bridge access to that loopback binding has not been verified and is not claimed as supported.
+For an application that is not managed by a supported local Compose service, use the host-run bootstrap above or explicitly configure a container runtime to preload `@perflens/cli/preload` and use the printed container endpoint. Do not set container `127.0.0.1` to reach the host Collector.
 
 For a private GET route, configure request headers without committing their values:
 

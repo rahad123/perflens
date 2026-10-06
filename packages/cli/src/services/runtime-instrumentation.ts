@@ -1,6 +1,6 @@
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { docker, Runner } from './process';
 import { CliError } from '../utils/errors';
 import { otlpTracesEndpoint } from './workspace';
@@ -10,6 +10,7 @@ type Compose = { name?: string; services?: Record<string, Service> };
 const BASE_FILES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
 const OVERRIDE_FILES = ['compose.override.yaml', 'compose.override.yml', 'docker-compose.override.yaml', 'docker-compose.override.yml'];
 const runtimePattern = /\b(?:node|npm|npx|pnpm|yarn|bun|tsx|ts-node(?:-dev)?|nodemon)\b/i;
+const CONTAINER_PRELOAD = '/opt/perflens/runtime/perflens-preload.cjs';
 
 export interface RuntimeActivationOptions {
   projectDirectory: string;
@@ -90,11 +91,53 @@ async function candidatePackage(cwd: string, service: Service): Promise<{ expres
   }
   return { express: false, node: false };
 }
-async function atomicWrite(file: string, data: string): Promise<void> {
+async function atomicWrite(file: string, data: string | Uint8Array): Promise<void> {
   await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  try {
+    const current = await readFile(file);
+    if (Buffer.from(current).equals(Buffer.from(data))) return;
+  } catch { /* first write or stale/missing runtime asset */ }
   const tmp = `${file}.${randomUUID()}.tmp`;
   await writeFile(tmp, data, { flag: 'wx', mode: 0o600 });
   await rename(tmp, file);
+}
+
+function tokenizeNodeOptions(input: string): string[] {
+  const tokens: string[] = [];
+  let value = '', quote = '', escaped = false;
+  for (const char of input) {
+    if (escaped) { value += char; escaped = false; continue; }
+    if (char === '\\' && quote !== "'") { escaped = true; continue; }
+    if (quote) { if (char === quote) quote = ''; else value += char; continue; }
+    if (char === '"' || char === "'") { quote = char; continue; }
+    if (/\s/.test(char)) { if (value) { tokens.push(value); value = ''; } continue; }
+    value += char;
+  }
+  if (escaped) value += '\\';
+  if (quote) throw new CliError('The Node service has malformed NODE_OPTIONS.', 'Close any unmatched quotes in NODE_OPTIONS, then rerun audit.');
+  if (value) tokens.push(value);
+  return tokens;
+}
+
+function mergePreload(nodeOptions: string): string {
+  const tokens = tokenizeNodeOptions(nodeOptions), preserved: string[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token === '--require' || token === '-r') {
+      const target = tokens[index + 1];
+      if (target && (target === '@perflens/cli/preload' || target === CONTAINER_PRELOAD || /(?:^|\/)perflens(?:-docker)?-preload\.cjs$/.test(target))) { index++; continue; }
+      preserved.push(token);
+      if (target) preserved.push(tokens[++index]);
+      continue;
+    }
+    if (token.startsWith('--require=')) {
+      const target = token.slice('--require='.length);
+      if (target === '@perflens/cli/preload' || target === CONTAINER_PRELOAD || /(?:^|\/)perflens(?:-docker)?-preload\.cjs$/.test(target)) continue;
+    }
+    preserved.push(token);
+  }
+  preserved.push('--require', CONTAINER_PRELOAD);
+  return preserved.map(value => /\s|["']/.test(value) ? JSON.stringify(value) : value).join(' ');
 }
 
 /** Activate the package-owned preload for exactly one already-running local Compose service. */
@@ -127,38 +170,38 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
   }
   if (!serviceName) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')) };
   const service = config.services[serviceName];
-  let packageCheck: string;
-  try { packageCheck = await run([...args, 'exec', '-T', serviceName, 'node', '-e', "process.stdout.write(require.resolve('@perflens/cli/preload'))"], { cwd }); }
-  catch { throw new CliError(`The ${serviceName} container cannot resolve the PerfLens preload.`, 'Install @perflens/cli in the Node application image and rebuild it. PerfLens does not install dependencies or change the Dockerfile automatically.'); }
-  if (!packageCheck.trim()) throw new CliError('The consumer container cannot resolve the PerfLens preload.', 'Install the packed @perflens/cli package in the Node application image, rebuild it, and rerun audit. PerfLens never installs application dependencies automatically.');
   const serviceIdRaw = await run([...args, 'ps', '-q', serviceName], { cwd });
   const containerId = serviceIdRaw.trim().split(/\r?\n/)[0];
   if (!containerId) throw new CliError(`The Node service ${serviceName} is not running.`, 'Start the consumer development service and rerun audit. No application process was started by PerfLens.');
   const envRaw = await run(['inspect', '--format', '{{json .Config.Env}}', containerId]);
   const actualEnv = parseJson(envRaw, 'runtime metadata') as string[];
   const actual = new Map(actualEnv.filter(value => typeof value === 'string').map(value => { const split = value.indexOf('='); return [value.slice(0, split), value.slice(split + 1)]; }));
+  const runtimeAsset = join(cwd, '.perflens', 'runtime', 'perflens-docker-preload.cjs');
+  let packagedAsset: string;
+  try { packagedAsset = require.resolve('@perflens/cli/docker-preload'); }
+  catch { throw new CliError('PerfLens could not locate its Docker instrumentation bundle.', 'Reinstall the packed @perflens/cli package and rerun audit. No application files were modified.'); }
+  const runtimeBundle = await readFile(packagedAsset);
+  const runtimeHash = createHash('sha256').update(runtimeBundle).digest('hex');
+  await atomicWrite(runtimeAsset, runtimeBundle);
   const runtimeMarkers = ['NODE_ENV', 'DEPLOYMENT_ENVIRONMENT', 'APP_ENV', 'ENVIRONMENT']
     .map(key => actual.get(key) ?? environmentValue(service, key)).filter((value): value is string => Boolean(value));
   if (runtimeMarkers.some(value => /^(?:prod|production|staging|stage)$/i.test(value.trim()))) {
     throw new CliError(`PerfLens will not restart ${serviceName} because its runtime environment is marked production or staging.`, 'Use a clearly local development Compose project. PerfLens did not modify or restart the service.');
   }
   const endpoint = containerEndpoint;
-  // Environment agreement plus the correlated Tempo preflight is authoritative:
-  // an application may already initialize the exported instrumentation API in
-  // source, in which case recreating it just to add NODE_OPTIONS is unnecessary.
+  // Reuse only when the current package bundle, dynamic exporter endpoint,
+  // service identity, and mounted preload are all present in the running app.
+  const nodeOptions = actual.get('NODE_OPTIONS') ?? environmentValue(service, 'NODE_OPTIONS') ?? '';
   const active = actual.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT') === endpoint
-    && actual.get('OTEL_SERVICE_NAME') === options.serviceName;
+    && actual.get('OTEL_SERVICE_NAME') === options.serviceName
+    && nodeOptions.includes(CONTAINER_PRELOAD)
+    && actual.get('PERFLENS_RUNTIME_BUNDLE_SHA256') === runtimeHash;
   if (active) return { mode: 'docker', service: serviceName, restarted: false, endpoint };
   const currentExporterEndpoint = actual.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT') ?? environmentValue(service, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT');
   if (currentExporterEndpoint && !isSupportedLocalTraceEndpoint(currentExporterEndpoint)) {
     throw new CliError(`The ${serviceName} service has an explicit non-local OTLP traces endpoint.`, 'PerfLens will not replace an external telemetry destination. Configure the consumer to use the project-local PerfLens Collector endpoint, then rerun audit.');
   }
-  const nodeOptions = actual.get('NODE_OPTIONS') ?? environmentValue(service, 'NODE_OPTIONS') ?? '';
-  const preload = '--require @perflens/cli/preload';
-  if (nodeOptions.trim() && nodeOptions.trim() !== preload) {
-    throw new CliError(`The ${serviceName} service already has custom NODE_OPTIONS.`, 'PerfLens will not replace or persist arbitrary Node runtime options. Add `--require @perflens/cli/preload` to the existing NODE_OPTIONS for this local service, or remove the custom value and rerun audit.');
-  }
-  const desiredNodeOptions = nodeOptions.trim() || preload;
+  const desiredNodeOptions = mergePreload(nodeOptions);
 
   // Prove the module is available from the actual Node application working directory before asking to restart.
   const override = join(cwd, '.perflens', 'runtime', 'instrumentation.compose.yaml');
@@ -166,8 +209,9 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
     NODE_OPTIONS: desiredNodeOptions,
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: endpoint,
     OTEL_SERVICE_NAME: options.serviceName,
+    PERFLENS_RUNTIME_BUNDLE_SHA256: runtimeHash,
   };
-  const yamlText = `services:\n  ${JSON.stringify(serviceName)}:\n    environment:\n${Object.entries(environment).map(([key, value]) => `      ${key}: ${yaml(value)}\n`).join('')}`;
+  const yamlText = `services:\n  ${JSON.stringify(serviceName)}:\n    environment:\n${Object.entries(environment).map(([key, value]) => `      ${key}: ${yaml(value)}\n`).join('')}    volumes:\n      - type: bind\n        source: ${yaml(runtimeAsset)}\n        target: ${CONTAINER_PRELOAD}\n        read_only: true\n`;
   await atomicWrite(override, yamlText);
   write(`Node/Express service detected: ${serviceName}`);
   write(`PerfLens instrumentation endpoint: ${endpoint}`);

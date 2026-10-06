@@ -122,7 +122,9 @@ export async function collectTempoEvidenceWithRetry(
   collect: () => Promise<TraceSnapshot>,
   options: { attempts?: number; intervalMs?: number; wait?: (ms: number) => Promise<void> } = {},
 ): Promise<TraceSnapshot> {
-  const attempts = options.attempts ?? 12, intervalMs = options.intervalMs ?? 500;
+  // Tempo indexing can lag behind Collector acceptance under a short local
+  // audit. Poll only this run/profile query for a bounded 20-second window.
+  const attempts = options.attempts ?? 40, intervalMs = options.intervalMs ?? 500;
   const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   let snapshot: TraceSnapshot = { spans: [], traceCount: 0, spanCount: 0, truncated: false };
   for (let attempt = 0; attempt < attempts; attempt++) {

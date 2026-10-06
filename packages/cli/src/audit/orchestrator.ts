@@ -111,7 +111,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   try {
     analysis = await dependencies.analyze(options, executed.run.runId, () => undefined);
     if (!analysis.availability.traces || analysis.traceSummary.requests === 0) {
-      throw new CliError('No correlated request traces were collected for this audit.', `Confirm the target loads @perflens/cli/instrumentation before its framework and database imports, sends OTLP traces to ${otlpEndpoint}, and uses the configured service.name. The PerfLens bootstrap reads .perflens/infra/.env automatically; the completed load evidence remains under .perflens/runs.`);
+      throw new CliError('No correlated request traces were collected for this audit.', `The completed load evidence remains under .perflens/runs. Check the selected application's startup logs and Collector delivery, then retry analysis for this run. PerfLens did not generate a report from missing telemetry (current Collector endpoint: ${otlpEndpoint}).`);
     }
   }
   catch (error) { throw completedLoadStageError('Evidence analysis', error, 'analysis'); }

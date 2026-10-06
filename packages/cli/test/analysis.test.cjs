@@ -104,6 +104,13 @@ test('Tempo evidence retry is bounded and returns an empty snapshot only after t
   assert.equal(waits, 2);
 });
 
+test('default Tempo evidence retry is bounded to a short indexing window', async () => {
+  let calls = 0, waits = 0;
+  await collectTempoEvidenceWithRetry(async () => { calls++; return { spans: [], traceCount: 0, spanCount: 0, truncated: false }; }, { wait: async ms => { assert.equal(ms, 500); waits++; } });
+  assert.equal(calls, 40);
+  assert.equal(waits, 39);
+});
+
 test('analyze refuses missing run and rejects failed/incomplete run state', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'perflens-analysis-invalid-'));
   try {
