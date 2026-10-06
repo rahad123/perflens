@@ -21,9 +21,57 @@ export interface RuntimeActivationOptions {
   selectService?: (services: string[]) => Promise<string | undefined>;
   write?: (line: string) => void;
   run?: Runner;
-  probeTarget?: (url: string) => Promise<boolean>;
+  probeTarget?: (url: string, timeoutMs?: number) => Promise<boolean>;
+  isServiceRunning?: (service: string) => Promise<boolean>;
+  readinessTimeoutMs?: number;
+  readinessPollIntervalMs?: number;
+  now?: () => number;
+  wait?: (milliseconds: number) => Promise<void>;
 }
 export interface RuntimeActivationResult { mode: 'host' | 'docker'; service?: string; restarted: boolean; endpoint: string }
+
+export class ApplicationReadinessError extends CliError {}
+
+const DEFAULT_READINESS_TIMEOUT_MS = 60_000;
+const DEFAULT_READINESS_POLL_INTERVAL_MS = 750;
+
+/** Wait for HTTP readiness independently from the later correlated-trace preflight. */
+export async function waitForApplicationReady(options: {
+  target: string;
+  serviceName: string;
+  probe: (url: string, timeoutMs?: number) => Promise<boolean>;
+  isServiceRunning: () => Promise<boolean>;
+  timeoutMs?: number;
+  intervalMs?: number;
+  now?: () => number;
+  wait?: (milliseconds: number) => Promise<void>;
+}): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+  const intervalMs = options.intervalMs ?? DEFAULT_READINESS_POLL_INTERVAL_MS;
+  const now = options.now ?? Date.now;
+  const wait = options.wait ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
+  const deadline = now() + timeoutMs;
+  while (true) {
+    if (!await options.isServiceRunning()) {
+      throw new ApplicationReadinessError(
+        `Application service ${options.serviceName} exited while PerfLens was waiting for it to become ready.`,
+        'Check the selected service startup logs and rerun audit. No load was started; unrelated services were not restarted.',
+      );
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    try {
+      if (await options.probe(options.target, remaining)) return;
+    } catch { /* transient connection failures are expected during startup */ }
+    const remainingAfterProbe = deadline - now();
+    if (remainingAfterProbe <= 0) break;
+    await wait(Math.min(intervalMs, remainingAfterProbe));
+  }
+  throw new ApplicationReadinessError(
+    `Application service ${options.serviceName} is running, but the audit target did not become reachable within ${Math.ceil(timeoutMs / 1000)} seconds: ${options.target}`,
+    'No load was started. Check the application startup logs, configured target URL, and published port. PerfLens did not modify application source or Compose files.',
+  );
+}
 
 function yaml(value: string): string { return JSON.stringify(value); }
 function composeFilesFromEnvironment(cwd: string, env = process.env): string[] | null {
@@ -219,15 +267,28 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
   const activationArgs = [...args, '-f', override, '--project-name', config.name, 'up', '-d', '--no-deps', '--force-recreate', serviceName];
   await run(activationArgs, { cwd, stream: true, timeout: 600000 });
   const target = new URL(options.probePath ?? '/', options.baseUrl).toString();
-  const probe = options.probeTarget ?? (async (url: string) => {
+  const probe = options.probeTarget ?? (async (url: string, timeoutMs = 1500) => {
     try {
-      const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(1500) });
+      const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(Math.max(1, Math.min(1500, timeoutMs))) });
       await response.body?.cancel();
       return true;
     } catch { return false; }
   });
-  const deadline = Date.now() + 30000;
-  while (Date.now() < deadline && !await probe(target)) await new Promise(resolve => setTimeout(resolve, 250));
-  if (!await probe(target)) throw new CliError(`The ${serviceName} service was recreated for instrumentation but the target did not become reachable.`, 'Check the selected service logs and verify its startup command/port. No load was started; the application service and its original Compose files remain available.');
+  const isServiceRunning = options.isServiceRunning ?? (async (name: string) => {
+    const ids = (await run([...args, 'ps', '-q', name], { cwd })).trim().split(/\r?\n/).filter(Boolean);
+    if (!ids.length) return false;
+    const status = (await run(['inspect', '--format', '{{.State.Status}}', ids[0]])).trim();
+    return status !== 'exited' && status !== 'dead' && status !== 'removing';
+  });
+  write('Waiting for application readiness...');
+  await waitForApplicationReady({
+    target, serviceName, probe,
+    isServiceRunning: () => isServiceRunning(serviceName),
+    timeoutMs: options.readinessTimeoutMs,
+    intervalMs: options.readinessPollIntervalMs,
+    now: options.now,
+    wait: options.wait,
+  });
+  write('✓ Application ready');
   return { mode: 'docker', service: serviceName, restarted: true, endpoint };
 }

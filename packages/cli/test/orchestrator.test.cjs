@@ -5,6 +5,7 @@ const { join } = require('node:path');
 const { tmpdir } = require('node:os');
 const { runCompleteAudit } = require('../dist/audit/orchestrator');
 const { otlpTracesEndpoint } = require('../dist/services/workspace');
+const { ApplicationReadinessError } = require('../dist/services/runtime-instrumentation');
 const infraServices = ['otel-collector', 'tempo', 'prometheus', 'grafana'];
 
 const runId = 'pfl_20261002T120000000Z_12345678-1234-1234-1234-123456789abc';
@@ -159,4 +160,19 @@ test('a changed single endpoint cannot reach load without explicit approval', as
   const deps = mockDependencies(t);
   await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json'), endpoints: [{ method: 'GET', path: '/private' }] }, new AbortController().signal, () => undefined, deps), /Selected endpoints require explicit load-test approval/);
   assert.deepEqual(deps.events, []);
+});
+
+test('application readiness completes before telemetry preflight/load orchestration begins', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t, { async activateInstrumentation() { deps.events.push('application-ready'); return { mode: 'docker', service: 'api', restarted: true, endpoint: 'http://host.docker.internal:4319/v1/traces' }; } });
+  await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, () => undefined, deps);
+  assert.ok(deps.events.indexOf('application-ready') < deps.events.indexOf('audit'));
+  assert.ok(deps.events.indexOf('audit') < deps.events.indexOf('analyze'));
+});
+
+test('readiness failure is accurately staged and prevents load, analysis, and report', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t, { async activateInstrumentation() { deps.events.push('readiness-failed'); throw new ApplicationReadinessError('Application service api is running, but the audit target did not become reachable within 60 seconds: http://localhost:3400/orders', 'No load was started.'); } });
+  await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, () => undefined, deps), error => /Application readiness failed/.test(error.message) && /Load test: not started/.test(error.message) && /Analysis: not run/.test(error.message) && /Report: not generated/.test(error.message));
+  assert.deepEqual(deps.events, ['status', 'readiness-failed']);
 });

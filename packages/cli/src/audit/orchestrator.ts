@@ -8,7 +8,7 @@ import { assertLocalDocker, Infrastructure, infrastructureReady } from '../servi
 import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { CliError } from '../utils/errors';
 import { audit, AuditOptions } from './service';
-import { activateComposeInstrumentation, RuntimeActivationResult } from '../services/runtime-instrumentation';
+import { activateComposeInstrumentation, ApplicationReadinessError, RuntimeActivationResult } from '../services/runtime-instrumentation';
 
 function stageError(stage: string, error: unknown): CliError {
   const detail = error instanceof Error ? error.message : String(error);
@@ -100,7 +100,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
         selectService: options.selectApplicationService, write,
       });
       if (activation.mode === 'docker') write(activation.restarted ? `✓ PerfLens instrumentation activated for ${activation.service}` : `✓ PerfLens instrumentation already active for ${activation.service}`);
-    } catch (error) { throw preLoadStageError('Instrumentation activation', error); }
+    } catch (error) { throw preLoadStageError(error instanceof ApplicationReadinessError ? 'Application readiness' : 'Instrumentation activation', error); }
   }
 
   let executed;

@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
-const { activateComposeInstrumentation, isSupportedNodeCommand } = require('../dist/services/runtime-instrumentation.js');
+const { activateComposeInstrumentation, isSupportedNodeCommand, waitForApplicationReady, ApplicationReadinessError } = require('../dist/services/runtime-instrumentation.js');
 
 async function fixture(t, { port = 4333, targetPort = 3400, services = ['api'], active = false, bundleHashOverride, nodeOptions = '', exporterEndpoint } = {}) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'perflens-runtime-'));
@@ -178,4 +178,53 @@ test('host-run targets are left unchanged for existing preload or actionable pre
   const result = await activateComposeInstrumentation({ ...args(f), approveRestart: async () => false });
   assert.equal(result.mode, 'host');
   assert.equal(f.calls.length, 0);
+});
+
+test('application readiness accepts an immediate HTTP response without an arbitrary delay', async () => {
+  let probes = 0, waits = 0;
+  await waitForApplicationReady({ target: 'http://127.0.0.1:3400/orders', serviceName: 'api', probe: async url => { probes++; assert.equal(url, 'http://127.0.0.1:3400/orders'); return true; }, isServiceRunning: async () => true, wait: async () => { waits++; } });
+  assert.equal(probes, 1);
+  assert.equal(waits, 0);
+});
+
+test('application readiness keeps polling through transient connection failures and stops on first success', async () => {
+  let clock = 0, probes = 0, waits = 0;
+  await waitForApplicationReady({ target: 'http://127.0.0.1:3400/orders', serviceName: 'api', probe: async () => ++probes >= 4, isServiceRunning: async () => true, timeoutMs: 10000, intervalMs: 500, now: () => clock, wait: async ms => { waits++; clock += ms; } });
+  assert.equal(probes, 4);
+  assert.equal(waits, 3);
+  assert.equal(clock, 1500);
+});
+
+test('slow application startup can become reachable within the bounded readiness timeout', async () => {
+  let clock = 0, probes = 0;
+  await waitForApplicationReady({ target: 'http://127.0.0.1:3400/orders', serviceName: 'api', probe: async () => { probes++; return clock >= 8000; }, isServiceRunning: async () => true, timeoutMs: 60000, intervalMs: 750, now: () => clock, wait: async ms => { clock += ms; } });
+  assert.equal(clock, 8250);
+  assert.ok(probes > 5);
+});
+
+test('application readiness timeout is bounded and performs no extra post-deadline probe', async () => {
+  let clock = 0, probes = 0;
+  await assert.rejects(waitForApplicationReady({ target: 'http://127.0.0.1:3400/orders', serviceName: 'api', probe: async () => { probes++; return false; }, isServiceRunning: async () => true, timeoutMs: 2000, intervalMs: 500, now: () => clock, wait: async ms => { clock += ms; } }), error => error instanceof ApplicationReadinessError && /did not become reachable within 2 seconds/.test(error.message) && /No load was started/.test(error.remediation));
+  assert.equal(clock, 2000);
+  assert.equal(probes, 4);
+});
+
+test('selected container exit fails readiness immediately instead of waiting for timeout', async () => {
+  let clock = 0, probes = 0, checks = 0;
+  await assert.rejects(waitForApplicationReady({ target: 'http://127.0.0.1:3400/orders', serviceName: 'api', probe: async () => { probes++; return false; }, isServiceRunning: async () => ++checks < 3, timeoutMs: 60000, intervalMs: 500, now: () => clock, wait: async ms => { clock += ms; } }), error => error instanceof ApplicationReadinessError && /service api exited/.test(error.message));
+  assert.equal(probes, 2);
+  assert.equal(clock, 1000);
+});
+
+test('Docker activation probes the configured endpoint after recreating only the selected service', async t => {
+  const f = await fixture(t), events = [];
+  const originalProbe = async url => { events.push(`probe:${url}`); return events.filter(event => event.startsWith('probe:')).length >= 3; };
+  const result = await activateComposeInstrumentation({ ...args(f), probeTarget: originalProbe, isServiceRunning: async service => (events.push(`running:${service}`), true), wait: async () => { events.push('wait'); }, approveRestart: async () => true, write: line => events.push(line) });
+  assert.equal(result.restarted, true);
+  assert.ok(events.indexOf('Waiting for application readiness...') < events.indexOf('✓ Application ready'));
+  assert.ok(events.indexOf('✓ Application ready') > events.indexOf('wait'));
+  assert.equal(events.filter(event => event === 'probe:http://127.0.0.1:3400/orders').length, 3);
+  const up = f.calls.find(call => call.includes('up'));
+  assert.equal(up.at(-1), 'api');
+  assert.ok(up.includes('--no-deps'));
 });
