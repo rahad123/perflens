@@ -55,7 +55,8 @@ test('Docker activation uses current dynamic OTLP port and recreates only the de
   const f = await fixture(t), source = await fs.readFile(path.join(f.cwd, 'compose.yaml'));
   const unchangedFiles = await Promise.all(['package.json', 'Dockerfile', 'server.js'].map(file => fs.readFile(path.join(f.cwd, file))));
   let approvedService;
-  const result = await activateComposeInstrumentation({ ...args(f), approveRestart: async service => (approvedService = service, true) });
+  const output = [];
+  const result = await activateComposeInstrumentation({ ...args(f), write: line => output.push(line), approveRestart: async service => (approvedService = service, true) });
   assert.equal(result.mode, 'docker');
   assert.equal(result.service, 'api');
   assert.equal(result.endpoint, 'http://host.docker.internal:4333/v1/traces');
@@ -65,6 +66,8 @@ test('Docker activation uses current dynamic OTLP port and recreates only the de
   assert.ok(up.includes('--force-recreate'));
   assert.equal(up.at(-1), 'api');
   assert.ok(up.includes('--project-name'));
+  assert.match(output.join('\n'), /✓ Node\/Express service detected: api/);
+  assert.doesNotMatch(output.join('\n'), /host\.docker\.internal|OTEL_EXPORTER_OTLP_TRACES_ENDPOINT|set OTEL_/);
   assert.equal(f.calls.some(call => call.includes('exec')), false, 'activation must not require the CLI package inside the image');
   const override = await fs.readFile(path.join(f.cwd, '.perflens/runtime/instrumentation.compose.yaml'), 'utf8');
   assert.match(override, /host\.docker\.internal:4333/);

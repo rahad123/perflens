@@ -45,6 +45,40 @@ test('zero-finding runs remain valid and produce conservative report language', 
   assert.match(html, /Latency by profile/);
   assert.match(html, /p99/);
 });
+
+test('long run IDs and endpoint URLs remain intact with wrapping layout at desktop and mobile widths', () => {
+  const longId = 'pfl_20261007T180126602Z_20bb015a-6881-4daa-903a-73b44cb5262a';
+  const paths = [
+    '/api/dpps/ZTU3OWMxMzMxNWVkNDE4MWJlNjA4YmIxODRjZmVkNzc/public-view',
+    '/api/organizations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/private-view',
+  ];
+  const input = fixture();
+  input.run.runId = longId;
+  input.analysis.runId = longId;
+  input.findingsArtifact.runId = longId;
+  input.evidence.runId = longId;
+  input.profiles[0].result.runId = longId;
+  input.profiles[0].result.target.endpoints = paths.map(path => ({ method: 'GET', path }));
+  input.profiles[0].result.metrics.endpointResults = paths.map((path, index) => ({ target: { method: 'GET', path }, metrics: { requests: 40, rps: 4, errorRate: index ? 0.1333 : 0, failedRequests: index ? 6 : 0, latencyMs: { p50: 20, p95: 84, p99: 120 } } }));
+  const html = renderHtml(build(input));
+  assert.ok(html.includes(longId));
+  for (const path of paths) assert.ok(html.includes(path));
+  assert.match(html, /h1,\.metadata div,\.endpoint-list[^}]*overflow-wrap:anywhere/);
+  assert.match(html, /\.metadata div\{min-width:0\}/);
+  assert.match(html, /\.evidence-card p,\.evidence-card li,code,footer\{overflow-wrap:anywhere/);
+  assert.match(html, /\.endpoint-comparison \.endpoint-cell[^}]*white-space:normal;overflow-wrap:anywhere/);
+  assert.match(html, /@media\(max-width:700px\)\{main\{width:100%;margin:0;padding:25px 18px\}/);
+  assert.match(html, /minmax\(min\(100%,220px\),1fr\)/);
+});
+
+test('non-zero error rates are highlighted as measured failures without creating a diagnosis', () => {
+  const html = renderHtml(build(fixture()));
+  assert.match(html, /Request failures were observed\./);
+  assert.match(html, /normal: 1\.00% \(2 failed of 200\)/);
+  assert.match(html, /class="error-rate nonzero"/);
+  assert.match(html, /This is a measured error rate, not a root-cause diagnosis\./);
+  assert.match(renderMarkdown(build(fixture())), /\| 1\.00% \|/);
+});
 test('multi-endpoint report comparison uses endpoint-scoped k6 samples and existing Phase 3 findings only', () => {
   const input = fixture({ findings: [finding({ target: { method: 'GET', path: '/products' }, severity: 'P1', confidence: 'medium' })] });
   const profile = input.profiles[0].result;

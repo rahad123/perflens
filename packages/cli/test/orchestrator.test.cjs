@@ -60,11 +60,11 @@ test('one-command audit reuses healthy infrastructure and runs measurement, anal
   assert.deepEqual(deps.events, ['status', 'audit', 'endpoints:/orders', 'analyze', 'report']);
   assert.equal(result.run.runId, runId);
   assert.match(output.join('\n'), /PERFORMANCE/);
-  assert.match(output.join('\n'), /baseline\s+20\s+0\s+6\.00/);
-  assert.match(output.join('\n'), /p50 ms.*p95 ms.*p99 ms/);
+  assert.match(output.join('\n'), /baseline\s+20 requests · 6\.00 RPS · p95 10\.00 ms · errors 0\.00%/);
   assert.match(output.join('\n'), /No evidence-backed bottlenecks/);
-  assert.match(output.join('\n'), /PostgreSQL spans: 222/);
-  assert.match(output.join('\n'), /OTLP traces endpoint http:\/\/127\.0\.0\.1:4319\/v1\/traces/);
+  assert.match(output.join('\n'), /PostgreSQL spans\s+222/);
+  assert.match(output.join('\n'), /✓ Observability ready/);
+  assert.doesNotMatch(output.join('\n'), /OTLP traces endpoint|host\.docker\.internal|set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT/);
   assert.match(output.join('\n'), /Grafana: http:\/\/127\.0\.0\.1:3001/);
   assert.match(output.join('\n'), new RegExp(runId));
 });
@@ -101,7 +101,8 @@ test('missing correlated telemetry fails after preserving audit evidence and ski
   assert.deepEqual(deps.events, ['status', 'audit', 'endpoints:/orders', 'analyze']);
   assert.match(await readFile(join(t.cwd, '.perflens', 'runs', runId, 'telemetry/metadata.json'), 'utf8'), /grafana/);
   const endpoint = await otlpTracesEndpoint(join(t.cwd, '.perflens', 'infra'));
-  assert.ok(output.some(line => line.includes(`OTLP traces endpoint ${endpoint}`)));
+  assert.ok(failure.remediation.includes(endpoint));
+  assert.doesNotMatch(output.join('\n'), /OTLP traces endpoint/);
   assert.ok(failure.remediation.includes(endpoint));
 });
 
@@ -160,6 +161,15 @@ test('a changed single endpoint cannot reach load without explicit approval', as
   const deps = mockDependencies(t);
   await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json'), endpoints: [{ method: 'GET', path: '/private' }] }, new AbortController().signal, () => undefined, deps), /Selected endpoints require explicit load-test approval/);
   assert.deepEqual(deps.events, []);
+});
+
+test('bounded load is never started when explicit load approval is denied', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t);
+  await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json'), approveLoad: async () => false }, new AbortController().signal, () => undefined, deps), /Audit permission was not granted/);
+  assert.ok(!deps.events.includes('audit'));
+  assert.ok(!deps.events.includes('analyze'));
+  assert.ok(!deps.events.includes('report'));
 });
 
 test('application readiness completes before telemetry preflight/load orchestration begins', async t => {

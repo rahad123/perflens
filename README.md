@@ -29,7 +29,7 @@ Phase 3 analysis currently supports measured latency, error-rate, and throughput
 
 ## Intended workflow
 
-The normal consumer workflow is `npm install -D @perflens/cli` followed by `npx perflens audit`. On first interactive use, audit asks for a local target and known safe GET paths; automatic Express route discovery is not currently reliable, so PerfLens will not claim to discover routes. For multiple configured endpoints it lists every endpoint and requires interactive approval before load; non-interactive runs require `--yes`. `npx perflens init` remains available for explicit setup. For Express, initialize PerfLens instrumentation before Express and database modules as described in [the consumer integration guide](docs/integrations/express.md).
+The normal consumer workflow is `npm install -D @perflens/cli` followed by `npx perflens audit`. First use guides setup and asks for known safe GET paths; automatic Express route discovery is not currently reliable, so PerfLens does not claim to discover routes. The audit shows the target, endpoints, profiles, and any local service restart before asking once for consent. Non-interactive runs require `--yes`; Docker service restart additionally requires `--restart-app`. `npx perflens init` remains available for explicit setup. Supported Docker Node/Express services receive temporary managed instrumentation automatically. Host-run apps need the documented preload started before Express and database modules, as described in [the consumer integration guide](docs/integrations/express.md).
 
 ## Architecture
 
@@ -58,15 +58,17 @@ npx perflens --version
 npx perflens init
 npx perflens doctor
 npx perflens audit
+npx perflens audit --open
 npx perflens audit --profile baseline,normal
 npx perflens runs
 npx perflens analyze <run-id> --offline
 npx perflens report <run-id> --format markdown
+npx perflens report --open
 npx perflens infra status
 npx perflens infra down
 ```
 
-`npx perflens audit` validates the configured loopback target, starts missing local audit infrastructure while reusing services already running for that project, runs the configured bounded profiles, analyzes correlated Tempo evidence, and generates all report formats. It prints actual profile measurements, Phase 3 findings, trace counts, Grafana access, and the HTML report path. If telemetry is missing, analysis fails explicitly and keeps the measured run artifacts for review.
+`npx perflens audit` validates the configured loopback target, starts missing local audit infrastructure while reusing services already running for that project, runs the configured bounded profiles, analyzes correlated Tempo evidence, and generates all report formats. Its summary includes measured profile results, error rates, Phase 3 findings, trace counts, Grafana access, and the HTML report path. `--open` opens the report produced by that successful audit. If telemetry is missing, analysis fails explicitly and keeps the measured run artifacts for review.
 
 Advanced commands remain separate: `analyze` selects the latest completed run by default, snapshots sanitized traces from local Tempo once, and supports offline reruns. `report` consumes saved analysis only and writes `report.json`, `report.md`, and `report.html` under `.perflens/runs/<run-id>/report/`; it never starts a load test or analysis.
 
@@ -76,13 +78,13 @@ Prerequisites: Node.js 22.12+, Docker with a local daemon and Docker Compose, pl
 
 ```sh
 npm install -D @perflens/cli
-# Instrument your app using docs/integrations/express.md, then start it.
 npx perflens audit
+npx perflens report --open
 ```
 
-On the first interactive audit, PerfLens asks for the local API URL, then whether you want to enter one known GET path or several known safe GET paths. It does not discover Express routes automatically: the CLI cannot reliably inspect an already-running app's in-memory router, so it asks for paths instead of pretending to inspect your router. It creates `perflens.config.json`, appends `.perflens/` to `.gitignore` without replacing existing content, and stores generated runtime assets, run evidence, and reports under `.perflens/`. Existing valid configuration is reused without prompting or rewriting. No application source or dependencies are modified. Multiple endpoints require approval showing the exact GET paths and profiles before any load starts; `--yes` is the explicit non-interactive authorization. Health and metrics routes are excluded, and only GET can be configured for automatic load.
+On the first interactive audit, PerfLens asks for the local API URL and one or more known safe GET paths. It does not discover Express routes automatically: the CLI cannot reliably inspect an already-running app's in-memory router, so it asks for paths instead of pretending to inspect your router. It creates `perflens.config.json`, appends `.perflens/` to `.gitignore` without replacing existing content, and stores generated runtime assets, run evidence, and reports under `.perflens/`. Existing valid configuration is reused without prompting or rewriting. No application source or dependencies are modified. Before load, one approval shows the exact endpoints, profiles, and whether a local Docker service may restart for instrumentation. `--yes` authorizes load in non-interactive use; restarting the app in non-interactive use also requires `--restart-app`. Health and metrics routes are excluded, and only GET can be configured for automatic load.
 
-Before load, PerfLens uses configured `target.headers` for target preflight and verifies a correlated application trace. Private endpoints can use environment references such as `"Authorization": "Bearer ${PERFLENS_AUTH_TOKEN}"` in config; export the token in the shell before running the command. Secret values are resolved in memory and are not written to run artifacts. A 401/403 stops the audit before load and explicitly reports that analysis and report generation did not occur. For a supported local Docker Compose Node service, audit temporarily mounts a self-contained instrumentation preload read-only and recreates only that selected service after approval; it does not require the CLI package in the application image or edit application source, Dockerfile, package scripts, or Compose files. The preload uses the current project’s dynamic Collector port and configured service name, then telemetry preflight must pass before load. A host-run app cannot be safely restarted or injected into by PerfLens; launch it with the documented `NODE_OPTIONS="--require @perflens/cli/preload"` before importing Express/PostgreSQL. For a containerized app, `localhost` inside the app is the app container itself; PerfLens supplies `host.docker.internal` and the selected OTLP port in the temporary override. In non-interactive use, create config before the audit; PerfLens will not guess target routes. `perflens init` remains optional explicit setup. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
+Before load, PerfLens uses configured `target.headers` for target preflight and verifies a correlated application trace. Private endpoints can use environment references such as `"Authorization": "Bearer ${PERFLENS_AUTH_TOKEN}"` in config; export the token in the shell before running the command. Secret values are resolved in memory and are not written to run artifacts. A 401/403 stops the audit before load and explicitly reports that analysis and report generation did not occur. For a supported local Docker Compose Node service, audit temporarily mounts a self-contained instrumentation preload read-only and recreates only that selected service after approval; it does not require the CLI package in the application image or edit application source, Dockerfile, package scripts, or Compose files. The preload uses the current project’s dynamic Collector port and configured service name, then telemetry preflight must pass before load. A host-run app cannot be safely restarted or injected into by PerfLens; see the [Express integration guide](docs/integrations/express.md) for the advanced preload setup. Advanced diagnostics, including selected OTLP endpoints, are available in `perflens doctor` and `perflens infra status`. In non-interactive use, create config before the audit; PerfLens will not guess target routes. `perflens init` remains optional explicit setup. `perflens infra down` stops only PerfLens's four audit services; persistent volumes and your application remain running.
 
 ### Local URLs
 
@@ -92,7 +94,7 @@ Before load, PerfLens uses configured `target.headers` for target preflight and 
 | Grafana | `http://localhost:3001` (actual selected URL is printed) |
 | Prometheus | `http://localhost:9090` (actual selected URL is printed) |
 | Tempo query API | `http://localhost:3200` (actual selected URL is printed) |
-| OTLP HTTP receiver | Host loopback and Docker-consumer endpoints are printed by init, doctor, infra up, and audit; both use the same selected port. |
+| OTLP HTTP receiver | Managed automatically for supported consumers; detailed host and container endpoints are available in `perflens doctor` and `perflens infra status`. |
 
 Grafana provisions the **PerfLens — Local API Performance** dashboard with request rate, 4xx/5xx rate, and p50/p95/p99 latency queries over the standard `perflens_http_*` metrics. The dashboard has data only when the target exposes those metrics. In Grafana → Explore → Tempo, query the run using `{ resource.service.name = "<service-name>" && span.perflens.audit.run_id = "<run-id>" }`.
 

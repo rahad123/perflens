@@ -261,8 +261,7 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
   };
   const yamlText = `services:\n  ${JSON.stringify(serviceName)}:\n    environment:\n${Object.entries(environment).map(([key, value]) => `      ${key}: ${yaml(value)}\n`).join('')}    volumes:\n      - type: bind\n        source: ${yaml(runtimeAsset)}\n        target: ${CONTAINER_PRELOAD}\n        read_only: true\n`;
   await atomicWrite(override, yamlText);
-  write(`Node/Express service detected: ${serviceName}`);
-  write(`PerfLens instrumentation endpoint: ${endpoint}`);
+  write(`✓ Node/Express service detected: ${serviceName}`);
   if (!await options.approveRestart(serviceName)) throw new CliError(`Instrumentation activation requires restarting ${serviceName}.`, `Rerun interactively and approve restarting only this local service. No other Compose service was changed.`);
   const activationArgs = [...args, '-f', override, '--project-name', config.name, 'up', '-d', '--no-deps', '--force-recreate', serviceName];
   await run(activationArgs, { cwd, stream: true, timeout: 600000 });

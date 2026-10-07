@@ -9,7 +9,7 @@ import { K6Runner, Plan } from './k6';
 import { checkCancelled, checkInfrastructure, checkInstrumentation, checkTarget } from './preflight';
 import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
-export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[]; approveApplicationRestart?: (service: string) => Promise<boolean>; selectApplicationService?: (services: string[]) => Promise<string | undefined> }
+export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[]; approveApplicationRestart?: (service: string) => Promise<boolean>; approveLoad?: () => Promise<boolean>; selectApplicationService?: (services: string[]) => Promise<string | undefined> }
 interface ProfileState { name: ProfileName; status: RunStatus; startedAt: string | null; endedAt: string | null; error: string | null; result: string | null }
 export interface AuditDependencies {
   runner: Pick<K6Runner, 'version' | 'prepare' | 'profile'>;
@@ -55,22 +55,17 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
   const save = async () => { await store.write('run.json', run); await store.write('telemetry/metadata.json', metadata); };
   await store.write('config.json', { schemaVersion: 1, ...config });
   await save();
-  dependencies.write(`PerfLens Audit\nRun: ${store.id}\nTarget: ${config.target.baseUrl}\nProfiles: ${selected.join(', ')}\nResults: ${store.directory}\nPreflight`);
   let currentPlan: Plan | undefined;
   try {
     run.status = 'preflight'; await save(); checkCancelled(signal);
-    dependencies.write('✓ Configuration valid (loopback GET targets only)');
     run.engine.version = await dependencies.runner.version(signal); checkCancelled(signal);
-    dependencies.write(`✓ ${run.engine.version}`);
     metadata.infrastructure = await dependencies.infrastructure(infraDir, dirname(configPath), config.target.baseUrl); checkCancelled(signal);
-    dependencies.write('✓ Collector, Tempo, Prometheus, and Grafana ready');
-    dependencies.write(`OTLP traces endpoint: ${metadata.infrastructure.otlpTracesEndpoint}`);
     for (const endpoint of auditConfig.endpoints) {
       await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
     }
     await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal, undefined, metadata.infrastructure.containerOtlpTracesEndpoint, metadata.infrastructure.otlpTracesEndpoint);
-    dependencies.write('✓ Correlated OpenTelemetry traces verified before load');
+    dependencies.write('✓ Telemetry verified');
     await dependencies.runner.prepare(store.directory);
     await store.write('raw/engine.json', { schemaVersion: 1, ...run.engine, scriptSha256: createHash('sha256').update(await readFile(join(store.directory, 'load-test.js'))).digest('hex') });
     run.status = 'running'; await save();
@@ -83,7 +78,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
         summaryFile: join(store.directory, 'raw', `${profile.name}.summary.json`),
       };
       await save();
-      dependencies.write(`${profile.name}: ${currentPlan.workload.vus} VUs, ${currentPlan.workload.duration}, ${currentPlan.workload.paceMs} ms minimum start interval/VU`);
+      dependencies.write(`Running ${profile.name}...`);
       const execution = await dependencies.runner.profile(store.directory, currentPlan, signal, requestHeaders);
       profile.endedAt = new Date().toISOString();
       profile.status = signal.aborted || execution.cancelled ? 'cancelled' : execution.code !== 0 || execution.timedOut ? 'failed' : 'completed';
@@ -100,9 +95,7 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       await store.write(profile.result, result);
       await save();
       if (profile.status !== 'completed') throw new CliError(profile.error ?? `${profile.name} ${profile.status}${execution.timedOut ? ' (process deadline exceeded)' : ''}.`, 'Completed profile results and available raw evidence are preserved.', profile.status === 'cancelled' ? 130 : 1);
-      const m = result.metrics;
-      const show = (n: number | null) => n === null ? 'unavailable' : n.toFixed(2);
-      dependencies.write(`✓ ${profile.name} complete — Requests: ${m.requests}; RPS: ${show(m.rps)}; p50/p95/p99: ${show(m.latencyMs.p50)}/${show(m.latencyMs.p95)}/${show(m.latencyMs.p99)} ms; Errors: ${show(m.errorRate === null ? null : m.errorRate * 100)}%`);
+      dependencies.write(`✓ ${profile.name} complete`);
       currentPlan = undefined;
     }
     checkCancelled(signal);
@@ -127,6 +120,5 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     await store.write('telemetry/metadata.json', metadata);
     await store.finalize(run);
   }
-  dependencies.write(`Audit complete (measurements only).\nResults: ${store.directory}`);
   return { directory: store.directory, run };
 }

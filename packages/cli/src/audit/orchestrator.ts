@@ -70,7 +70,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   try { root = options.infraDir ? await infrastructureRoot(options.infraDir, projectDirectory, project.config.target.baseUrl) : await dependencies.infrastructureRoot(projectDirectory, project.config.target.baseUrl); }
   catch (error) { throw stageError('Infrastructure asset setup', error); }
   const infra = dependencies.infrastructure(root);
-  write(`PerfLens Performance Audit\nProject  ${project.config.project.name}\nTarget   ${project.config.target.baseUrl}\nEndpoints ${selectedEndpoints.map(e => `GET ${e.path}`).join(', ') || 'not configured'}`);
+  write(`PerfLens Performance Audit\nProject   ${project.config.project.name}\nTarget    ${project.config.target.baseUrl}\nEndpoints ${selectedEndpoints.length} selected GET route${selectedEndpoints.length === 1 ? '' : 's'}`);
   write('✓ Configuration valid');
   let otlpEndpoint = '';
   try {
@@ -78,18 +78,16 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
     let states: Awaited<ReturnType<Infrastructure['status']>>;
     try { states = await infra.status(); }
     catch { states = []; }
-    if (infrastructureReady(states)) write('✓ Observability infrastructure already ready');
+    if (infrastructureReady(states)) write('✓ Observability ready');
     else {
       const unavailable = states.filter(item => !item.ready).map(item => `${item.service}: ${item.state}`);
       write(`Current project infrastructure is missing, stale, or unhealthy (${unavailable.join('; ') || 'service set incomplete'}). Recovering local services...`);
       await infra.up(120000, true);
       states = await infra.status();
       if (!infrastructureReady(states)) throw new CliError('Infrastructure readiness checks did not pass.', states.map(item => `${item.service}: ${item.state}`).join('\n'));
-      write('✓ Observability infrastructure ready');
+      write('✓ Observability ready');
     }
     otlpEndpoint = await otlpTracesEndpoint(root);
-    write(`OTLP traces endpoint ${otlpEndpoint}`);
-    write(`Docker container traces endpoint ${await otlpTracesEndpoint(root, 'container')} (set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT in the consumer container)`);
   } catch (error) { throw preLoadStageError('Observability startup', error); }
 
   if (dependencies.activateInstrumentation) {
@@ -99,8 +97,15 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
         approveRestart: options.approveApplicationRestart ?? (async () => false),
         selectService: options.selectApplicationService, write,
       });
-      if (activation.mode === 'docker') write(activation.restarted ? `✓ PerfLens instrumentation activated for ${activation.service}` : `✓ PerfLens instrumentation already active for ${activation.service}`);
+      if (activation.mode === 'docker') write(`✓ PerfLens instrumentation active${activation.service ? ` for ${activation.service}` : ''}`);
     } catch (error) { throw preLoadStageError(error instanceof ApplicationReadinessError ? 'Application readiness' : 'Instrumentation activation', error); }
+  }
+
+  if (options.approveLoad) {
+    let approved = false;
+    try { approved = await options.approveLoad(); }
+    catch (error) { throw preLoadStageError('Audit permission', error); }
+    if (!approved) throw new CliError('Audit permission was not granted.', 'No bounded load was started. Rerun interactively and approve the displayed target, endpoints, and profiles.');
   }
 
   let executed;
@@ -126,28 +131,29 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
     catch (error) { throw stageError(`Reading ${profile.name} measurements`, error); }
   }
   write('\nPERFORMANCE');
-  write('Profile     Requests   Failed   RPS     Error   p50 ms   p95 ms   p99 ms');
   for (const result of profileResults) {
-    const metrics = result.metrics, latency = metrics.latencyMs;
-    write(`${result.profile.padEnd(11)} ${String(metrics.requests ?? '—').padStart(8)} ${String(metrics.failedRequests ?? '—').padStart(8)} ${display(metrics.rps).padStart(7)} ${display(typeof metrics.errorRate === 'number' ? metrics.errorRate * 100 : null).padStart(7)}% ${display(latency.p50).padStart(8)} ${display(latency.p95).padStart(8)} ${display(latency.p99).padStart(8)}`);
+    const metrics = result.metrics;
+    const errorRate = typeof metrics.errorRate === 'number' ? `${display(metrics.errorRate * 100)}%` : 'unavailable';
+    const errorSignal = typeof metrics.errorRate === 'number' && metrics.errorRate > 0 ? ' ⚠' : '';
+    write(`  ${result.profile.padEnd(9)} ${String(metrics.requests ?? '—')} requests · ${display(metrics.rps)} RPS · p95 ${display(metrics.latencyMs.p95)} ms · errors ${errorRate}${errorSignal}`);
   }
-  write(`Duration: ${profileResults.map(result => `${result.profile} ${display(result.metrics.durationMs, 0)} ms`).join(' · ')}`);
-
-  write('\nBOTTLENECK FINDINGS');
-  if (!analysis.findings.length) write('✓ No evidence-backed bottlenecks met Phase 3 thresholds for this run.');
+  write('\nTELEMETRY');
+  write(`  Request traces    ${analysis.traceSummary.requests}`);
+  write(`  PostgreSQL spans  ${analysis.traceSummary.databaseSpans}`);
+  write(`  External HTTP     ${analysis.traceSummary.externalClientSpans}`);
+  write('\nFINDINGS');
+  if (!analysis.findings.length) write('  No evidence-backed bottlenecks met the configured thresholds.');
   for (const finding of analysis.findings) {
-    write(`${finding.severity}  ${finding.title} — ${finding.confidence.toUpperCase()} confidence`);
+    write(`  ${finding.severity} ${finding.title} — ${finding.confidence.toUpperCase()} confidence`);
     write(`    ${finding.summary}`);
-    write(`    Rule: ${finding.ruleId} · Profiles: ${finding.profiles.join(', ')}`);
-    for (const evidence of finding.evidence.slice(0, 2)) write(`    • ${evidence.observation}`);
+    write(`    ${finding.profiles.join(', ')} · ${finding.ruleId}`);
   }
-  write(`\nTELEMETRY\nRequest traces: ${analysis.traceSummary.requests} · PostgreSQL spans: ${analysis.traceSummary.databaseSpans} · External HTTP spans: ${analysis.traceSummary.externalClientSpans}`);
   const grafana = (await JSON.parse(await readFile(join(executed.directory, 'telemetry/metadata.json'), 'utf8'))).infrastructure?.localUrls?.grafana;
   const prometheus = (await JSON.parse(await readFile(join(executed.directory, 'telemetry/metadata.json'), 'utf8'))).infrastructure?.localUrls?.prometheus;
-  if (grafana) write(`Grafana: ${grafana}`);
-  if (prometheus) write(`Prometheus: ${prometheus}`);
-  if (grafana) write(`Trace navigation: Grafana → Explore → Tempo → filter perflens.audit.run_id = ${executed.run.runId}`);
+  write('\n✓ Audit complete');
   write(`Run ID: ${executed.run.runId}`);
-  write(`\n✓ Audit complete\nReport: .perflens/runs/${executed.run.runId}/report/report.html`);
+  write(`Report: .perflens/runs/${executed.run.runId}/report/report.html`);
+  if (grafana) write(`Grafana: ${grafana} · filter traces by run ID ${executed.run.runId}`);
+  if (prometheus) write(`Prometheus: ${prometheus}`);
   return { ...executed, analysis, report: reportModel };
 }
