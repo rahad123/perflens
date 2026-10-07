@@ -125,6 +125,7 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 function finite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0; }
+const displayNumber = (value: number, digits = 2) => value.toFixed(digits);
 function findingId(ruleId: string, target: { method: string; path: string }, profiles: string[]): string {
   return `${ruleId}:${target.method}:${target.path}:${[...profiles].sort().join(',')}`;
 }
@@ -226,13 +227,17 @@ function compareLoad(profiles: ProfileResult[], findings: Finding[]) {
     findings.push({
       id: findingId(ruleId, target, profilesUsed), ruleId, category: 'load',
       title: ruleId === 'load.error-degradation' ? 'Error rate increases under higher configured concurrency' : ruleId === 'load.throughput-degradation' ? 'Throughput decreased under higher configured concurrency' : 'Latency increased as configured concurrency increased',
-      summary: latencyDegraded ? `p95 latency increased between comparable constant-VU ${previous.profile} and ${current.profile} profiles.` : errorDegraded ? 'The measured error rate increased between comparable constant-VU profiles with higher configured concurrency.' : 'Measured throughput decreased between comparable constant-VU profiles with higher configured concurrency; this observation does not establish saturation or root cause.',
+      summary: errorDegraded
+        ? `Error rate increased from ${displayNumber(errorA! * 100)}% to ${displayNumber(errorB! * 100)}% as configured concurrency increased from ${previous.workload.vus} to ${current.workload.vus} VUs.${latencyDegraded ? ` p95 latency also increased from ${displayNumber(p95A)} ms to ${displayNumber(p95B)} ms.` : ''}`
+        : latencyDegraded
+          ? `p95 latency increased between comparable constant-VU ${previous.profile} and ${current.profile} profiles.`
+          : 'Measured throughput decreased between comparable constant-VU profiles with higher configured concurrency; this observation does not establish saturation or root cause.',
       severity: severity({ p95: p95B, errorRate: errorDegraded ? errorsIncrease : 0 }), confidence: 'high', target, profiles: profilesUsed,
       evidence: [
         { observation: `Under the same constant-VU model, request pacing, timeout, and endpoint, configured concurrency increased from ${previous.workload.vus} to ${current.workload.vus} VUs.`, source: `results/${previous.profile}.json, results/${current.profile}.json` },
-        ...(latencyDegraded ? [{ observation: `p95 changed from ${p95A} ms to ${p95B} ms; p99 changed from ${p99A ?? 'unavailable'} ms to ${p99B ?? 'unavailable'} ms.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { p95BeforeMs: p95A, p95AfterMs: p95B, p99BeforeMs: p99A, p99AfterMs: p99B } }] : []),
-        ...(errorDegraded ? [{ observation: `Error rate changed from ${(errorA! * 100).toFixed(2)}% to ${(errorB! * 100).toFixed(2)}%.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { errorRateBefore: errorA, errorRateAfter: errorB } }] : []),
-        ...(throughputDegraded ? [{ observation: `Observed throughput changed from ${rpsA} to ${rpsB} requests/sec between the comparable ${previous.profile} and ${current.profile} profiles.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { rpsBefore: rpsA, rpsAfter: rpsB } }] : []),
+        ...(errorDegraded ? [{ observation: `Error rate changed from ${displayNumber(errorA! * 100)}% to ${displayNumber(errorB! * 100)}%.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { errorRateBefore: errorA, errorRateAfter: errorB } }] : []),
+        ...(latencyDegraded ? [{ observation: `p95 changed from ${displayNumber(p95A)} ms to ${displayNumber(p95B)} ms; p99 changed from ${finite(p99A) ? `${displayNumber(p99A)} ms` : 'unavailable'} to ${finite(p99B) ? `${displayNumber(p99B)} ms` : 'unavailable'}.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { p95BeforeMs: p95A, p95AfterMs: p95B, p99BeforeMs: p99A, p99AfterMs: p99B } }] : []),
+        ...(throughputDegraded ? [{ observation: `Observed throughput changed from ${displayNumber(rpsA)} to ${displayNumber(rpsB)} requests/sec between the comparable ${previous.profile} and ${current.profile} profiles.`, source: `results/${previous.profile}.json, results/${current.profile}.json`, value: { rpsBefore: rpsA, rpsAfter: rpsB } }] : []),
       ], metrics: { p95BeforeMs: p95A, p95AfterMs: p95B, p99BeforeMs: p99A, p99AfterMs: p99B, errorRateBefore: errorA, errorRateAfter: errorB, rpsBefore: rpsA, rpsAfter: rpsB, vusBefore: previous.workload.vus, vusAfter: current.workload.vus },
     });
   }
