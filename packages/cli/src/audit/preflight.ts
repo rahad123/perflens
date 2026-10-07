@@ -1,5 +1,5 @@
 import { CliError } from '../utils/errors';
-import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
+import { assertLocalDocker, Infrastructure, infrastructureReady } from '../services/infrastructure';
 import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { ProjectConfig } from '../config/project';
 import { Endpoint, targetUrl } from './config';
@@ -11,7 +11,10 @@ export async function checkInfrastructure(infraDir?: string, projectDirectory = 
   const infra = new Infrastructure(await infrastructureRoot(infraDir, projectDirectory, baseUrl));
   const config = await infra.configuration();
   const states = await infra.status();
-  if (!states.every(s => s.ready)) throw new CliError('Audit infrastructure is not ready.', 'Run perflens infra up; inspect perflens infra status before retrying.');
+  if (!infrastructureReady(states)) {
+    const details = states.map(s => `${s.service}: ${s.state}`).join('\n') || 'No current-project infrastructure services were discovered.';
+    throw new CliError('Audit infrastructure is not ready.', `${details}\nRun perflens infra up; inspect perflens infra status before retrying.`);
+  }
   const urls: Record<string, string | null> = {};
   for (const name of ['prometheus', 'grafana', 'tempo']) {
     const port = config.services[name].ports?.[0];
@@ -43,7 +46,7 @@ export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, run
 }
 
 /** Check one lightweight correlated probe in Tempo before any k6 profile runs. */
-export async function checkInstrumentation(tempoUrl: string | null, serviceName: string, runId: string, signal: AbortSignal, polling = { attempts: 36, intervalMs: 1000, timeoutMs: 5000 }, containerOtlpEndpoint?: string): Promise<void> {
+export async function checkInstrumentation(tempoUrl: string | null, serviceName: string, runId: string, signal: AbortSignal, polling = { attempts: 36, intervalMs: 1000, timeoutMs: 5000 }, containerOtlpEndpoint?: string, hostOtlpEndpoint?: string): Promise<void> {
   if (!tempoUrl) throw new CliError('Tempo query endpoint is unavailable.', 'Start PerfLens infrastructure and verify the local Tempo port. No load was started.');
   try {
     const ready = await fetch(new URL('/ready', tempoUrl), { signal: AbortSignal.any([signal, AbortSignal.timeout(polling.timeoutMs)]) });
@@ -76,5 +79,6 @@ export async function checkInstrumentation(tempoUrl: string | null, serviceName:
     if (attempt < polling.attempts - 1) await new Promise(resolve => setTimeout(resolve, polling.intervalMs));
   }
   const containerGuidance = containerOtlpEndpoint ? ` If the target runs inside Docker, 127.0.0.1 refers to that container, not the host. Set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${containerOtlpEndpoint} in the application container and recreate it using the current PerfLens OTLP_HTTP_PORT from .perflens/infra/.env. On Linux Docker Engine, map host.docker.internal to host-gateway; this host-side receiver is loopback-bound, so verify that the platform permits container access before auditing.` : '';
-  throw new CliError('Target is reachable but PerfLens could not find its correlated OpenTelemetry server span.', `No load was started. Confirm the endpoint is a representative application route (health and metrics routes are excluded), and that the app initializes startExpressInstrumentation from @perflens/cli/express-instrumentation before importing Express or PostgreSQL. Restart the app, set service.name to the configured observability.serviceName, and export to the OTLP traces endpoint printed by PerfLens. Generic Node apps can preload startNodeInstrumentation from @perflens/cli/instrumentation.${containerGuidance}`);
+  const hostGuidance = `For a host-run Node process, restart it with NODE_OPTIONS="--require @perflens/cli/preload" OTEL_SERVICE_NAME=${serviceName} OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${hostOtlpEndpoint ?? 'the host OTLP endpoint printed above'}. The package preload selects Express when it is resolvable and otherwise uses generic Node instrumentation; it must load before Express and PostgreSQL.`;
+  throw new CliError('Target is reachable but PerfLens could not find its correlated OpenTelemetry server span.', `No load was started. Confirm the endpoint is a representative application route (health and metrics routes are excluded). ${hostGuidance}${containerGuidance}`);
 }

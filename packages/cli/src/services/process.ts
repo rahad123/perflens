@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
 import { CliError } from '../utils/errors';
-export interface RunOptions { cwd?: string; stream?: boolean; timeout?: number }
+export interface RunOptions { cwd?: string; stream?: boolean; timeout?: number; env?: NodeJS.ProcessEnv; unsetEnv?: string[] }
 export type Runner = (args: string[], options?: RunOptions) => Promise<string>;
 
 // Argument arrays only: project paths and arguments never pass through a shell.
 export const docker: Runner = (args, options = {}) => new Promise((resolve, reject) => {
-  const child = spawn('docker', args, { cwd: options.cwd, shell: false, stdio: options.stream ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'] });
+  const env = { ...process.env, ...options.env };
+  for (const name of options.unsetEnv ?? []) delete env[name];
+  const child = spawn('docker', args, { cwd: options.cwd, env, shell: false, stdio: options.stream ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'] });
   let stdout = '', stderr = '', timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, options.timeout ?? 20000);
   child.stdout?.on('data', (chunk) => { stdout += chunk; });

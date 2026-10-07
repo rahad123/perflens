@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { analyze } = require('../dist/analysis/service.js');
-const { collectTempoEvidence, normalizeTempoTrace } = require('../dist/analysis/tempo.js');
+const { collectTempoEvidence, collectTempoEvidenceWithRetry, normalizeTempoTrace } = require('../dist/analysis/tempo.js');
 
 const runId = 'pfl_20260930T120000000Z_12345678-1234-1234-1234-123456789abc';
 function profile(name, vus) {
@@ -81,6 +81,34 @@ test('Tempo query is bounded by service, run, profile, and audit window', async 
     assert.match(urls[0].searchParams.get('q'), /perflens\.audit\.profile = "normal"/);
     assert.equal(Number(urls[0].searchParams.get('end')) - Number(urls[0].searchParams.get('start')), 20);
   } finally { global.fetch = originalFetch; }
+});
+
+test('analysis waits briefly for expected run-correlated Tempo evidence before snapshotting', async () => {
+  let calls = 0, waits = [];
+  const result = await collectTempoEvidenceWithRetry(async () => {
+    calls++;
+    return calls < 3
+      ? { spans: [], traceCount: 0, spanCount: 0, truncated: false }
+      : { spans: [{ traceId: 'expected-run-trace' }], traceCount: 1, spanCount: 1, truncated: false };
+  }, { attempts: 5, intervalMs: 400, wait: async ms => waits.push(ms) });
+  assert.equal(result.traceCount, 1);
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [400, 400]);
+});
+
+test('Tempo evidence retry is bounded and returns an empty snapshot only after the configured deadline', async () => {
+  let calls = 0, waits = 0;
+  const result = await collectTempoEvidenceWithRetry(async () => { calls++; return { spans: [], traceCount: 0, spanCount: 0, truncated: false }; }, { attempts: 3, intervalMs: 250, wait: async () => { waits++; } });
+  assert.equal(result.traceCount, 0);
+  assert.equal(calls, 3);
+  assert.equal(waits, 2);
+});
+
+test('default Tempo evidence retry is bounded to a short indexing window', async () => {
+  let calls = 0, waits = 0;
+  await collectTempoEvidenceWithRetry(async () => { calls++; return { spans: [], traceCount: 0, spanCount: 0, truncated: false }; }, { wait: async ms => { assert.equal(ms, 500); waits++; } });
+  assert.equal(calls, 40);
+  assert.equal(waits, 39);
 });
 
 test('analyze refuses missing run and rejects failed/incomplete run state', async () => {

@@ -9,7 +9,9 @@
   "exports": {
     ".": "./dist/perflens.js",
     "./instrumentation": { "types": "./dist/instrumentation.d.ts", "require": "./dist/instrumentation.cjs", "default": "./dist/instrumentation.cjs" },
-    "./express-instrumentation": { "types": "./dist/express-instrumentation.d.ts", "require": "./dist/express-instrumentation.cjs", "default": "./dist/express-instrumentation.cjs" }
+    "./express-instrumentation": { "types": "./dist/express-instrumentation.d.ts", "require": "./dist/express-instrumentation.cjs", "default": "./dist/express-instrumentation.cjs" },
+    "./preload": "./dist/preload.cjs",
+    "./docker-preload": "./dist/docker-preload.cjs"
   },
   "files": [
     "bin",
@@ -20,7 +22,7 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "pnpm --filter @perflens/analysis-engine build && pnpm --filter @perflens/reporting build && pnpm --filter @perflens/node-instrumentation build && tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/perflens.js --external:commander --external:@opentelemetry/* && esbuild ../node-instrumentation/src/index.ts --bundle --platform=node --format=cjs --outfile=dist/instrumentation.cjs --external:@opentelemetry/* && esbuild ../node-instrumentation/src/express.ts --bundle --platform=node --format=cjs --outfile=dist/express-instrumentation.cjs --external:@opentelemetry/* && cp ../node-instrumentation/dist/index.d.ts dist/instrumentation.d.ts && sed \"s|from './index'|from './instrumentation'|\" ../node-instrumentation/dist/express.d.ts > dist/express-instrumentation.d.ts",
+    "build": "pnpm --filter @perflens/analysis-engine build && pnpm --filter @perflens/reporting build && pnpm --filter @perflens/node-instrumentation build && tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/perflens.js --external:commander --external:@opentelemetry/* && esbuild ../node-instrumentation/src/index.ts --bundle --platform=node --format=cjs --outfile=dist/instrumentation.cjs --external:@opentelemetry/* && esbuild ../node-instrumentation/src/express.ts --bundle --platform=node --format=cjs --outfile=dist/express-instrumentation.cjs --external:@opentelemetry/* && esbuild ../node-instrumentation/dist/docker-preload.js --bundle --platform=node --format=cjs --outfile=dist/docker-preload.cjs --alias:supports-color=./src/supports-color.cjs && cp src/preload.cjs dist/preload.cjs && cp ../node-instrumentation/dist/index.d.ts dist/instrumentation.d.ts && sed \"s|from './index'|from './instrumentation'|\" ../node-instrumentation/dist/express.d.ts > dist/express-instrumentation.d.ts",
     "prepack": "pnpm build",
     "typecheck": "tsc --noEmit",
     "test": "pnpm build && node --test test/*.test.cjs"

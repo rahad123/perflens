@@ -8,7 +8,7 @@ import { listRuns } from '../audit/storage';
 import { Command } from 'commander';
 import { initialize, loadProject } from '../config/project';
 import { doctor, Options } from '../services/doctor';
-import { assertLocalDocker, Infrastructure } from '../services/infrastructure';
+import { assertLocalDocker, Infrastructure, infrastructureReady } from '../services/infrastructure';
 import { infrastructureRoot, LABELS, otlpTracesEndpoint } from '../services/workspace';
 import { runCompleteAudit } from '../audit/orchestrator';
 import { chooseAuditEndpoints, ensureProjectForAudit } from '../services/onboarding';
@@ -56,7 +56,8 @@ export function registerCommands(program: Command): void {
   program.command('audit').description('Run a bounded local audit, collect telemetry, analyze evidence, and generate reports')
     .option('--profile <names>', 'Comma-separated baseline,normal,peak,stress; default: baseline,normal')
     .option('--yes', 'Explicitly authorize load against all selected local GET endpoints (for non-interactive use)')
-    .action(async (options: { profile?: string; yes?: boolean }) => {
+    .option('--restart-app', 'Explicitly authorize recreating the identified local Compose application service for instrumentation')
+    .action(async (options: { profile?: string; yes?: boolean; restartApp?: boolean }) => {
       const abort = new AbortController();
       const cancel = () => abort.abort();
       process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
@@ -97,7 +98,25 @@ export function registerCommands(program: Command): void {
             finally { prompt.close(); }
           }
         } else if (endpoints.length === 1) console.log(`Selected endpoint: GET ${endpoints[0].path}`);
-        await runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || !requiresApproval || (stdin.isTTY && stdout.isTTY) }, abort.signal);
+        const approveApplicationRestart = async (service: string) => {
+          if (options.restartApp) return true;
+          if (!stdin.isTTY || !stdout.isTTY) return false;
+          const prompt = createInterface({ input: stdin, output: stdout });
+          try {
+            return /^y(?:es)?$/i.test((await prompt.question(`PerfLens needs to restart the local Docker service "${service}" with temporary instrumentation. No application source or Compose file will be changed. Continue? (y/N): `)).trim());
+          } finally { prompt.close(); }
+        };
+        const selectApplicationService = async (services: string[]) => {
+          if (!stdin.isTTY || !stdout.isTTY) return undefined;
+          const prompt = createInterface({ input: stdin, output: stdout });
+          try {
+            const choices = services.map((service, index) => `${index + 1}. ${service}`).join('\n');
+            const answer = (await prompt.question(`PerfLens found multiple Node services for this target:\n${choices}\nChoose service [1]: `)).trim() || '1';
+            const index = Number(answer) - 1;
+            return Number.isInteger(index) && index >= 0 ? services[index] : undefined;
+          } finally { prompt.close(); }
+        };
+        await runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || !requiresApproval || (stdin.isTTY && stdout.isTTY), approveApplicationRestart, selectApplicationService }, abort.signal);
       }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });
@@ -150,7 +169,7 @@ export function registerCommands(program: Command): void {
       for (const state of states) console.log(`${LABELS[state.service].padEnd(20)} ${state.state}`);
       console.log(`OTLP traces endpoint: ${await otlpTracesEndpoint(control.root)}`);
       console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(control.root, 'container')}`);
-      if (states.some(s => s.failed)) process.exitCode = 1;
+      if (!infrastructureReady(states)) process.exitCode = 1;
     });
   infra.command('down').description('Stop only audit infrastructure; preserve containers, volumes, and target services')
     .action(async () => { await (await service()).down(); console.log('PerfLens infrastructure stopped. Persistent volumes and target services preserved.'); });
