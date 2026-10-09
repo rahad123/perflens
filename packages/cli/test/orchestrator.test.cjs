@@ -60,13 +60,64 @@ test('one-command audit reuses healthy infrastructure and runs measurement, anal
   assert.deepEqual(deps.events, ['status', 'audit', 'endpoints:/orders', 'analyze', 'report']);
   assert.equal(result.run.runId, runId);
   assert.match(output.join('\n'), /PERFORMANCE/);
-  assert.match(output.join('\n'), /baseline\s+20\s+0\s+6\.00/);
-  assert.match(output.join('\n'), /p50 ms.*p95 ms.*p99 ms/);
+  assert.match(output.join('\n'), /baseline\s+20 requests · 6\.00 RPS · p95 10\.00 ms · errors 0\.00%/);
   assert.match(output.join('\n'), /No evidence-backed bottlenecks/);
-  assert.match(output.join('\n'), /PostgreSQL spans: 222/);
-  assert.match(output.join('\n'), /OTLP traces endpoint http:\/\/127\.0\.0\.1:4319\/v1\/traces/);
+  assert.match(output.join('\n'), /PostgreSQL spans\s+222/);
+  assert.match(output.join('\n'), /✓ Observability ready/);
+  assert.doesNotMatch(output.join('\n'), /OTLP traces endpoint|host\.docker\.internal|set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT/);
   assert.match(output.join('\n'), /Grafana: http:\/\/127\.0\.0\.1:3001/);
   assert.match(output.join('\n'), new RegExp(runId));
+});
+
+test('all-failed completed profiles are labeled inconclusive without inventing a root cause', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t);
+  const originalAudit = deps.audit.bind(deps);
+  deps.audit = async options => {
+    const executed = await originalAudit(options);
+    for (const profile of ['baseline', 'normal']) {
+      const file = join(executed.directory, `results/${profile}.json`);
+      const result = JSON.parse(await readFile(file, 'utf8'));
+      result.metrics.successfulRequests = 0;
+      result.metrics.failedRequests = result.metrics.requests;
+      result.metrics.errorRate = 1;
+      result.metrics.latencyMs.p95 = 5000;
+      await writeFile(file, JSON.stringify(result));
+    }
+    return executed;
+  };
+  const output = [];
+  await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps);
+  const text = output.join('\n');
+  assert.match(text, /Performance assessment inconclusive — all measured requests failed/);
+  assert.match(text, /No successful-response latency baseline is available/);
+  assert.match(text, /baseline\s+20 requests/);
+  assert.match(text, /p95 5000\.00 ms · errors 100\.00%/);
+  assert.match(text, /No root cause is inferred from failed requests alone/);
+  assert.doesNotMatch(text, /No evidence-backed bottlenecks met the configured thresholds/);
+  assert.match(text, /✓ Audit complete/);
+});
+
+test('partial failed requests remain a measured error rate rather than an all-failed assessment', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t);
+  const originalAudit = deps.audit.bind(deps);
+  deps.audit = async options => {
+    const executed = await originalAudit(options);
+    const file = join(executed.directory, 'results/normal.json');
+    const result = JSON.parse(await readFile(file, 'utf8'));
+    result.metrics.successfulRequests = 60;
+    result.metrics.failedRequests = 30;
+    result.metrics.errorRate = 1 / 3;
+    await writeFile(file, JSON.stringify(result));
+    return executed;
+  };
+  const output = [];
+  await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps);
+  const text = output.join('\n');
+  assert.doesNotMatch(text, /Performance assessment inconclusive — all measured requests failed/);
+  assert.match(text, /errors 33\.33%/);
+  assert.match(text, /No evidence-backed bottlenecks met the configured thresholds/);
 });
 
 test('a k6/audit failure is stage-labelled and never proceeds to analysis or report', async t => {
@@ -101,7 +152,8 @@ test('missing correlated telemetry fails after preserving audit evidence and ski
   assert.deepEqual(deps.events, ['status', 'audit', 'endpoints:/orders', 'analyze']);
   assert.match(await readFile(join(t.cwd, '.perflens', 'runs', runId, 'telemetry/metadata.json'), 'utf8'), /grafana/);
   const endpoint = await otlpTracesEndpoint(join(t.cwd, '.perflens', 'infra'));
-  assert.ok(output.some(line => line.includes(`OTLP traces endpoint ${endpoint}`)));
+  assert.ok(failure.remediation.includes(endpoint));
+  assert.doesNotMatch(output.join('\n'), /OTLP traces endpoint/);
   assert.ok(failure.remediation.includes(endpoint));
 });
 
@@ -160,6 +212,15 @@ test('a changed single endpoint cannot reach load without explicit approval', as
   const deps = mockDependencies(t);
   await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json'), endpoints: [{ method: 'GET', path: '/private' }] }, new AbortController().signal, () => undefined, deps), /Selected endpoints require explicit load-test approval/);
   assert.deepEqual(deps.events, []);
+});
+
+test('bounded load is never started when explicit load approval is denied', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t);
+  await assert.rejects(runCompleteAudit({ config: join(t.cwd, 'perflens.config.json'), approveLoad: async () => false }, new AbortController().signal, () => undefined, deps), /Audit permission was not granted/);
+  assert.ok(!deps.events.includes('audit'));
+  assert.ok(!deps.events.includes('analyze'));
+  assert.ok(!deps.events.includes('report'));
 });
 
 test('application readiness completes before telemetry preflight/load orchestration begins', async t => {

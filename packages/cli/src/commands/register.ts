@@ -12,6 +12,8 @@ import { assertLocalDocker, Infrastructure, infrastructureReady } from '../servi
 import { infrastructureRoot, LABELS, otlpTracesEndpoint } from '../services/workspace';
 import { runCompleteAudit } from '../audit/orchestrator';
 import { chooseAuditEndpoints, ensureProjectForAudit } from '../services/onboarding';
+import { createAuditApprovals } from '../audit/approval';
+import { openGeneratedReport, runAuditAndMaybeOpenReport } from '../report/open';
 
 export function registerCommands(program: Command): void {
   program.command('init').description('Guided onboarding for a local backend project; never rewrites application code')
@@ -38,18 +40,17 @@ export function registerCommands(program: Command): void {
       const result = await initialize(process.cwd(), { projectName, baseUrl, endpoint });
       console.log(`${result.created ? 'Created' : 'Found and preserved'} ${result.path}\n${result.created ? 'Created' : 'Verified'} .perflens/{runs,results,logs}. No application source or dependencies were changed.`);
       const initializedProject = await loadProject(result.path);
-      const root = await infrastructureRoot(undefined, dirname(result.path), initializedProject.config.target.baseUrl);
-      console.log(`Host OTLP traces endpoint: ${await otlpTracesEndpoint(root)} (the PerfLens Node bootstrap configures this automatically).`);
-      console.log(`Docker consumer endpoint: ${await otlpTracesEndpoint(root, 'container')} (pass as OTEL_EXPORTER_OTLP_TRACES_ENDPOINT when starting the app container).`);
       console.log(express ? 'Express project detected.' : 'Node project detected where package.json is present; framework support is not inferred.');
       let bootstrapped = false;
       for (const file of ['src/perflens-instrumentation.ts', 'src/perflens-instrumentation.js', 'src/instrumentation.ts', 'src/instrumentation.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'index.js', 'server.js']) {
         try { const source = await readFile(join(process.cwd(), file), 'utf8'); if (/startNodeInstrumentation/.test(source)) { bootstrapped = true; break; } } catch { /* candidate entry file missing */ }
       }
       if (bootstrapped) console.log('OpenTelemetry bootstrap reference found in a common entrypoint.');
-      else console.log('Instrumentation is not confirmed. For Express, preload startExpressInstrumentation from @perflens/cli/express-instrumentation before importing Express or database clients. Generic Node apps can use startNodeInstrumentation from @perflens/cli/instrumentation.');
+      else console.log(express
+        ? 'For a supported local Docker Compose Node service, audit manages instrumentation automatically. Host-run apps require the documented early preload setup.'
+        : 'Instrumentation is not confirmed. See the integration guide for supported Node instrumentation setup.');
       console.log('Routes /health and /metrics are excluded from traced request analysis. Use representative business GET routes in audit.endpoints.');
-      console.log('Next: verify target.baseUrl and audit.endpoints in perflens.config.json, start your API, then run npx perflens audit.');
+      console.log('PerfLens manages local observability during audit. Run npx perflens audit when the local API is ready.');
     });
   program.command('doctor').description('Check local prerequisites, configuration, ports, and existing infrastructure')
     .action(async () => { if (!await doctor(program.opts<Options>())) process.exitCode = 1; });
@@ -57,7 +58,8 @@ export function registerCommands(program: Command): void {
     .option('--profile <names>', 'Comma-separated baseline,normal,peak,stress; default: baseline,normal')
     .option('--yes', 'Explicitly authorize load against all selected local GET endpoints (for non-interactive use)')
     .option('--restart-app', 'Explicitly authorize recreating the identified local Compose application service for instrumentation')
-    .action(async (options: { profile?: string; yes?: boolean; restartApp?: boolean }) => {
+    .option('--open', 'Open the newly generated HTML report after a successful audit')
+    .action(async (options: { profile?: string; yes?: boolean; restartApp?: boolean; open?: boolean }) => {
       const abort = new AbortController();
       const cancel = () => abort.abort();
       process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
@@ -89,23 +91,16 @@ export function registerCommands(program: Command): void {
           if (endpointsChanged) console.log('These endpoint choices apply to this audit only; perflens.config.json was not changed.');
         }
         const requiresApproval = endpoints.length > 1 || endpointsChanged;
-        if (requiresApproval) {
-          console.log(`PerfLens will run bounded local load against:\n${endpoints.map(endpoint => `  GET ${endpoint.path}`).join('\n')}\nProfiles: ${(options.profile ?? 'baseline,normal').split(',').join(', ')}`);
-          if (!options.yes) {
-            if (!stdin.isTTY || !stdout.isTTY) throw new Error('Selected endpoint changes or multiple endpoints require interactive approval. Review the endpoint list and rerun with --yes only after authorizing these local targets. No load was started.');
-            const prompt = createInterface({ input: stdin, output: stdout });
-            try { if (!/^y(?:es)?$/i.test((await prompt.question('Proceed? (y/N): ')).trim())) throw new Error('Endpoint load-test permission was not granted. No load was started.'); }
-            finally { prompt.close(); }
-          }
-        } else if (endpoints.length === 1) console.log(`Selected endpoint: GET ${endpoints[0].path}`);
-        const approveApplicationRestart = async (service: string) => {
-          if (options.restartApp) return true;
+        if (requiresApproval && !options.yes && (!stdin.isTTY || !stdout.isTTY)) throw new Error('Selected endpoint changes or multiple endpoints require explicit approval. Rerun interactively or pass --yes only after authorizing these local GET targets. No load was started.');
+        const promptApproval = async (message: string) => {
           if (!stdin.isTTY || !stdout.isTTY) return false;
           const prompt = createInterface({ input: stdin, output: stdout });
-          try {
-            return /^y(?:es)?$/i.test((await prompt.question(`PerfLens needs to restart the local Docker service "${service}" with temporary instrumentation. No application source or Compose file will be changed. Continue? (y/N): `)).trim());
-          } finally { prompt.close(); }
+          try { return /^y(?:es)?$/i.test((await prompt.question(message)).trim()); }
+          finally { prompt.close(); }
         };
+        const approvals = createAuditApprovals({ target: project.config.target.baseUrl, endpoints, profiles: (options.profile ?? 'baseline,normal').split(',').map(profile => profile.trim()), prompt: promptApproval });
+        const approveLoad = options.yes ? async () => true : approvals.approveLoad;
+        const approveApplicationRestart = async (service: string) => options.restartApp || await approvals.approveRestart(service);
         const selectApplicationService = async (services: string[]) => {
           if (!stdin.isTTY || !stdout.isTTY) return undefined;
           const prompt = createInterface({ input: stdin, output: stdout });
@@ -116,7 +111,10 @@ export function registerCommands(program: Command): void {
             return Number.isInteger(index) && index >= 0 ? services[index] : undefined;
           } finally { prompt.close(); }
         };
-        await runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || !requiresApproval || (stdin.isTTY && stdout.isTTY), approveApplicationRestart, selectApplicationService }, abort.signal);
+        await runAuditAndMaybeOpenReport(
+          () => runCompleteAudit({ ...globalOptions, ...options, endpoints, confirmMultipleEndpoints: options.yes || (stdin.isTTY && stdout.isTTY), approveApplicationRestart, approveLoad, selectApplicationService }, abort.signal),
+          Boolean(options.open), globalOptions,
+        );
       }
       finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
     });
@@ -134,8 +132,11 @@ export function registerCommands(program: Command): void {
     });
   program.command('report [run-id]').description('Generate Markdown and HTML from a completed run and its persisted Phase 3 analysis')
     .option('--format <format>', 'Output format: all, markdown, or html', 'all')
-    .action(async (runId: string | undefined, options: { format?: string }) => {
-      await report({ ...program.opts<Options>(), ...options }, runId);
+    .option('--open', 'Open an existing generated HTML report without regenerating it')
+    .action(async (runId: string | undefined, options: { format?: string; open?: boolean }) => {
+      const globalOptions = program.opts<Options>();
+      if (options.open) await openGeneratedReport(globalOptions, runId);
+      else await report({ ...globalOptions, ...options }, runId);
     });
   const infra = program.command('infra').description('Control local audit infrastructure; target application remains separate');
   async function service(): Promise<Infrastructure> {

@@ -51,6 +51,10 @@ test('executable help/version work outside checkout and advertise only implement
   for (const name of ['init', 'doctor', 'infra', 'audit', 'runs', 'analyze', 'report']) assert.match(help.stdout, new RegExp(name));
   const result = cli(['--version'], dir, { PATH: '' });
   assert.equal(result.status, 0); assert.equal(result.stdout.trim(), version);
+  const auditHelp = cli(['audit', '--help'], dir, { PATH: '' });
+  assert.equal(auditHelp.status, 0); assert.match(auditHelp.stdout, /--open/);
+  const reportHelp = cli(['report', '--help'], dir, { PATH: '' });
+  assert.equal(reportHelp.status, 0); assert.match(reportHelp.stdout, /--open/);
 });
 test('unsupported infra actions, destructive flags, and excess arguments fail before running Docker', async t => {
   const dir = await fixture(t);
@@ -162,14 +166,13 @@ test('malformed existing config is fatal and never replaced during first audit',
   await assert.rejects(ensureProjectForAudit(dir), /Invalid JSON/);
   assert.equal(await readFile(path, 'utf8'), '{broken');
 });
-test('init surfaces the selected project OTLP traces endpoint', async t => {
+test('init keeps successful onboarding product-facing and points to automatic audit setup', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-init-')); t.after(() => rm(dir, { recursive: true, force: true }));
   await writeFile(join(dir, 'package.json'), '{"name":"init-target"}');
   const result = cli(['init'], dir, { PATH: '' });
   assert.equal(result.status, 0, result.stderr);
-  const endpoint = await otlpTracesEndpoint(join(dir, '.perflens', 'infra'));
-  assert.ok(result.stdout.includes(endpoint));
-  assert.match(result.stdout, /bootstrap configures this automatically/);
+  assert.match(result.stdout, /PerfLens manages local observability during audit/);
+  assert.doesNotMatch(result.stdout, /OTLP traces endpoint|host\.docker\.internal|OTEL_EXPORTER_OTLP_TRACES_ENDPOINT/);
 });
 test('installed infrastructure assets are package-relative, project-local, secret-free, and target the configured local metrics port', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-assets-')); t.after(() => rm(dir, { recursive: true, force: true }));

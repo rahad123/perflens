@@ -45,6 +45,166 @@ test('zero-finding runs remain valid and produce conservative report language', 
   assert.match(html, /Latency by profile/);
   assert.match(html, /p99/);
 });
+
+test('all-failed runs are explicitly inconclusive while preserving measurements and findings', () => {
+  const measuredFinding = finding({ ruleId: 'database.slow-operation', title: 'Measured slow database operation', severity: 'P2' });
+  const input = fixture({ findings: [measuredFinding] });
+  const metrics = input.profiles[0].result.metrics;
+  metrics.requests = 9; metrics.successfulRequests = 0; metrics.failedRequests = 9; metrics.errorRate = 1; metrics.rps = 0.9;
+  metrics.statusDistribution = { '500': 9 };
+  metrics.latencyMs = { min: 4999.1, p50: 5000, p90: 5000, p95: 5000, p99: 5000, max: 5001 };
+  const model = build(input);
+  const html = renderHtml(model), markdown = renderMarkdown(model);
+  for (const output of [html, markdown]) {
+    assert.match(output, /Performance assessment inconclusive — all measured requests failed/);
+    assert.match(output, /No successful-response latency baseline is available/);
+    assert.match(output, /request timeouts, authentication/);
+    assert.match(output, /5000\.00/);
+    assert.match(output, /100\.00%/);
+    assert.match(output, /Measured slow database operation/);
+    assert.doesNotMatch(output, /No evidence-backed performance bottleneck met the configured detection thresholds/);
+  }
+  assert.match(html, /role="alert"/);
+  assert.match(html, /Failed requests alone do not establish a backend root cause/);
+});
+
+test('partial failures keep the normal assessment and measured error warning without all-failed wording', () => {
+  const input = fixture();
+  const html = renderHtml(build(input)), markdown = renderMarkdown(build(input));
+  for (const output of [html, markdown]) {
+    assert.doesNotMatch(output, /Performance assessment inconclusive — all measured requests failed/);
+    assert.match(output, /Request failures were observed|1\.00%/);
+    assert.match(output, /No evidence-backed performance bottleneck met the configured detection thresholds/);
+  }
+});
+
+test('long run IDs and endpoint URLs remain intact with wrapping layout at desktop and mobile widths', () => {
+  const longId = 'pfl_20261007T180126602Z_20bb015a-6881-4daa-903a-73b44cb5262a';
+  const paths = [
+    '/api/dpps/ZTU3OWMxMzMxNWVkNDE4MWJlNjA4YmIxODRjZmVkNzc/public-view',
+    '/api/organizations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/private-view',
+  ];
+  const input = fixture();
+  input.run.runId = longId;
+  input.analysis.runId = longId;
+  input.findingsArtifact.runId = longId;
+  input.evidence.runId = longId;
+  input.profiles[0].result.runId = longId;
+  input.profiles[0].result.target.endpoints = paths.map(path => ({ method: 'GET', path }));
+  input.profiles[0].result.metrics.endpointResults = paths.map((path, index) => ({ target: { method: 'GET', path }, metrics: { requests: 40, rps: 4, errorRate: index ? 0.1333 : 0, failedRequests: index ? 6 : 0, latencyMs: { p50: 20, p95: 84, p99: 120 } } }));
+  const html = renderHtml(build(input));
+  assert.ok(html.includes(longId));
+  for (const path of paths) assert.ok(html.includes(path));
+  assert.match(html, /h1,\.metadata div,\.endpoint-list[^}]*overflow-wrap:anywhere/);
+  assert.match(html, /\.metadata div\{min-width:0\}/);
+  assert.match(html, /\.evidence-card p,\.evidence-card li,code,footer\{overflow-wrap:anywhere/);
+  assert.match(html, /\.endpoint-comparison \.endpoint-cell[^}]*white-space:normal;overflow-wrap:anywhere/);
+  assert.match(html, /@media\(max-width:700px\)\{main\{width:100%;margin:0;padding:25px 18px\}/);
+  assert.match(html, /minmax\(min\(100%,220px\),1fr\)/);
+});
+
+test('non-zero error rates are highlighted as measured failures without creating a diagnosis', () => {
+  const html = renderHtml(build(fixture()));
+  assert.match(html, /Request failures were observed\./);
+  assert.match(html, /normal: 1\.00% \(2 failed of 200\)/);
+  assert.match(html, /class="error-rate nonzero"/);
+  assert.match(html, /This is a measured error rate, not a root-cause diagnosis\./);
+  assert.match(renderMarkdown(build(fixture())), /\| 1\.00% \|/);
+});
+
+function noisyTwoProfileInput() {
+  const input = fixture({ findings: [finding({
+    ruleId: 'load.error-degradation', category: 'load', title: 'Error rate increases under higher configured concurrency',
+    summary: 'Error rate increased from 0.00% to 62.22% as configured concurrency increased from 1 to 3 VUs. p95 latency also increased.',
+    metrics: {
+      p95BeforeMs: 42.00189999999998, p95AfterMs: 80.33554999999997,
+      p99BeforeMs: 66.56357999999999, p99AfterMs: 132.43526,
+      errorRateBefore: 0, errorRateAfter: 0.6222222222222222,
+      rpsBefore: 1.9951987537190505, rpsAfter: 5.993789235594078,
+      vusBefore: 1, vusAfter: 3,
+    },
+  })] });
+  const normal = input.profiles[0];
+  normal.result.metrics = {
+    requests: 90, successfulRequests: 34, failedRequests: 56, errorRate: 0.6222222222222222, rps: 5.993789235594078,
+    latencyMs: { min: 4.0019, p50: 42.00189999999998, p90: 66.56357999999999, p95: 80.33554999999997, p99: 132.43526, max: 210.3456 },
+  };
+  normal.result.workload.vus = 3;
+  const baselineResult = structuredClone(normal.result);
+  baselineResult.profile = 'baseline'; baselineResult.workload.vus = 1;
+  baselineResult.metrics = {
+    requests: 20, successfulRequests: 20, failedRequests: 0, errorRate: 0, rps: 1.9951987537190505,
+    latencyMs: { min: 2.12345, p50: 21.23456, p90: 35.67891, p95: 42.00189999999998, p99: 66.56357999999999, max: 89.87654 },
+  };
+  const baselineRunProfile = { name: 'baseline', status: 'completed', startedAt: '2026-09-30T12:00:00Z', endedAt: '2026-09-30T12:00:10Z', result: 'results/baseline.json' };
+  input.profiles.unshift({ runProfile: baselineRunProfile, result: baselineResult });
+  input.run.profiles.unshift(baselineRunProfile);
+  return { input, sourceBaseline: baselineResult.metrics.latencyMs.p95, sourceNormalRps: normal.result.metrics.rps };
+}
+
+test('presentation formats noisy floats without changing raw persisted measurements', () => {
+  const { input, sourceBaseline, sourceNormalRps } = noisyTwoProfileInput();
+  const model = build(input);
+  assert.equal(model.performanceSummary.profiles[0].metrics.latencyMs.p95, sourceBaseline);
+  assert.equal(model.performanceSummary.profiles[1].metrics.rps, sourceNormalRps);
+  const html = renderHtml(model);
+  const markdown = renderMarkdown(model);
+  for (const output of [html, markdown]) {
+    assert.match(output, /42\.00/);
+    assert.match(output, /80\.34/);
+    assert.match(output, /66\.56/);
+    assert.match(output, /132\.44/);
+    assert.match(output, /2\.00/);
+    assert.match(output, /5\.99/);
+    assert.match(output, /62\.22%/);
+    assert.doesNotMatch(output, /42\.00189999999998|80\.33554999999997|66\.56357999999999|132\.43526|1\.9951987537190505|5\.993789235594078|0\.6222222222222222/);
+  }
+});
+
+test('latency-by-profile has accessible measured values for both profiles and tolerates missing measurements', () => {
+  const input = noisyTwoProfileInput().input;
+  const html = renderHtml(build(input));
+  const table = html.match(/<table class="latency-by-profile">([\s\S]*?)<\/table>/)?.[1];
+  assert.ok(table);
+  assert.match(table, /baseline[\s\S]*21\.23 ms[\s\S]*42\.00 ms[\s\S]*66\.56 ms/);
+  assert.match(table, /normal[\s\S]*42\.00 ms[\s\S]*80\.34 ms[\s\S]*132\.44 ms/);
+
+  for (const profile of input.profiles) profile.result.metrics.latencyMs = {};
+  const withoutLatency = renderHtml(build(input));
+  assert.match(withoutLatency, /Latency chart unavailable/);
+  assert.match(withoutLatency, /Not available/);
+});
+
+test('latency chart and accessible table occupy separate responsive flow blocks without clipping chart height', () => {
+  const html = renderHtml(build(noisyTwoProfileInput().input));
+  const chartStart = html.indexOf('<div class="latency-chart">');
+  const chartEnd = html.indexOf('</svg></div>', chartStart);
+  const tableStart = html.indexOf('<div class="table-wrap"><table class="latency-by-profile">', chartEnd);
+  assert.ok(chartStart >= 0 && chartEnd > chartStart && tableStart > chartEnd);
+  assert.match(html, /\.latency-chart\{display:block;width:100%;min-width:0;margin:12px 0 20px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain\}/);
+  assert.match(html, /\.chart\{display:block;width:900px;min-width:900px;max-width:none;height:auto;max-height:none\}/);
+  assert.match(html, /@media\(max-width:700px\)\{main\{width:100%;margin:0;padding:25px 18px\}/);
+  assert.doesNotMatch(html, /profile-label"[^>]*x="830"/);
+});
+
+test('known supporting measurements render as an escaped readable table and unknown structures use safe JSON fallback', () => {
+  const input = noisyTwoProfileInput().input;
+  const html = renderHtml(build(input));
+  const section = html.match(/<h4>Supporting measurements<\/h4>([\s\S]*?)<\/article>/)?.[1];
+  assert.ok(section);
+  assert.match(section, /<table class="supporting-measurements">/);
+  assert.match(section, /<th scope="row">VUs<\/th><td>1<\/td><td>3<\/td>/);
+  assert.match(section, /Error rate<\/th><td>0\.00%<\/td><td>62\.22%/);
+  assert.match(section, /p95<\/th><td>42\.00 ms<\/td><td>80\.34 ms/);
+  assert.match(section, /RPS<\/th><td>2\.00<\/td><td>5\.99/);
+  assert.doesNotMatch(section, /42\.00189999999998|\[object Object\]/);
+
+  const unknown = renderHtml(build(fixture({ findings: [finding({ metrics: { custom: { label: '<script>alert(1)</script>' } } })] })));
+  assert.match(unknown, /<details class="additional-measurements">/);
+  assert.match(unknown, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(unknown, /<script>alert\(1\)<\/script>/);
+  assert.doesNotMatch(unknown, /\[object Object\]/);
+});
 test('multi-endpoint report comparison uses endpoint-scoped k6 samples and existing Phase 3 findings only', () => {
   const input = fixture({ findings: [finding({ target: { method: 'GET', path: '/products' }, severity: 'P1', confidence: 'medium' })] });
   const profile = input.profiles[0].result;

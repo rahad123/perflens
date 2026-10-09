@@ -26,7 +26,8 @@ export async function checkInfrastructure(infraDir?: string, projectDirectory = 
     containerOtlpTracesEndpoint: await otlpTracesEndpoint(infra.root, 'container'),
   };
 }
-export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, runId: string, signal: AbortSignal, requestHeaders: Record<string, string> = {}): Promise<void> {
+export interface TargetPreflightResult { contentType: string | null; streaming: boolean }
+export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, runId: string, signal: AbortSignal, requestHeaders: Record<string, string> = {}): Promise<TargetPreflightResult> {
   checkCancelled(signal);
   const url = new URL(targetUrl(config.target.baseUrl, endpoint));
   // Match k6's fixed localhost mapping; do not use proxy env or follow redirects.
@@ -43,6 +44,8 @@ export async function checkTarget(config: ProjectConfig, endpoint: Endpoint, run
     throw new CliError(`Target preflight failed for GET ${endpoint.path}.`, 'Start the target; verify its loopback URL, port, and timeout. No profile load was started.');
   }
   if (response.status < 200 || response.status >= 300) throw new CliError(`Target preflight returned HTTP ${response.status} for GET ${endpoint.path}.`, 'Preflight requires HTTP 2xx. Redirects are not followed. No profile load was started.');
+  const contentType = response.headers.get('content-type');
+  return { contentType, streaming: /^text\/event-stream(?:\s*;|$)/i.test(contentType ?? '') };
 }
 
 /** Check one lightweight correlated probe in Tempo before any k6 profile runs. */

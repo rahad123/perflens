@@ -304,6 +304,24 @@ test('error degradation is distinct from inferred component root cause', () => {
   assert.equal(result.findings.some(item => item.category === 'database'), false);
 });
 
+test('error degradation summary leads with measured errors and keeps latency as supporting observation', () => {
+  const result = analyzeEvidence(evidence({ profiles: [
+    profile('baseline', 1, 42.00189999999998, 66.56357999999999, 0, 20),
+    profile('normal', 3, 80.33554999999997, 132.43526, 0.6222222222222222, 90),
+  ] }));
+  const finding = result.findings.find(item => item.ruleId === 'load.error-degradation');
+  assert.ok(finding);
+  assert.match(finding.title, /Error rate/);
+  assert.match(finding.summary, /^Error rate increased from 0\.00% to 62\.22%/);
+  assert.match(finding.summary, /p95 latency also increased from 42\.00 ms to 80\.34 ms/);
+  assert.match(finding.evidence[1].observation, /Error rate changed from 0\.00% to 62\.22%/);
+  assert.match(finding.evidence[2].observation, /p95 changed from/);
+  assert.doesNotMatch(finding.summary, /database|postgres|CPU|Redis|external|root cause|saturation/i);
+  assert.equal(finding.metrics.errorRateAfter, 0.6222222222222222);
+  assert.equal(finding.metrics.p95BeforeMs, 42.00189999999998);
+  assert.equal(finding.metrics.p95AfterMs, 80.33554999999997);
+});
+
 test('low trace sample cannot produce high-confidence output and unsupported resources are explicit', () => {
   const spans = nplusTraces(5);
   const result = analyzeEvidence(evidence({ traces: spans }));
