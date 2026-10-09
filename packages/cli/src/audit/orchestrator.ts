@@ -130,6 +130,20 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
     try { profileResults.push(JSON.parse(await readFile(join(executed.directory, profile.result), 'utf8'))); }
     catch (error) { throw stageError(`Reading ${profile.name} measurements`, error); }
   }
+  const totals = profileResults.reduce((total, result) => {
+    const metrics = result.metrics ?? {};
+    return {
+      requests: total.requests + (typeof metrics.requests === 'number' && Number.isFinite(metrics.requests) ? metrics.requests : 0),
+      successful: total.successful + (typeof metrics.successfulRequests === 'number' && Number.isFinite(metrics.successfulRequests) ? metrics.successfulRequests : 0),
+      failed: total.failed + (typeof metrics.failedRequests === 'number' && Number.isFinite(metrics.failedRequests) ? metrics.failedRequests : 0),
+    };
+  }, { requests: 0, successful: 0, failed: 0 });
+  const failedAssessment = totals.requests > 0 && totals.successful === 0 && totals.failed === totals.requests;
+  if (failedAssessment) {
+    write('\n⚠ Performance assessment inconclusive — all measured requests failed.');
+    write('  Audit execution completed. No successful-response latency baseline is available. Check endpoint behavior, HTTP status, request timeout, authentication, and whether the route is a long-lived stream. Standard profiles are intended for finite, safe GET endpoints.');
+    write('  Failed requests alone do not establish a backend root cause.');
+  }
   write('\nPERFORMANCE');
   for (const result of profileResults) {
     const metrics = result.metrics;
@@ -142,7 +156,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   write(`  PostgreSQL spans  ${analysis.traceSummary.databaseSpans}`);
   write(`  External HTTP     ${analysis.traceSummary.externalClientSpans}`);
   write('\nFINDINGS');
-  if (!analysis.findings.length) write('  No evidence-backed bottlenecks met the configured thresholds.');
+  if (!analysis.findings.length) write(failedAssessment ? '  No root cause is inferred from failed requests alone.' : '  No evidence-backed bottlenecks met the configured thresholds.');
   for (const finding of analysis.findings) {
     write(`  ${finding.severity} ${finding.title} — ${finding.confidence.toUpperCase()} confidence`);
     write(`    ${finding.summary}`);

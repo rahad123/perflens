@@ -120,6 +120,18 @@ test('successful default audit persists raw/normalized results and windows witho
   assert.equal(metadata.auditRunId, first.run.runId); assert.ok(metadata.auditEndedAt);
   const results = await readdir(join(first.directory, 'results')); assert.deepEqual(results.sort(), ['baseline.json', 'normal.json']);
 });
+test('preflight warns on declared SSE content type without blocking or inferring from route name', async t => {
+  const dir = await temp(t), path = await project(dir), output = [];
+  const result = await audit({ config: path }, undefined, fakeDependencies({
+    target: async () => ({ contentType: 'text/event-stream', streaming: true }),
+    write: line => output.push(line),
+  }));
+  assert.equal(result.run.status, 'completed');
+  assert.match(output.join('\n'), /declares text\/event-stream/);
+  assert.match(output.join('\n'), /use a finite, safe GET endpoint/);
+  const ordinary = await audit({ config: path }, undefined, fakeDependencies({ target: async () => ({ contentType: 'application/json', streaming: false }) }));
+  assert.equal(ordinary.run.status, 'completed');
+});
 test('multiple endpoint workloads require explicit approval before audit begins', async t => {
   const dir = await temp(t), path = await project(dir);
   const parsed = JSON.parse(await readFile(path)); parsed.audit.endpoints.push({ method: 'GET', path: '/products' }); await writeFile(path, JSON.stringify(parsed));
@@ -158,20 +170,26 @@ test('failed preflight leaves failed artifacts and never starts k6 load', async 
 test('target preflight sends correlation without redirects, rejects non-2xx, and cancels response bodies', async () => {
   const original = global.fetch;
   const valid = validateConfig({ ...config, target: { baseUrl: 'http://localhost:3002' } });
-  let status = 302, cancelled = 0;
+  let status = 302, cancelled = 0, contentType = 'application/json';
   global.fetch = async (url, options) => {
     assert.equal(url.hostname, '127.0.0.1');
     assert.equal(options.redirect, 'manual');
     assert.equal(options.headers['X-PerfLens-Run-Id'], 'test-run');
     assert.equal(options.headers['X-PerfLens-Profile'], 'preflight');
     assert.equal(options.headers.Authorization, 'Bearer runtime-token');
-    return { status, body: { cancel: async () => cancelled++ } };
+    return { status, headers: new Headers({ 'content-type': contentType }), body: { cancel: async () => cancelled++ } };
   };
   try {
     await assert.rejects(checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal, { Authorization: 'Bearer runtime-token' }), /HTTP 302/);
     status = 200;
-    await checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal, { Authorization: 'Bearer runtime-token' });
+    const ordinary = await checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal, { Authorization: 'Bearer runtime-token' });
+    assert.deepEqual(ordinary, { contentType: 'application/json', streaming: false });
     assert.equal(cancelled, 2);
+    contentType = 'text/event-stream; charset=utf-8';
+    const stream = await checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal, { Authorization: 'Bearer runtime-token' });
+    assert.equal(stream.streaming, true);
+    assert.equal(stream.contentType, contentType);
+    assert.equal(cancelled, 3);
     global.fetch = async () => { throw new Error('sensitive transport detail'); };
     await assert.rejects(checkTarget(valid, valid.audit.endpoints[0], 'test-run', new AbortController().signal), error => /Target preflight failed/.test(error.message) && !error.message.includes('sensitive'));
   } finally { global.fetch = original; }

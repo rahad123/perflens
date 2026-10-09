@@ -69,6 +69,57 @@ test('one-command audit reuses healthy infrastructure and runs measurement, anal
   assert.match(output.join('\n'), new RegExp(runId));
 });
 
+test('all-failed completed profiles are labeled inconclusive without inventing a root cause', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t);
+  const originalAudit = deps.audit.bind(deps);
+  deps.audit = async options => {
+    const executed = await originalAudit(options);
+    for (const profile of ['baseline', 'normal']) {
+      const file = join(executed.directory, `results/${profile}.json`);
+      const result = JSON.parse(await readFile(file, 'utf8'));
+      result.metrics.successfulRequests = 0;
+      result.metrics.failedRequests = result.metrics.requests;
+      result.metrics.errorRate = 1;
+      result.metrics.latencyMs.p95 = 5000;
+      await writeFile(file, JSON.stringify(result));
+    }
+    return executed;
+  };
+  const output = [];
+  await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps);
+  const text = output.join('\n');
+  assert.match(text, /Performance assessment inconclusive — all measured requests failed/);
+  assert.match(text, /No successful-response latency baseline is available/);
+  assert.match(text, /baseline\s+20 requests/);
+  assert.match(text, /p95 5000\.00 ms · errors 100\.00%/);
+  assert.match(text, /No root cause is inferred from failed requests alone/);
+  assert.doesNotMatch(text, /No evidence-backed bottlenecks met the configured thresholds/);
+  assert.match(text, /✓ Audit complete/);
+});
+
+test('partial failed requests remain a measured error rate rather than an all-failed assessment', async t => {
+  t.cwd = await fixture(t);
+  const deps = mockDependencies(t);
+  const originalAudit = deps.audit.bind(deps);
+  deps.audit = async options => {
+    const executed = await originalAudit(options);
+    const file = join(executed.directory, 'results/normal.json');
+    const result = JSON.parse(await readFile(file, 'utf8'));
+    result.metrics.successfulRequests = 60;
+    result.metrics.failedRequests = 30;
+    result.metrics.errorRate = 1 / 3;
+    await writeFile(file, JSON.stringify(result));
+    return executed;
+  };
+  const output = [];
+  await runCompleteAudit({ config: join(t.cwd, 'perflens.config.json') }, new AbortController().signal, line => output.push(line), deps);
+  const text = output.join('\n');
+  assert.doesNotMatch(text, /Performance assessment inconclusive — all measured requests failed/);
+  assert.match(text, /errors 33\.33%/);
+  assert.match(text, /No evidence-backed bottlenecks met the configured thresholds/);
+});
+
 test('a k6/audit failure is stage-labelled and never proceeds to analysis or report', async t => {
   t.cwd = await fixture(t);
   const deps = mockDependencies(t, { async audit() { deps.events.push('audit'); throw new Error('k6 exited 1 after HTTP 500 responses'); } });

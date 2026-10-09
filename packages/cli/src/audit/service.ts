@@ -61,8 +61,9 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     run.engine.version = await dependencies.runner.version(signal); checkCancelled(signal);
     metadata.infrastructure = await dependencies.infrastructure(infraDir, dirname(configPath), config.target.baseUrl); checkCancelled(signal);
     for (const endpoint of auditConfig.endpoints) {
-      await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
+      const targetPreflight = await dependencies.target(config, endpoint, store.id, signal, requestHeaders);
       dependencies.write(`✓ Target reachable: GET ${endpoint.path}`);
+      if (targetPreflight?.streaming) dependencies.write(`⚠ GET ${endpoint.path} declares text/event-stream. Standard finite load profiles do not model long-lived streams; use a finite, safe GET endpoint for a representative performance audit.`);
     }
     await dependencies.instrumentation(metadata.infrastructure.localUrls.tempo, config.observability.serviceName, store.id, signal, undefined, metadata.infrastructure.containerOtlpTracesEndpoint, metadata.infrastructure.otlpTracesEndpoint);
     dependencies.write('✓ Telemetry verified');

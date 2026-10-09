@@ -46,6 +46,38 @@ test('zero-finding runs remain valid and produce conservative report language', 
   assert.match(html, /p99/);
 });
 
+test('all-failed runs are explicitly inconclusive while preserving measurements and findings', () => {
+  const measuredFinding = finding({ ruleId: 'database.slow-operation', title: 'Measured slow database operation', severity: 'P2' });
+  const input = fixture({ findings: [measuredFinding] });
+  const metrics = input.profiles[0].result.metrics;
+  metrics.requests = 9; metrics.successfulRequests = 0; metrics.failedRequests = 9; metrics.errorRate = 1; metrics.rps = 0.9;
+  metrics.statusDistribution = { '500': 9 };
+  metrics.latencyMs = { min: 4999.1, p50: 5000, p90: 5000, p95: 5000, p99: 5000, max: 5001 };
+  const model = build(input);
+  const html = renderHtml(model), markdown = renderMarkdown(model);
+  for (const output of [html, markdown]) {
+    assert.match(output, /Performance assessment inconclusive — all measured requests failed/);
+    assert.match(output, /No successful-response latency baseline is available/);
+    assert.match(output, /request timeouts, authentication/);
+    assert.match(output, /5000\.00/);
+    assert.match(output, /100\.00%/);
+    assert.match(output, /Measured slow database operation/);
+    assert.doesNotMatch(output, /No evidence-backed performance bottleneck met the configured detection thresholds/);
+  }
+  assert.match(html, /role="alert"/);
+  assert.match(html, /Failed requests alone do not establish a backend root cause/);
+});
+
+test('partial failures keep the normal assessment and measured error warning without all-failed wording', () => {
+  const input = fixture();
+  const html = renderHtml(build(input)), markdown = renderMarkdown(build(input));
+  for (const output of [html, markdown]) {
+    assert.doesNotMatch(output, /Performance assessment inconclusive — all measured requests failed/);
+    assert.match(output, /Request failures were observed|1\.00%/);
+    assert.match(output, /No evidence-backed performance bottleneck met the configured detection thresholds/);
+  }
+});
+
 test('long run IDs and endpoint URLs remain intact with wrapping layout at desktop and mobile widths', () => {
   const longId = 'pfl_20261007T180126602Z_20bb015a-6881-4daa-903a-73b44cb5262a';
   const paths = [
@@ -141,6 +173,18 @@ test('latency-by-profile has accessible measured values for both profiles and to
   const withoutLatency = renderHtml(build(input));
   assert.match(withoutLatency, /Latency chart unavailable/);
   assert.match(withoutLatency, /Not available/);
+});
+
+test('latency chart and accessible table occupy separate responsive flow blocks without clipping chart height', () => {
+  const html = renderHtml(build(noisyTwoProfileInput().input));
+  const chartStart = html.indexOf('<div class="latency-chart">');
+  const chartEnd = html.indexOf('</svg></div>', chartStart);
+  const tableStart = html.indexOf('<div class="table-wrap"><table class="latency-by-profile">', chartEnd);
+  assert.ok(chartStart >= 0 && chartEnd > chartStart && tableStart > chartEnd);
+  assert.match(html, /\.latency-chart\{display:block;width:100%;min-width:0;margin:12px 0 20px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain\}/);
+  assert.match(html, /\.chart\{display:block;width:900px;min-width:900px;max-width:none;height:auto;max-height:none\}/);
+  assert.match(html, /@media\(max-width:700px\)\{main\{width:100%;margin:0;padding:25px 18px\}/);
+  assert.doesNotMatch(html, /profile-label"[^>]*x="830"/);
 });
 
 test('known supporting measurements render as an escaped readable table and unknown structures use safe JSON fallback', () => {
