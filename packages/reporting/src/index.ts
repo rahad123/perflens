@@ -14,8 +14,19 @@ export interface ReportFinding {
   evidence: { observation: string; source: string; value?: unknown }[];
   metrics: Record<string, unknown>;
 }
+export type DiagnosticCoverageState = 'available' | 'partial' | 'no-observations' | 'not-collected' | 'not-persisted' | 'unavailable' | 'incomplete';
+export interface HttpStatusEvidence {
+  profile: string; target: { method: string; path: string; scope?: 'aggregate' };
+  requests: number | null; successfulRequests: number | null; failedRequests: number | null; errorRate: number | null; rps: number | null;
+  statusDistribution: Record<string, number> | null; statusCount: number | null; statusState: DiagnosticCoverageState; source: string;
+}
+export interface DiagnosticEvidence {
+  schemaVersion: 1;
+  httpStatusProfiles: HttpStatusEvidence[];
+  coverage: { diagnostic: string; state: DiagnosticCoverageState; observations: number | null; source: string | null; note: string }[];
+}
 export interface ReportModel {
-  schemaVersion: 1; perflensVersion: string; reportVersion: 2; generatedAt: string;
+  schemaVersion: 1; perflensVersion: string; reportVersion: 3; generatedAt: string;
   run: { id: string; target: string; method: string; path: string; endpoints: { method: string; path: string }[]; startedAt: string; completedAt: string; serviceName: string; loadEngine: { name: string | null; version: string | null } };
   workload: { profiles: ReportProfile[] };
   performanceSummary: { profiles: ReportProfile[] };
@@ -23,6 +34,7 @@ export interface ReportModel {
   findingsSummary: { total: number; bySeverity: Record<Severity, number> };
   findings: ReportFinding[];
   evidenceSummary: { requestTraces: number | null; databaseSpans: number | null; externalHttpSpans: number | null; traceAvailable: boolean; snapshotTraceCount: number | null; snapshotSpanCount: number | null; snapshotTruncated: boolean | null; profiles: string[] };
+  diagnosticEvidence: DiagnosticEvidence;
   limitations: string[];
 }
 
@@ -82,6 +94,73 @@ function makeProfile(runProfile: any, result: any): ReportProfile {
     metrics,
   };
 }
+const statusCountMap = (value: unknown): Record<string, number> | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.some(([status, count]) => !/^(0|[1-9]\d{2})$/.test(status) || !Number.isSafeInteger(count) || (count as number) < 0)) return null;
+  return Object.fromEntries(entries.sort(([a], [b]) => Number(a) - Number(b))) as Record<string, number>;
+};
+function statusEvidenceState(distribution: Record<string, number> | null, requests: number | null): { state: DiagnosticCoverageState; count: number | null } {
+  if (!distribution) return { state: 'not-persisted', count: null };
+  const count = Object.values(distribution).reduce((total, item) => total + item, 0);
+  if (count === 0 && requests === 0) return { state: 'no-observations', count };
+  if (count === 0 && requests === null) return { state: 'no-observations', count };
+  if (count === 0 || (requests !== null && count !== requests)) return { state: 'incomplete', count };
+  return { state: 'available', count };
+}
+function buildDiagnosticEvidence(profiles: ReportProfile[], endpoints: { method: string; path: string }[], evidence: any, analysis: any): DiagnosticEvidence {
+  const httpStatusProfiles: HttpStatusEvidence[] = [];
+  for (const profile of profiles) {
+    const metrics = profile.metrics as Record<string, any>;
+    const endpointResults = Array.isArray(metrics.endpointResults) ? metrics.endpointResults : [];
+    const endpointScoped = endpoints.map(target => endpointResults.find(item => item?.target?.method === target.method && typeof item?.target?.path === 'string' && safeEndpointPath(item.target.path) === target.path)).filter(Boolean);
+    if (endpointScoped.length === endpoints.length && endpointScoped.length > 0) {
+      for (let index = 0; index < endpoints.length; index++) {
+        const result = endpointScoped[index];
+        const m = result.metrics && typeof result.metrics === 'object' ? result.metrics : {};
+        const requests = finiteOrNull(m.requests);
+        const distribution = statusCountMap(m.statusDistribution);
+        const state = statusEvidenceState(distribution, requests);
+        httpStatusProfiles.push({ profile: profile.name, target: endpoints[index], requests, successfulRequests: finiteOrNull(m.successfulRequests), failedRequests: finiteOrNull(m.failedRequests), errorRate: finiteOrNull(m.errorRate), rps: finiteOrNull(m.rps), statusDistribution: distribution, statusCount: state.count, statusState: state.state, source: `results/${profile.name}.json` });
+      }
+    } else {
+      const requests = finiteOrNull(metrics.requests);
+      const distribution = statusCountMap(metrics.statusDistribution);
+      const state = statusEvidenceState(distribution, requests);
+      const singleTarget = endpoints.length === 1;
+      const target = singleTarget ? endpoints[0] : { method: 'GET', path: 'All configured endpoints (aggregate)', scope: 'aggregate' as const };
+      httpStatusProfiles.push({ profile: profile.name, target, requests, successfulRequests: finiteOrNull(metrics.successfulRequests), failedRequests: finiteOrNull(metrics.failedRequests), errorRate: finiteOrNull(metrics.errorRate), rps: finiteOrNull(metrics.rps), statusDistribution: distribution, statusCount: state.count, statusState: state.state, source: `results/${profile.name}.json` });
+    }
+  }
+  const statusRows = httpStatusProfiles;
+  const statusState: DiagnosticCoverageState = statusRows.length === 0 || statusRows.every(row => row.statusState === 'not-persisted') ? 'not-persisted'
+    : statusRows.every(row => row.statusState === 'available') ? 'available'
+      : statusRows.every(row => row.statusState === 'no-observations') ? 'no-observations'
+        : statusRows.some(row => row.statusState === 'available' || row.statusState === 'no-observations') ? 'partial' : 'incomplete';
+  const endpointMeasurementsComplete = profiles.length > 0 && profiles.every(profile => {
+    const results = (profile.metrics as any).endpointResults;
+    return Array.isArray(results) && endpoints.every(target => results.some((item: any) => item?.target?.method === target.method && item?.target?.path === target.path));
+  });
+  const traceAvailable = Boolean(analysis.availability?.traces);
+  const traces = traceAvailable ? finiteOrNull(analysis.traceSummary?.requests) : null;
+  const db = traceAvailable ? finiteOrNull(analysis.traceSummary?.databaseSpans) : null;
+  const external = traceAvailable ? finiteOrNull(analysis.traceSummary?.externalClientSpans) : null;
+  const redisSpans = traceAvailable && Array.isArray(evidence.traces) ? evidence.traces.filter((span: any) => String(span.attributes?.['db.system'] ?? '').toLowerCase() === 'redis').length : null;
+  const observedState = (count: number | null): DiagnosticCoverageState => count === null ? 'unavailable' : count > 0 ? 'available' : 'no-observations';
+  const coverage: DiagnosticEvidence['coverage'] = [
+    { diagnostic: 'HTTP status distribution', state: statusState, observations: statusRows.some(row => row.statusCount !== null) ? statusRows.reduce((total, row) => total + (row.statusCount ?? 0), 0) : null, source: statusRows.length ? 'results/<profile>.json' : null, note: statusState === 'not-persisted' ? 'This run does not contain persisted status counts.' : statusState === 'incomplete' || statusState === 'partial' ? 'Some profile or endpoint status counts are missing or do not match request totals.' : 'Counts come from k6 HTTP response samples; status 0 represents a transport failure.' },
+    { diagnostic: 'Endpoint request measurements', state: endpointMeasurementsComplete ? 'available' : profiles.length && profiles.every(profile => Array.isArray((profile.metrics as any).endpointResults)) ? 'partial' : 'not-persisted', observations: endpointMeasurementsComplete ? profiles.length * endpoints.length : null, source: 'results/<profile>.json', note: endpointMeasurementsComplete ? 'Counts, status distributions, and latency percentiles are scoped to each endpoint/profile.' : 'Some older runs contain only profile-aggregate measurements; aggregate values are not assigned to individual endpoints.' },
+    { diagnostic: 'Correlated request spans', state: observedState(traces), observations: traces, source: 'analysis/evidence.json', note: traces === null ? 'Trace evidence was unavailable for analysis.' : traces > 0 ? 'Run/profile-correlated server spans were persisted.' : 'No correlated request spans were observed in the persisted snapshot.' },
+    { diagnostic: 'PostgreSQL operation spans', state: observedState(db), observations: db, source: 'analysis/evidence.json', note: db === null ? 'Trace evidence was unavailable.' : db > 0 ? 'PostgreSQL spans were observed in correlated traces.' : 'No PostgreSQL spans were observed; this does not establish whether the endpoint used a database.' },
+    { diagnostic: 'External HTTP spans', state: observedState(external), observations: external, source: 'analysis/evidence.json', note: external === null ? 'Trace evidence was unavailable.' : external > 0 ? 'External HTTP client spans were observed in correlated traces.' : 'No external HTTP spans were observed in the persisted snapshot.' },
+    { diagnostic: 'Redis operation spans', state: redisSpans === null ? 'unavailable' : redisSpans > 0 ? 'available' : 'no-observations', observations: redisSpans, source: traceAvailable ? 'analysis/evidence.json' : null, note: redisSpans === null ? 'Trace evidence was unavailable.' : redisSpans > 0 ? 'Spans with db.system=redis were found; they are not analyzed by current Phase 3 rules.' : 'No spans declaring db.system=redis were found; PerfLens does not infer that Redis was not used.' },
+    { diagnostic: 'CPU utilization', state: 'not-collected', observations: null, source: 'analysis/analysis.json', note: 'No reliable per-run CPU measurement is persisted.' },
+    { diagnostic: 'Process memory / heap', state: 'not-collected', observations: null, source: 'analysis/analysis.json', note: 'No reliable per-run process memory or heap snapshot is persisted.' },
+    { diagnostic: 'Container CPU / memory', state: 'not-collected', observations: null, source: null, note: 'The local stack does not collect container resource snapshots.' },
+    { diagnostic: 'Connection-pool metrics', state: 'not-collected', observations: null, source: null, note: 'Pool metrics are not part of the persisted audit evidence.' },
+  ];
+  return { schemaVersion: 1, httpStatusProfiles, coverage };
+}
 function validFinding(raw: any, target: { method: string; path: string }): ReportFinding {
   if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || typeof raw.ruleId !== 'string' || typeof raw.category !== 'string' || typeof raw.title !== 'string' || typeof raw.summary !== 'string' || !['P0', 'P1', 'P2'].includes(raw.severity) || !['high', 'medium', 'low'].includes(raw.confidence) || !Array.isArray(raw.profiles) || !Array.isArray(raw.evidence) || !raw.metrics || typeof raw.metrics !== 'object') fail('Analysis findings artifact is malformed or unsupported.');
   const sanitized = sanitize(raw);
@@ -140,11 +219,12 @@ export function buildReportModel(input: { run: any; profiles: { runProfile: any;
   for (const finding of findings as ReportFinding[]) bySeverity[finding.severity]++;
   const limitations = [...new Set([...(Array.isArray(analysis.unsupported) ? analysis.unsupported.map(safeText) : []), ...(analysis.availability.traces ? [] : ['Trace evidence was unavailable for this analysis.']), 'This report contains only configured audit targets and does not represent untested production traffic.'])].sort();
   return {
-    schemaVersion: 1, perflensVersion: safeText(input.perflensVersion ?? 'unknown'), reportVersion: 2, generatedAt: validDate(input.generatedAt ?? new Date().toISOString(), 'report generation timestamp'),
+    schemaVersion: 1, perflensVersion: safeText(input.perflensVersion ?? 'unknown'), reportVersion: 3, generatedAt: validDate(input.generatedAt ?? new Date().toISOString(), 'report generation timestamp'),
     run: { id: run.runId, target: safeBaseUrl(run.target?.baseUrl), method: target.method, path: target.path, endpoints: safeEndpoints, startedAt: validDate(run.startedAt, 'audit start time'), completedAt: validDate(run.endedAt, 'audit completion time'), serviceName: safeText(run.serviceName ?? analysis.target?.serviceName ?? 'unknown'), loadEngine: { name: typeof run.engine?.name === 'string' ? safeText(run.engine.name) : null, version: typeof run.engine?.version === 'string' ? safeText(run.engine.version) : null } },
     workload: { profiles }, performanceSummary: { profiles }, endpointEvidence,
     findingsSummary: { total: findings.length, bySeverity }, findings,
     evidenceSummary: { requestTraces: finiteOrNull(analysis.traceSummary.requests), databaseSpans: finiteOrNull(analysis.traceSummary.databaseSpans), externalHttpSpans: finiteOrNull(analysis.traceSummary.externalClientSpans), traceAvailable: Boolean(analysis.availability.traces), snapshotTraceCount: finiteOrNull(evidence.telemetry.traceCount), snapshotSpanCount: finiteOrNull(evidence.telemetry.spanCount), snapshotTruncated: typeof evidence.telemetry.truncated === 'boolean' ? evidence.telemetry.truncated : null, profiles: profiles.map(profile => profile.name) },
+    diagnosticEvidence: buildDiagnosticEvidence(profiles, safeEndpoints, evidence, analysis),
     limitations,
   };
 }
@@ -154,6 +234,15 @@ const escMd = (text: string) => safeText(text).replace(/\\/g, '\\\\').replace(/(
 const value = (data: unknown): string => data === null || data === undefined ? 'Not available' : typeof data === 'number' ? String(data) : typeof data === 'object' ? JSON.stringify(data) : String(data);
 const metric = (metrics: Record<string, any>, key: string) => metrics[key] === null || metrics[key] === undefined ? 'Not available' : String(metrics[key]);
 const percent = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : 'Not available';
+const HTTP_STATUS_TITLES: Record<string, string> = {
+  '0': 'Transport error (no HTTP status)', '200': 'OK', '201': 'Created', '202': 'Accepted', '204': 'No Content',
+  '301': 'Moved Permanently', '302': 'Found', '304': 'Not Modified', '400': 'Bad Request', '401': 'Unauthorized',
+  '403': 'Forbidden', '404': 'Not Found', '408': 'Request Timeout', '409': 'Conflict', '422': 'Unprocessable Content',
+  '429': 'Too Many Requests', '500': 'Internal Server Error', '501': 'Not Implemented', '502': 'Bad Gateway',
+  '503': 'Service Unavailable', '504': 'Gateway Timeout',
+};
+const httpStatusText = (status: string) => status === '0' ? HTTP_STATUS_TITLES[status] : `${status} ${HTTP_STATUS_TITLES[status] ?? 'HTTP response'}`;
+const coverageText = (state: DiagnosticCoverageState) => ({ available: 'Available', partial: 'Partial', 'no-observations': 'No observations', 'not-collected': 'Not collected', 'not-persisted': 'Not persisted', unavailable: 'Unavailable', incomplete: 'Incomplete' })[state];
 const formattedNumber = (input: unknown, digits = 2): string => {
   if (typeof input === 'number') return Number.isFinite(input) ? input.toFixed(digits) : 'Not available';
   return input === null || input === undefined ? 'Not available' : value(input);
@@ -209,6 +298,15 @@ export function renderMarkdown(model: ReportModel): string {
     const metrics: any = profile.metrics; const latency: any = metrics.latencyMs ?? {};
     lines.push(`| ${escMd(profile.name)} | ${value(profile.workload.vus)} | ${value(profile.workload.durationMs)} | ${value(profile.observedDurationMs)} | ${value(metrics.concurrency?.maxObservedInFlight)} | ${metric(metrics, 'requests')} | ${metric(metrics, 'successfulRequests')} | ${metric(metrics, 'failedRequests')} | ${percent(metrics.errorRate)} | ${formattedMetric(metrics, 'rps')} | ${formattedNumber(latency.min)} | ${formattedNumber(latency.p50)} | ${formattedNumber(latency.p90)} | ${formattedNumber(latency.p95)} | ${formattedNumber(latency.p99)} | ${formattedNumber(latency.max)} |`);
   }
+  lines.push('', '## HTTP response status diagnostics', '', '| Profile | Endpoint | Requests | Successful | Failed | Error rate | RPS | HTTP statuses | Coverage |', '|---|---|---:|---:|---:|---:|---:|---|---|');
+  for (const status of model.diagnosticEvidence.httpStatusProfiles) {
+    const targetName = status.target.scope === 'aggregate' ? status.target.path : `${status.target.method} ${status.target.path}`;
+    const distribution = status.statusDistribution === null ? 'Not persisted' : Object.entries(status.statusDistribution).map(([code, count]) => `${httpStatusText(code)}: ${count}`).join('; ') || 'No status observations';
+    const recorded = status.statusCount === null ? '' : ` (${status.statusCount}${status.requests === null ? '' : ` of ${status.requests}`} recorded)`;
+    lines.push(`| ${escMd(status.profile)} | ${escMd(targetName)} | ${value(status.requests)} | ${value(status.successfulRequests)} | ${value(status.failedRequests)} | ${percent(status.errorRate)} | ${formattedNumber(status.rps)} | ${escMd(distribution)} | ${coverageText(status.statusState)}${recorded} |`);
+  }
+  const has429 = model.diagnosticEvidence.httpStatusProfiles.some(item => (item.statusDistribution?.['429'] ?? 0) > 0);
+  if (has429) lines.push('', 'HTTP 429 responses indicate that requests were rejected as too frequent. Possible sources include application rate limiting, an API gateway, or upstream throttling. The responsible component has not been identified.');
   if (model.run.endpoints.length > 1) {
     lines.push('', '## Endpoint comparison', '', '| Profile | Endpoint | Requests | RPS | Error rate | p50 (ms) | p95 (ms) | p99 (ms) | Request traces | PostgreSQL spans | External HTTP spans | Findings |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|');
     for (const profile of model.performanceSummary.profiles) for (const endpoint of (profile.metrics as any).endpointResults ?? []) {
@@ -233,7 +331,9 @@ export function renderMarkdown(model: ReportModel): string {
     for (const evidence of finding.evidence) lines.push(`- ${escMd(evidence.observation)} _(${escMd(evidence.source)})_`);
     lines.push('', '**Supporting measurements**', '', renderSupportingMarkdown(finding.metrics), '');
   }
-  lines.push('## Evidence coverage', '', `- Request traces analyzed: ${value(model.evidenceSummary.requestTraces)}`, `- PostgreSQL spans analyzed: ${value(model.evidenceSummary.databaseSpans)}`, `- External HTTP spans analyzed: ${value(model.evidenceSummary.externalHttpSpans)}`, `- Persisted snapshot: ${value(model.evidenceSummary.snapshotTraceCount)} traces / ${value(model.evidenceSummary.snapshotSpanCount)} spans`, `- Snapshot truncated: ${value(model.evidenceSummary.snapshotTruncated)}`, `- Trace evidence available: ${model.evidenceSummary.traceAvailable ? 'Yes' : 'No'}`, `- Profiles: ${model.evidenceSummary.profiles.map(escMd).join(', ') || 'None'}`, '', '## Limitations', '');
+  lines.push('## Diagnostic coverage', '', '| Diagnostic | Coverage | Observations | Source | Notes |', '|---|---|---:|---|---|');
+  for (const item of model.diagnosticEvidence.coverage) lines.push(`| ${escMd(item.diagnostic)} | ${coverageText(item.state)} | ${value(item.observations)} | ${escMd(item.source ?? '—')} | ${escMd(item.note)} |`);
+  lines.push('', '## Evidence coverage', '', `- Request traces analyzed: ${value(model.evidenceSummary.requestTraces)}`, `- PostgreSQL spans analyzed: ${value(model.evidenceSummary.databaseSpans)}`, `- External HTTP spans analyzed: ${value(model.evidenceSummary.externalHttpSpans)}`, `- Persisted snapshot: ${value(model.evidenceSummary.snapshotTraceCount)} traces / ${value(model.evidenceSummary.snapshotSpanCount)} spans`, `- Snapshot truncated: ${value(model.evidenceSummary.snapshotTruncated)}`, `- Trace evidence available: ${model.evidenceSummary.traceAvailable ? 'Yes' : 'No'}`, `- Profiles: ${model.evidenceSummary.profiles.map(escMd).join(', ') || 'None'}`, '', '## Limitations', '');
   for (const limitation of model.limitations) lines.push(`- ${escMd(limitation)}`);
   lines.push('', '---', '', 'Generated by PerfLens. Findings and severity are carried from the persisted Phase 3 analysis; this report does not perform additional diagnosis.', '');
   return lines.join('\n');
@@ -272,6 +372,15 @@ export function renderHtml(model: ReportModel): string {
   const evidenceCards = (items: ReportFinding[]) => items.map(finding => `<article class="evidence-card"><strong>${h(finding.severity)} · ${h(finding.title)}</strong><p>${h(finding.summary)}</p><ul>${finding.evidence.slice(0, 4).map(item => `<li>${h(item.observation)}</li>`).join('')}</ul></article>`).join('');
   const findings = model.findings.length ? model.findings.map(finding => `<article class="finding ${finding.severity.toLowerCase()}"><div class="finding-head"><span class="severity">${h(finding.severity)}</span><h3>${h(finding.title)}</h3><span class="confidence">${h(finding.confidence.toUpperCase())} confidence</span></div><p class="meta">${h(finding.category)} · <code>${h(finding.ruleId)}</code> · ${h(finding.target.method)} ${h(finding.target.path)} · ${h(finding.profiles.join(', '))}</p><h4>What was observed</h4><p>${h(finding.summary)}</p><h4>Evidence</h4><ul>${finding.evidence.map(item => `<li>${h(item.observation)} <span class="source">(${h(item.source)})</span></li>`).join('')}</ul><h4>Supporting measurements</h4>${renderSupportingHtml(finding.metrics, h)}</article>`).join('') : '<p>No Phase 3 findings were recorded.</p>';
   const latencyTable = model.performanceSummary.profiles.length ? `<div class="table-wrap"><table class="latency-by-profile"><caption>Measured latency by profile (milliseconds)</caption><thead><tr><th scope="col">Profile</th><th scope="col">p50</th><th scope="col">p95</th><th scope="col">p99</th></tr></thead><tbody>${model.performanceSummary.profiles.map(profile => { const latency = (profile.metrics as any).latencyMs ?? {}; return `<tr><th scope="row">${h(profile.name)}</th>${(['p50', 'p95', 'p99'] as const).map(key => `<td>${h(typeof latency[key] === 'number' && Number.isFinite(latency[key]) ? latencyMetric(latency[key]) : 'Not available')}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>` : '<p class="subtle">No profile measurements are available.</p>';
+  const httpStatusRows = model.diagnosticEvidence.httpStatusProfiles.map(item => {
+    const targetName = item.target.scope === 'aggregate' ? item.target.path : `${item.target.method} ${item.target.path}`;
+    const statuses = item.statusDistribution === null ? '<span>Not persisted</span>' : Object.entries(item.statusDistribution).map(([code, count]) => `<div class="status-entry"><span>${h(httpStatusText(code))}</span><strong>${h(count)}</strong></div>`).join('') || '<span>No status observations</span>';
+    const recorded = item.statusCount === null ? 'Not available' : `${item.statusCount}${item.requests === null ? '' : ` of ${item.requests}`}`;
+    return `<tr><th scope="row">${h(item.profile)}</th><td class="endpoint-cell">${h(targetName)}</td><td>${h(value(item.requests))}</td><td>${h(value(item.successfulRequests))}</td><td>${h(value(item.failedRequests))}</td><td class="error-rate${typeof item.errorRate === 'number' && item.errorRate > 0 ? ' nonzero' : ''}">${h(percent(item.errorRate))}</td><td>${h(formattedNumber(item.rps))}</td><td><div class="status-list">${statuses}</div></td><td>${h(coverageText(item.statusState))} (${h(recorded)} statuses)</td></tr>`;
+  }).join('');
+  const has429 = model.diagnosticEvidence.httpStatusProfiles.some(item => (item.statusDistribution?.['429'] ?? 0) > 0);
+  const status429Note = has429 ? '<aside class="error-notice" role="note"><strong>HTTP 429 responses indicate that requests were rejected as too frequent.</strong> Possible sources include application rate limiting, an API gateway, or upstream throttling. The responsible component has not been identified.</aside>' : '';
+  const diagnosticCoverageRows = model.diagnosticEvidence.coverage.map(item => `<tr><th scope="row">${h(item.diagnostic)}</th><td>${h(coverageText(item.state))}</td><td>${h(value(item.observations))}</td><td>${h(item.source ?? 'Not available')}</td><td class="coverage-note">${h(item.note)}</td></tr>`).join('');
   const count = (severity: Severity) => model.findingsSummary.bySeverity[severity];
   const failedAssessment = allRequestsFailed(model);
   const assessmentNotice = failedAssessment ? `<aside class="assessment-warning" role="alert"><strong>${h(inconclusiveAssessment)}</strong><p>Audit execution completed and measured evidence is preserved. ${h(inconclusiveGuidance)}</p><p>Measured request counts, latency, error rates, telemetry, and any Phase 3 findings remain shown below. Failed requests alone do not establish a backend root cause.</p></aside>` : '';
@@ -279,12 +388,14 @@ export function renderHtml(model: ReportModel): string {
     ? model.findings.length ? `Phase 3 recorded ${h(model.findings.length)} evidence-backed finding(s); see the detailed findings below.` : ''
     : model.findings.length ? `${h(model.findings.length)} evidence-backed finding(s) were identified.` : 'No evidence-backed performance bottleneck met the configured detection thresholds for this audit run.';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PerfLens Backend Performance Audit</title><style>
- .latency-chart{display:block;width:100%;min-width:0;margin:12px 0 20px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}.chart{display:block;width:900px;min-width:900px;max-width:none;height:auto;max-height:none}.chart .axis{font:12px system-ui;fill:var(--muted)}.chart .profile-label{font:12px system-ui;fill:var(--ink)}.chart .value{font:12px system-ui;fill:var(--ink)}.chart rect{fill:var(--blue)}.chart rect.p95{fill:#3682ad}.chart rect.p99{fill:#82b4cc}.latency-by-profile{max-width:640px;margin:10px 0}.latency-by-profile caption{text-align:left;font-weight:700;padding:8px}.supporting-measurements{max-width:640px}.supporting-measurements th,.supporting-measurements td{white-space:normal;overflow-wrap:anywhere}.assessment-warning{margin:14px 0;padding:16px 18px;border:1px solid #d6a247;border-left:6px solid #986000;background:#fff8e9;color:#573900;overflow-wrap:anywhere}.assessment-warning p{margin:8px 0 0}.evidence-card{background:var(--wash);border-left:4px solid var(--blue);padding:12px 16px;margin:12px 0}.evidence-card p{margin:6px 0}.evidence-card li{margin:4px 0}
+ .latency-chart{display:block;width:100%;min-width:0;margin:12px 0 20px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}.chart{display:block;width:900px;min-width:900px;max-width:none;height:auto;max-height:none}.chart .axis{font:12px system-ui;fill:var(--muted)}.chart .profile-label{font:12px system-ui;fill:var(--ink)}.chart .value{font:12px system-ui;fill:var(--ink)}.chart rect{fill:var(--blue)}.chart rect.p95{fill:#3682ad}.chart rect.p99{fill:#82b4cc}.latency-by-profile{max-width:640px;margin:10px 0}.latency-by-profile caption{text-align:left;font-weight:700;padding:8px}.supporting-measurements{max-width:640px}.supporting-measurements th,.supporting-measurements td{white-space:normal;overflow-wrap:anywhere}.http-status-table{min-width:900px}.status-list{display:grid;gap:3px;min-width:220px}.status-entry{display:flex;justify-content:space-between;gap:12px;white-space:nowrap}.coverage-note{min-width:240px;max-width:420px;white-space:normal;overflow-wrap:anywhere}.assessment-warning{margin:14px 0;padding:16px 18px;border:1px solid #d6a247;border-left:6px solid #986000;background:#fff8e9;color:#573900;overflow-wrap:anywhere}.assessment-warning p{margin:8px 0 0}.evidence-card{background:var(--wash);border-left:4px solid var(--blue);padding:12px 16px;margin:12px 0}.evidence-card p{margin:6px 0}.evidence-card li{margin:4px 0}
 :root{color-scheme:light;--ink:#17212b;--muted:#5d6a76;--line:#d8e0e6;--paper:#fff;--wash:#f3f6f8;--blue:#175b8e;--p0:#a62b2b;--p1:#986000;--p2:#315d75}*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1100px;margin:36px auto;background:var(--paper);padding:42px 52px;box-shadow:0 8px 32px #17212b12}header{border-bottom:3px solid var(--blue);padding-bottom:22px}header .brand{font-weight:800;letter-spacing:.08em;color:var(--blue);text-transform:uppercase;font-size:13px}h1{font-size:30px;margin:8px 0}h2{font-size:21px;margin-top:34px;border-bottom:1px solid var(--line);padding-bottom:8px}h3{font-size:18px;margin:0}h4{font-size:14px;margin:16px 0 4px}.meta,.subtle,.source{color:var(--muted)}.metadata{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:22px}.metadata div{background:var(--wash);padding:12px;border-radius:5px}.metadata strong{display:block;font-size:12px;color:var(--muted);text-transform:uppercase}.counts{display:flex;gap:10px;flex-wrap:wrap}.counts span{border:1px solid var(--line);padding:7px 12px;border-radius:4px}.counts b{margin-right:5px}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}thead{background:var(--wash)}.finding{border:1px solid var(--line);border-left:5px solid var(--p2);padding:20px;margin:16px 0}.finding.p0{border-left-color:var(--p0)}.finding.p1{border-left-color:var(--p1)}.finding-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.severity{font-weight:800;color:var(--p2)}.p0 .severity{color:var(--p0)}.p1 .severity{color:var(--p1)}.confidence{margin-left:auto;color:var(--muted);font-size:13px}.finding li{margin:7px 0}code{overflow-wrap:anywhere;background:var(--wash);padding:2px 4px}footer{margin-top:40px;padding-top:14px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}@media(max-width:700px){main{margin:0;padding:25px 18px}h1{font-size:25px}}@media print{body{background:#fff}main{margin:0;max-width:none;box-shadow:none;padding:0}.finding{break-inside:avoid}h2{break-after:avoid}}
 :root{--error:#a32121;--error-wash:#fff0ef}main{width:calc(100% - 32px);min-width:0}h1,.metadata div,.endpoint-list,.finding,.finding p,.finding li,.finding pre,.evidence-card,.evidence-card p,.evidence-card li,code,footer{overflow-wrap:anywhere;word-break:break-word}.metadata{grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr))}.metadata div{min-width:0}.table-wrap{max-width:100%;overscroll-behavior-x:contain}.endpoint-comparison .endpoint-cell,.endpoint-comparison .finding-cell{min-width:120px;max-width:260px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.endpoint-comparison td.endpoint-cell{text-align:left}.error-rate.nonzero{color:var(--error);background:var(--error-wash);font-weight:800}.error-notice{margin:14px 0;padding:12px 16px;border:1px solid #e6aaa5;border-left:5px solid var(--error);background:var(--error-wash);color:#641b18;overflow-wrap:anywhere}.finding{min-width:0}.finding-head{align-items:flex-start;min-width:0}.finding-head>*{min-width:0;max-width:100%;overflow-wrap:anywhere}.finding-head h3{flex:1 1 300px}.finding pre{white-space:pre-wrap;max-width:100%;overflow-x:auto}@media(min-width:701px) and (max-width:900px){main{padding:34px 28px}}@media(max-width:700px){main{width:100%;margin:0;padding:25px 18px}.metadata{grid-template-columns:minmax(0,1fr)}.finding{padding:16px}.confidence{margin-left:0}}@media print{main{width:100%;max-width:none}}
 </style></head><body><main><header><div class="brand">PerfLens</div><h1>Backend Performance Audit</h1><p class="subtle">A factual report generated from persisted audit measurements and Phase 3 findings.</p><div class="metadata"><div><strong>Run</strong>${h(model.run.id)}</div><div><strong>Target</strong>${h(model.run.target)}</div><div><strong>Endpoint</strong>${h(model.run.method)} ${h(model.run.path)}</div><div><strong>Audit period</strong>${h(model.run.startedAt)} – ${h(model.run.completedAt)}</div><div><strong>Report generated</strong>${h(model.generatedAt)}</div><div><strong>Service</strong>${h(model.run.serviceName)}</div></div></header>
 <section><h2>Executive summary</h2>${assessmentNotice}${executiveText ? `<p>${executiveText}</p>` : ''}<div class="counts"><span><b class="severity">P0</b>${count('P0')}</span><span><b style="color:var(--p1)">P1</b>${count('P1')}</span><span><b style="color:var(--p2)">P2</b>${count('P2')}</span></div></section>
 <section><h2>Test scope and performance overview</h2><p>Load engine: ${h(model.run.loadEngine.name ?? 'Not available')} ${h(model.run.loadEngine.version ?? '')}. Configured endpoints: <strong class="endpoint-list">${h(model.run.endpoints.map(endpoint => `${endpoint.method} ${endpoint.path}`).join(', '))}</strong>. Configured workload values describe test setup; measurements describe observed results.</p>${errorNotice}<div class="table-wrap"><table><thead><tr><th>Profile</th><th>Configured VUs</th><th>Configured duration ms</th><th>Observed duration ms</th><th>Max in-flight</th><th>Requests</th><th>Success</th><th>Failed</th><th>Error rate</th><th>RPS</th><th>min ms</th><th>p50 ms</th><th>p90 ms</th><th>p95 ms</th><th>p99 ms</th><th>max ms</th></tr></thead><tbody>${profileRows}</tbody></table></div><h3>Latency by profile</h3>${latencyChart}${latencyTable}</section>
+<section><h2>HTTP response status diagnostics</h2><p>Status counts are measured by k6 for each profile and endpoint where persisted endpoint evidence is available. A recorded status total that differs from requests is labeled incomplete.</p>${status429Note}<div class="table-wrap"><table class="http-status-table"><thead><tr><th>Profile</th><th>Endpoint</th><th>Requests</th><th>Successful</th><th>Failed</th><th>Error rate</th><th>RPS</th><th>HTTP status counts</th><th>Status coverage</th></tr></thead><tbody>${httpStatusRows}</tbody></table></div></section>
+<section><h2>Diagnostic coverage</h2><p>Coverage describes evidence present in this run’s persisted artifacts. “No observations” does not prove that a component was unused or uninstrumented.</p><div class="table-wrap"><table><thead><tr><th>Diagnostic</th><th>Coverage</th><th>Observations</th><th>Source</th><th>Notes</th></tr></thead><tbody>${diagnosticCoverageRows}</tbody></table></div></section>
 ${model.run.endpoints.length > 1 ? `<section><h2>Endpoint comparison</h2><p>Endpoint latency percentiles are calculated from raw per-request k6 samples for each route. Trace counts use only persisted spans correlated to this run and matching the route template. Aggregate profile metrics above cover the full selected endpoint set.</p><div class="table-wrap"><table class="endpoint-comparison"><thead><tr><th>Profile</th><th>Endpoint</th><th>Requests</th><th>RPS</th><th>Error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Request traces</th><th>PostgreSQL spans</th><th>External HTTP spans</th><th>Phase 3 finding</th></tr></thead><tbody>${endpointRows}</tbody></table></div></section>` : ''}
 ${databaseFindings.length ? `<section><h2>Database evidence</h2><p>PostgreSQL spans analyzed: ${h(value(model.evidenceSummary.databaseSpans))}. The following evidence is carried from Phase 3 findings.</p>${evidenceCards(databaseFindings)}</section>` : ''}${dependencyFindings.length ? `<section><h2>External dependency evidence</h2><p>External HTTP spans analyzed: ${h(value(model.evidenceSummary.externalHttpSpans))}. The following evidence is carried from Phase 3 findings.</p>${evidenceCards(dependencyFindings)}</section>` : ''}<section><h2>Detailed findings</h2>${findings}</section><section><h2>Evidence coverage</h2><ul><li>Request traces analyzed: ${h(value(model.evidenceSummary.requestTraces))}</li><li>PostgreSQL spans analyzed: ${h(value(model.evidenceSummary.databaseSpans))}</li><li>External HTTP spans analyzed: ${h(value(model.evidenceSummary.externalHttpSpans))}</li><li>Persisted snapshot: ${h(value(model.evidenceSummary.snapshotTraceCount))} traces / ${h(value(model.evidenceSummary.snapshotSpanCount))} spans</li><li>Snapshot truncated: ${h(value(model.evidenceSummary.snapshotTruncated))}</li><li>Trace evidence available: ${model.evidenceSummary.traceAvailable ? 'Yes' : 'No'}</li><li>Profiles: ${h(model.evidenceSummary.profiles.join(', ') || 'None')}</li></ul></section><section><h2>Limitations</h2><ul>${model.limitations.map(item => `<li>${h(item)}</li>`).join('')}</ul></section><footer>Generated by PerfLens ${h(model.perflensVersion)} · Report version ${model.reportVersion}. Findings, severity, and confidence are carried from the persisted Phase 3 analysis. This report does not perform additional diagnosis.</footer></main></body></html>`;
 }

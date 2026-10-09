@@ -35,9 +35,15 @@ test('report integration loads finalized artifacts and writes normalized JSON, M
     assert.equal(model.perflensVersion, '0.1.0');
     assert.equal(model.findings[0].severity, 'P2');
     assert.equal(model.findings[0].confidence, 'high');
+    assert.equal(model.diagnosticEvidence.schemaVersion, 1);
+    assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusState, 'not-persisted');
     for (const file of ['report.json', 'report.md', 'report.html']) await fs.access(path.join(dir, 'report', file));
+    const json = JSON.parse(await fs.readFile(path.join(dir, 'report/report.json'), 'utf8'));
     const md = await fs.readFile(path.join(dir, 'report/report.md'), 'utf8');
     const html = await fs.readFile(path.join(dir, 'report/report.html'), 'utf8');
+    assert.equal(json.reportVersion, 3);
+    assert.equal(json.diagnosticEvidence.schemaVersion, 1);
+    assert.match(html, /Diagnostic coverage/);
     assert.match(md, /Repeated database operation/);
     assert.match(html, /Repeated database operation/);
     assert.ok(output[0].includes('P2'));

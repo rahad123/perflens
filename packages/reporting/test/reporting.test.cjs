@@ -259,7 +259,8 @@ test('multi-endpoint report renders each endpoint metrics and findings independe
     ['/performance/external-call', 1, 0, 1],
   ]);
   const html = renderHtml(model);
-  const rows = html.match(/<tr><th scope="row">[^]*?<\/tr>/g) ?? [];
+  const comparison = html.match(/<table class="endpoint-comparison">([\s\S]*?)<\/table>/)?.[1] ?? '';
+  const rows = comparison.match(/<tr><th scope="row">[^]*?<\/tr>/g) ?? [];
   const endpointRows = Object.fromEntries(endpoints.map(endpoint => [endpoint.path, rows.find(row => row.includes(endpoint.path))]));
   assert.ok(endpointRows['/orders'].includes('10</td>') && endpointRows['/orders'].includes('None'));
   assert.ok(endpointRows['/performance/n-plus-one'].includes('11</td>') && endpointRows['/performance/n-plus-one'].includes('P2 Repeated DB evidence'));
@@ -278,6 +279,110 @@ test('multi-endpoint report renders each endpoint metrics and findings independe
   assert.ok(!endpointRows['/orders'].includes('Repeated DB evidence'));
   assert.ok(!endpointRows['/orders'].includes('Slow DB evidence'));
   assert.ok(!endpointRows['/orders'].includes('Dependency evidence'));
+});
+
+function statusDistributionInput() {
+  const targets = [{ method: 'GET', path: '/orders' }, { method: 'GET', path: '/users' }];
+  const input = fixture({ findings: [finding({ id: 'kept-finding', ruleId: 'load.error-degradation', target: targets[0], severity: 'P0', confidence: 'high', evidence: [{ observation: 'Existing Phase 3 evidence stays intact.', source: 'results/baseline.json, results/normal.json' }] })] });
+  const normal = input.profiles[0];
+  normal.result.target.endpoints = targets;
+  normal.result.metrics = {
+    requests: 90, successfulRequests: 69, failedRequests: 21, errorRate: 21 / 90, rps: 6,
+    latencyMs: { p50: 40, p90: 70, p95: 84, p99: 120 }, statusDistribution: { '200': 69, '429': 21 },
+    endpointResults: [
+      { target: targets[0], metrics: { requests: 50, successfulRequests: 29, failedRequests: 21, errorRate: 21 / 50, rps: 3.3, latencyMs: { p50: 50, p95: 100, p99: 130 }, statusDistribution: { '200': 29, '429': 21 } } },
+      { target: targets[1], metrics: { requests: 40, successfulRequests: 40, failedRequests: 0, errorRate: 0, rps: 2.7, latencyMs: { p50: 20, p95: 40, p99: 60 }, statusDistribution: { '200': 40 } } },
+    ],
+  };
+  const baselineRunProfile = { name: 'baseline', status: 'completed', startedAt: '2026-09-30T12:00:00Z', endedAt: '2026-09-30T12:00:10Z', result: 'results/baseline.json' };
+  const baseline = structuredClone(normal.result);
+  baseline.profile = 'baseline'; baseline.metrics.requests = 20; baseline.metrics.successfulRequests = 20; baseline.metrics.failedRequests = 0; baseline.metrics.errorRate = 0; baseline.metrics.rps = 2; baseline.metrics.statusDistribution = { '200': 20 };
+  baseline.metrics.endpointResults = [
+    { target: targets[0], metrics: { requests: 10, successfulRequests: 10, failedRequests: 0, errorRate: 0, rps: 1, latencyMs: { p50: 10, p95: 20, p99: 30 }, statusDistribution: { '200': 10 } } },
+    { target: targets[1], metrics: { requests: 10, successfulRequests: 10, failedRequests: 0, errorRate: 0, rps: 1, latencyMs: { p50: 15, p95: 25, p99: 35 }, statusDistribution: { '200': 10 } } },
+  ];
+  input.run.profiles.unshift(baselineRunProfile);
+  input.profiles.unshift({ runProfile: baselineRunProfile, result: baseline });
+  input.run.profiles[1].name = 'normal';
+  return { input, existingFinding: structuredClone(input.findingsArtifact.findings[0]) };
+}
+
+test('HTTP status diagnostics preserve per-endpoint counts for each profile and explain 429 without creating findings', () => {
+  const { input, existingFinding } = statusDistributionInput();
+  const model = build(input);
+  assert.equal(model.reportVersion, 3);
+  assert.equal(model.diagnosticEvidence.schemaVersion, 1);
+  assert.equal(model.findings.length, 1);
+  assert.deepEqual(model.findings[0].evidence, existingFinding.evidence);
+  assert.equal(model.findings[0].severity, existingFinding.severity);
+  assert.equal(model.findings[0].confidence, existingFinding.confidence);
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles.length, 4);
+  const normalOrders = model.diagnosticEvidence.httpStatusProfiles.find(item => item.profile === 'normal' && item.target.path === '/orders');
+  assert.deepEqual(normalOrders.statusDistribution, { '200': 29, '429': 21 });
+  assert.equal(normalOrders.requests, 50);
+  assert.equal(normalOrders.successfulRequests, 29);
+  assert.equal(normalOrders.failedRequests, 21);
+  assert.equal(normalOrders.statusCount, 50);
+  assert.equal(normalOrders.statusState, 'available');
+  assert.equal(normalOrders.source, 'results/normal.json');
+  const html = renderHtml(model), markdown = renderMarkdown(model);
+  for (const output of [html, markdown]) {
+    assert.match(output, /HTTP response status diagnostics/);
+    assert.match(output, /429 Too Many Requests/);
+    assert.match(output, /requests were rejected as too frequent/);
+    assert.match(output, /Possible sources include application rate limiting, an API gateway, or upstream throttling/);
+    assert.match(output, /The responsible component has not been identified/);
+  }
+  assert.match(html, /29[\s\S]*?200 OK[\s\S]*?21[\s\S]*?429 Too Many Requests/);
+  assert.match(renderHtml(model), /<h2>Diagnostic coverage<\/h2>/);
+  assert.match(renderHtml(model), /CPU utilization[\s\S]*?Not collected/);
+});
+
+test('empty, unavailable, inconsistent, and legacy status distributions are distinguished without inventing zeroes', () => {
+  const emptyInput = fixture();
+  emptyInput.profiles[0].result.metrics.requests = 0;
+  emptyInput.profiles[0].result.metrics.statusDistribution = {};
+  let model = build(emptyInput);
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusState, 'no-observations');
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusCount, 0);
+  assert.match(renderHtml(model), /No status observations/);
+
+  const missingInput = fixture();
+  delete missingInput.profiles[0].result.metrics.statusDistribution;
+  model = build(missingInput);
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusState, 'not-persisted');
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusCount, null);
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'HTTP status distribution').observations, null);
+  assert.match(renderHtml(model), /Not persisted/);
+
+  const inconsistentInput = fixture();
+  inconsistentInput.profiles[0].result.metrics.statusDistribution = { '200': 198, '429': 1 };
+  model = build(inconsistentInput);
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusState, 'incomplete');
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusCount, 199);
+  assert.match(renderHtml(model), /Incomplete \(199 of 200 statuses\)/);
+
+  const legacyInput = fixture();
+  delete legacyInput.profiles[0].result.metrics.endpointResults;
+  delete legacyInput.profiles[0].result.metrics.statusDistribution;
+  model = build(legacyInput);
+  assert.equal(model.performanceSummary.profiles[0].metrics.requests, 200);
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Endpoint request measurements').state, 'not-persisted');
+  assert.equal(model.diagnosticEvidence.httpStatusProfiles[0].statusState, 'not-persisted');
+});
+
+test('diagnostic rendering escapes endpoint text and reports evidence coverage without changing Phase 3 artifacts', () => {
+  const input = fixture({ findings: [finding({ id: 'preserved', severity: 'P1', confidence: 'medium', metrics: { arbitrary: 'unchanged' } })] });
+  input.profiles[0].result.target.endpoints[0].path = '/items/<img src=x onerror=alert(1)>&';
+  input.profiles[0].result.metrics.statusDistribution = { '200': 198, '429': 2 };
+  const before = structuredClone(input.findingsArtifact.findings);
+  const model = build(input);
+  const html = renderHtml(model);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;&amp;/);
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(1\)>/);
+  assert.match(html, /analysis\/evidence\.json/);
+  assert.deepEqual(model.findings, before);
+  assert.equal(input.findingsArtifact.findings[0].metrics.arbitrary, 'unchanged');
 });
 
 test('HTML comparison visualizations use only measured percentiles and conditionally show component evidence', () => {
@@ -340,7 +445,7 @@ test('Markdown evidence cannot inject table rows, headings, raw HTML, or links',
   const markdown = renderMarkdown(model);
   assert.ok(markdown.includes('cell \\| injected \\| fake \\| row \\# heading \\<script\\>alert(1)\\</script\\> \\[click\\](javascript:alert(1))'));
   assert.equal((markdown.match(/^\| fake \| row$/gm) ?? []).length, 0);
-  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 1);
+  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 2);
   assert.ok(!markdown.includes('<script>alert(1)</script>'));
 });
 
