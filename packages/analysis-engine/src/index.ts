@@ -56,6 +56,8 @@ export interface SanitizedSpan {
   kind: 'server' | 'client' | 'internal' | 'producer' | 'consumer' | 'unknown';
   startTimeUnixNano: string;
   endTimeUnixNano: string;
+  /** Optional for compatibility with historical evidence; message text is never persisted. */
+  status?: 'error' | 'ok' | 'unset';
   attributes: Record<string, string | number | boolean>;
 }
 
@@ -452,6 +454,7 @@ export function validateEvidence(evidence: AnalysisEvidence): void {
     if (!span || !span.traceId || !span.spanId || !span.profile || !evidence.profiles.some(profile => profile.profile === span.profile) || !['server', 'client', 'internal', 'producer', 'consumer', 'unknown'].includes(span.kind)) throw new Error('Malformed normalized trace span evidence.');
     try { if (BigInt(span.endTimeUnixNano) < BigInt(span.startTimeUnixNano)) throw new Error(); } catch { throw new Error('Malformed normalized trace span timestamps.'); }
     if (!span.attributes || typeof span.attributes !== 'object') throw new Error('Malformed normalized trace span attributes.');
+    if (span.status !== undefined && !['error', 'ok', 'unset'].includes(span.status)) throw new Error('Malformed normalized trace span status.');
     if (span.kind === 'server' && span.attributes['perflens.audit.run_id'] !== undefined && span.attributes['perflens.audit.run_id'] !== evidence.runId) throw new Error('Trace snapshot contains server spans from another audit run.');
   }
 }

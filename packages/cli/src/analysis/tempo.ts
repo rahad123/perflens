@@ -29,6 +29,13 @@ function kind(raw: Json): SanitizedSpan['kind'] {
   if (value === 'SPAN_KIND_CONSUMER' || value === 5) return 'consumer';
   return 'unknown';
 }
+function spanStatus(raw: Json): SanitizedSpan['status'] {
+  const code = raw?.status?.code;
+  if (code === 2 || code === '2' || code === 'STATUS_CODE_ERROR' || String(code).toUpperCase() === 'ERROR') return 'error';
+  if (code === 1 || code === '1' || code === 'STATUS_CODE_OK' || String(code).toUpperCase() === 'OK') return 'ok';
+  if (code === 0 || code === '0' || code === 'STATUS_CODE_UNSET' || String(code).toUpperCase() === 'UNSET') return 'unset';
+  return undefined;
+}
 function endpointPath(path: string, allowed: string[]): string {
   if (allowed.includes(path)) return path;
   const prefix = [...allowed].sort((a, b) => b.length - a.length).find(candidate => path.startsWith(`${candidate}/`));
@@ -99,6 +106,7 @@ export function normalizeTempoTrace(trace: Json, profile: string, runId: string,
           spanId: String(raw.spanId ?? ''), parentSpanId: raw.parentSpanId ? String(raw.parentSpanId) : null,
           profile: spanKind === 'server' ? String(attrSafe['perflens.audit.profile'] ?? profile) : profile,
           name, kind: spanKind, startTimeUnixNano: String(raw.startTimeUnixNano ?? ''), endTimeUnixNano: String(raw.endTimeUnixNano ?? ''),
+          ...(spanStatus(raw) === undefined ? {} : { status: spanStatus(raw) }),
           attributes: attrSafe,
         });
       }

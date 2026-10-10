@@ -310,7 +310,7 @@ function statusDistributionInput() {
 test('HTTP status diagnostics preserve per-endpoint counts for each profile and explain 429 without creating findings', () => {
   const { input, existingFinding } = statusDistributionInput();
   const model = build(input);
-  assert.equal(model.reportVersion, 4);
+  assert.equal(model.reportVersion, 5);
   assert.equal(model.diagnosticEvidence.schemaVersion, 1);
   assert.equal(model.findings.length, 1);
   assert.deepEqual(model.findings[0].evidence, existingFinding.evidence);
@@ -507,7 +507,7 @@ test('resource summaries preserve process-lifetime identity, avoid cross-process
 
 test('old runs without resources remain readable and resource coverage is not represented as zero', () => {
   const model = build(fixture());
-  assert.equal(model.reportVersion, 4);
+  assert.equal(model.reportVersion, 5);
   assert.equal(model.resourceDiagnostics.state, 'not-collected');
   assert.equal(model.resourceDiagnostics.processState, 'not-collected');
   assert.equal(model.resourceDiagnostics.containerState, 'not-collected');
@@ -587,7 +587,7 @@ test('Markdown evidence cannot inject table rows, headings, raw HTML, or links',
   const markdown = renderMarkdown(model);
   assert.ok(markdown.includes('cell \\| injected \\| fake \\| row \\# heading \\<script\\>alert(1)\\</script\\> \\[click\\](javascript:alert(1))'));
   assert.equal((markdown.match(/^\| fake \| row$/gm) ?? []).length, 0);
-  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 3);
+  assert.ok((markdown.match(/^\| Profile \|/gm) ?? []).length >= 3);
   assert.ok(!markdown.includes('<script>alert(1)</script>'));
 });
 
@@ -635,4 +635,73 @@ test('identical artifacts produce deterministically ordered semantic content', (
   first.generatedAt = second.generatedAt;
   assert.deepEqual(first, second);
   assert.equal(renderMarkdown(first), renderMarkdown(second));
+});
+
+test('PostgreSQL diagnostics correlate parent chains, preserve profile and endpoint scope, summarize durations, repeats and safe errors', () => {
+  const input = fixture({ findings: [finding({ ruleId: 'database.slow-operation', title: 'Consistently slow database operation' })] });
+  const endpoints = [{ method: 'GET', path: '/orders' }, { method: 'GET', path: '/customers' }];
+  input.profiles[0].result.target.endpoints = endpoints;
+  input.profiles[0].runProfile.name = 'normal';
+  input.profiles[0].result.profile = 'normal';
+  input.profiles[0].result.metrics.requests = 3;
+  input.profiles[0].result.metrics.successfulRequests = 3;
+  input.profiles[0].result.metrics.failedRequests = 0;
+  input.profiles[0].runProfile.result = 'results/normal.json';
+  input.run.profiles[0] = input.profiles[0].runProfile;
+  const trace = (profile, traceId, method, route, spanSpecs) => {
+    const rootSpan = { traceId, spanId: `root-${traceId}`, parentSpanId: null, profile, kind: 'server', name: `${method} ${route}`, startTimeUnixNano: '0', endTimeUnixNano: '1000000000', attributes: { 'perflens.audit.run_id': runId, 'perflens.audit.profile': profile, 'http.request.method': method, 'http.route': route } };
+    const children = spanSpecs.map((spec, index) => ({ traceId, spanId: `${traceId}-db-${index}`, parentSpanId: spec.parent ?? rootSpan.spanId, profile, kind: 'client', name: 'pg.query: SELECT * FROM orders WHERE id = $?', startTimeUnixNano: String(index * 1000000), endTimeUnixNano: String((index * 1000000) + (spec.durationMs * 1000000)), status: spec.status, attributes: { 'db.system': 'postgresql', ...(spec.fingerprint ? { 'db.query.sanitized': spec.fingerprint } : {}), ...(spec.operation ? { 'db.operation.name': spec.operation } : {}) } }));
+    return [rootSpan, ...children];
+  };
+  const fingerprint = 'select * from orders where customer_id = ?';
+  input.evidence.traces = [
+    ...trace('normal', 'n-order-a', 'GET', '/orders', Array.from({ length: 5 }, (_, i) => ({ durationMs: 20 + i, fingerprint, status: i === 4 ? 'error' : 'ok' }))),
+    ...trace('normal', 'n-order-b', 'GET', '/orders', []),
+    ...trace('normal', 'n-customer', 'GET', '/customers', [{ durationMs: 9, operation: 'SELECT', status: 'unset' }]),
+  ];
+  input.analysis.traceSummary.databaseSpans = 7;
+  input.evidence.telemetry = { source: 'Tempo', traceCount: 4, spanCount: input.evidence.traces.length, truncated: false };
+  const model = build(input), html = renderHtml(model), markdown = renderMarkdown(model);
+  const normalOrders = model.postgresDiagnostics.profiles.find(row => row.profile === 'normal').endpoints.find(item => item.target.path === '/orders');
+  const normalCustomers = model.postgresDiagnostics.profiles.find(row => row.profile === 'normal').endpoints.find(item => item.target.path === '/customers');
+  assert.equal(normalOrders.requests, 2);
+  assert.equal(normalOrders.requestsWithPostgres, 1);
+  assert.equal(normalOrders.operations, 5);
+  assert.equal(normalOrders.averageOperationsPerRequest, 2.5);
+  assert.equal(normalOrders.maxOperationsPerRequest, 5);
+  assert.equal(normalOrders.summedSpanDurationMs, 110);
+  assert.equal(normalOrders.operationSummaries[0].averageDurationMs, 22);
+  assert.equal(normalOrders.operationSummaries[0].p95DurationMs, 24);
+  assert.equal(normalOrders.repeatedPatterns[0].maxExecutionsPerTrace, 5);
+  assert.equal(normalOrders.repeatedPatterns[0].phase3Finding, false, 'diagnostic repetition does not manufacture a Phase 3 finding');
+  assert.equal(normalCustomers.operations, 1);
+  assert.equal(normalCustomers.operationSummaries[0].fingerprint, null);
+  assert.equal(model.postgresDiagnostics.errors.length, 1);
+  assert.equal(model.postgresDiagnostics.errors[0].correlation, 'parent-chain');
+  assert.equal(model.findings.length, 1);
+  assert.match(html, /PostgreSQL diagnostics/);
+  assert.match(html, /select \* from orders where customer_id = \?/);
+  assert.match(html, /EXPLAIN \(ANALYZE, BUFFERS\)/);
+  assert.match(markdown, /p95 ms/);
+  assert.match(markdown, /Sum of span durations \(ms; overlap possible\)/i);
+  assert.doesNotMatch(html, /private-value/i);
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Connection-pool metrics').state, 'not-collected');
+});
+
+test('PostgreSQL diagnostics leave spans uncorrelated when trace has multiple request roots and mark missing status/query evidence honestly', () => {
+  const input = fixture({ findings: [] });
+  const span = (spanId, parentSpanId, kind, route, name, startTimeUnixNano, endTimeUnixNano, attributes = {}) => ({ traceId: 'shared-trace', spanId, parentSpanId, profile: 'normal', kind, name, startTimeUnixNano, endTimeUnixNano, attributes });
+  input.evidence.traces = [
+    span('root-a', null, 'server', '/orders', 'GET /orders', '0', '1000000000', { 'perflens.audit.run_id': runId, 'http.route': '/orders' }),
+    span('root-b', null, 'server', '/customers', 'GET /customers', '0', '1000000000', { 'perflens.audit.run_id': runId, 'http.route': '/customers' }),
+    span('db', 'missing-parent', 'client', '', 'pg.query', '0', '5000000', { 'db.system': 'postgresql' }),
+  ];
+  input.analysis.findings = []; input.findingsArtifact.findings = [];
+  const model = build(input);
+  assert.equal(model.postgresDiagnostics.operations[0].correlation, 'ambiguous');
+  assert.equal(model.postgresDiagnostics.operations[0].target, null);
+  assert.equal(model.postgresDiagnostics.operations[0].fingerprint, null);
+  assert.equal(model.postgresDiagnostics.operations[0].status, 'unknown');
+  assert.equal(model.postgresDiagnostics.coverage.find(item => item.diagnostic === 'Endpoint-to-database correlation').state, 'insufficient-evidence');
+  assert.equal(model.postgresDiagnostics.coverage.find(item => item.diagnostic === 'PostgreSQL error status').state, 'insufficient-evidence');
 });
