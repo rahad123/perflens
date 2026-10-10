@@ -37,6 +37,18 @@ test('normalizes SQL literals and numeric parameters without retaining secrets',
   assert.equal(sanitizeDependency('not a URL'), 'external dependency');
 });
 
+test('SQL fingerprint normalization removes escaped strings, dollar quotes, nested comments, and numeric literals', () => {
+  const sql = String.raw`SELECT * FROM users WHERE note = E'private\' value -- not a comment' AND payload = $tag$customer-secret$tag$ AND id = 42.50e+2 /* outer /* nested-comment-secret */ trailing-comment-secret */ AND flags = B'101'`;
+  const normalized = normalizeSql(sql);
+  for (const secret of ['private', 'value -- not a comment', 'customer-secret', 'nested-comment-secret', 'trailing-comment-secret', '42.50e+2', '101']) assert.ok(!normalized.includes(secret), `normalized fingerprint leaked ${secret}`);
+  assert.match(normalized, /select \* from users/);
+  assert.match(normalized, /payload = \?/);
+  assert.match(normalized, /id = \?/);
+  assert.match(normalized, /flags = b\?/);
+  assert.match(normalizeSql('SELECT * FROM users WHERE id = $1'), /id = \$\?/);
+  assert.match(normalizeSql("SELECT data ? 'private-key' FROM records WHERE score > .25 AND ratio < 1e-6"), /data \? \? from records where score > \? and ratio < \?/);
+});
+
 test('positive repeated database operation rule requires repeated equivalent SQL across many requests', () => {
   const result = analyzeEvidence(evidence({ traces: nplusTraces() }));
   const finding = result.findings.find(item => item.ruleId === 'database.repeated-operation');

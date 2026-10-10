@@ -51,9 +51,11 @@ function endpointPath(path: string, allowed: string[]): string {
 }
 function safeAttributes(raw: Record<string, string | number | boolean>, endpoints: string[]): Record<string, string | number | boolean> {
   const safe: Record<string, string | number | boolean> = {};
-  for (const key of ['perflens.audit.run_id', 'perflens.audit.profile', 'db.system', 'db.operation.name', 'db.namespace', 'http.request.method', 'http.method', 'http.response.status_code', 'http.status_code']) {
+  for (const key of ['perflens.audit.run_id', 'perflens.audit.profile', 'db.system', 'db.namespace', 'http.request.method', 'http.method', 'http.response.status_code', 'http.status_code']) {
     if (raw[key] !== undefined) safe[key] = raw[key];
   }
+  const operation = raw['db.operation.name'];
+  if (typeof operation === 'string' && /^[a-z][a-z0-9_]{0,39}$/i.test(operation)) safe['db.operation.name'] = operation.toUpperCase();
   const databaseSystem = raw['db.system'] ?? raw['db.system.name'];
   if (databaseSystem !== undefined) safe['db.system'] = databaseSystem;
   const statement = raw['db.query.text'] ?? raw['db.statement'];

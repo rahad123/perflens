@@ -638,7 +638,10 @@ test('identical artifacts produce deterministically ordered semantic content', (
 });
 
 test('PostgreSQL diagnostics correlate parent chains, preserve profile and endpoint scope, summarize durations, repeats and safe errors', () => {
-  const input = fixture({ findings: [finding({ ruleId: 'database.slow-operation', title: 'Consistently slow database operation' })] });
+  const input = fixture({ findings: [
+    finding({ id: 'slow-finding', ruleId: 'database.slow-operation', title: 'Consistently slow database operation' }),
+    finding({ id: 'other-query-finding', ruleId: 'database.repeated-operation', title: 'Repeated database query pattern', metrics: { operationFingerprint: 'select * from unrelated_table where id = ?' } }),
+  ] });
   const endpoints = [{ method: 'GET', path: '/orders' }, { method: 'GET', path: '/customers' }];
   input.profiles[0].result.target.endpoints = endpoints;
   input.profiles[0].runProfile.name = 'normal';
@@ -673,19 +676,72 @@ test('PostgreSQL diagnostics correlate parent chains, preserve profile and endpo
   assert.equal(normalOrders.operationSummaries[0].averageDurationMs, 22);
   assert.equal(normalOrders.operationSummaries[0].p95DurationMs, 24);
   assert.equal(normalOrders.repeatedPatterns[0].maxExecutionsPerTrace, 5);
-  assert.equal(normalOrders.repeatedPatterns[0].phase3Finding, false, 'diagnostic repetition does not manufacture a Phase 3 finding');
+  assert.equal('phase3Finding' in normalOrders.repeatedPatterns[0], false, 'descriptive fingerprint rows are never individually marked as analyzer diagnoses');
   assert.equal(normalCustomers.operations, 1);
   assert.equal(normalCustomers.operationSummaries[0].fingerprint, null);
   assert.equal(model.postgresDiagnostics.errors.length, 1);
   assert.equal(model.postgresDiagnostics.errors[0].correlation, 'parent-chain');
-  assert.equal(model.findings.length, 1);
+  assert.equal(model.findings.length, 2);
   assert.match(html, /PostgreSQL diagnostics/);
   assert.match(html, /select \* from orders where customer_id = \?/);
   assert.match(html, /EXPLAIN \(ANALYZE, BUFFERS\)/);
   assert.match(markdown, /p95 ms/);
   assert.match(markdown, /Sum of span durations \(ms; overlap possible\)/i);
+  assert.match(markdown, /descriptive repetition evidence, not a confirmed N\+1 diagnosis/i);
+  assert.doesNotMatch(markdown, /Phase 3 repeated-operation finding \|/);
+  assert.ok(model.findings.some(item => item.ruleId === 'database.repeated-operation'));
   assert.doesNotMatch(html, /private-value/i);
   assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Connection-pool metrics').state, 'not-collected');
+});
+
+test('PostgreSQL fingerprint report rejects suspicious historical raw SQL and unknown status is insufficient evidence', () => {
+  const legacyFinding = finding({ id: 'legacy-query-finding', metrics: { operationFingerprint: "SELECT * FROM users WHERE email = E'private\\'secret-value'" } });
+  const input = fixture({ findings: [legacyFinding] });
+  const base = { traceId: 'status-trace', profile: 'normal', startTimeUnixNano: '0', endTimeUnixNano: '5000000', attributes: { 'db.system': 'postgresql' } };
+  const root = { ...base, spanId: 'root', parentSpanId: null, kind: 'server', name: 'GET /orders', startTimeUnixNano: '0', endTimeUnixNano: '100000000', attributes: { 'perflens.audit.run_id': runId, 'http.route': '/orders', 'http.request.method': 'GET' } };
+  const leakedLegacy = { ...base, spanId: 'db-legacy', parentSpanId: 'root', kind: 'client', name: 'pg.query', status: 'unset', attributes: { ...base.attributes, 'db.operation.name': 'SELECT secret-operation-value', 'db.query.sanitized': "select * from users where email = e'private\\'secret-value'" } };
+  input.evidence.traces = [root, leakedLegacy];
+  input.analysis.traceSummary.requests = 1;
+  input.analysis.traceSummary.databaseSpans = 1;
+  const model = build(input);
+  const outputs = [JSON.stringify(model), renderMarkdown(model), renderHtml(model)];
+  for (const output of outputs) {
+    assert.ok(!output.includes('secret-value'));
+    assert.ok(!output.includes('secret-operation-value'));
+  }
+  assert.match(JSON.stringify(model), /SQL details redacted/);
+  const operation = model.postgresDiagnostics.operations[0];
+  assert.equal(operation.fingerprint, null);
+  assert.equal(operation.status, 'unset');
+  const errorCoverage = model.postgresDiagnostics.coverage.find(item => item.diagnostic === 'PostgreSQL error status');
+  assert.equal(errorCoverage.state, 'insufficient-evidence', 'UNSET is not counted as successful operation status');
+
+  leakedLegacy.status = undefined;
+  const missingStatusModel = build(input);
+  assert.equal(missingStatusModel.postgresDiagnostics.coverage.find(item => item.diagnostic === 'PostgreSQL error status').state, 'insufficient-evidence');
+});
+
+test('PostgreSQL correlation labels parent-chain, unique-root fallback, async children, and background operations distinctly', () => {
+  const input = fixture({ findings: [] });
+  const common = { traceId: 'single-root', profile: 'normal', startTimeUnixNano: '0', endTimeUnixNano: '10000000', attributes: { 'db.system': 'postgresql' } };
+  const root = { ...common, spanId: 'root', parentSpanId: null, kind: 'server', startTimeUnixNano: '0', endTimeUnixNano: '5000000', attributes: { 'perflens.audit.run_id': runId, 'http.route': '/orders', 'http.request.method': 'GET' } };
+  const middle = { ...common, spanId: 'async-work', parentSpanId: 'root', kind: 'internal', attributes: {} };
+  const asyncDb = { ...common, spanId: 'async-db', parentSpanId: 'async-work', kind: 'client', name: 'pg.query', attributes: { ...common.attributes, 'db.query.sanitized': 'select * from orders where id = ?' } };
+  const traceOnlyDb = { ...common, spanId: 'trace-only-db', parentSpanId: 'missing-parent', kind: 'client', name: 'pg.query', attributes: common.attributes };
+  const backgroundDb = { ...common, traceId: 'background-trace', spanId: 'background-db', parentSpanId: null, kind: 'client', name: 'pg.query', attributes: common.attributes };
+  input.evidence.traces = [root, middle, asyncDb, traceOnlyDb, backgroundDb];
+  input.analysis.traceSummary.requests = 1;
+  input.analysis.traceSummary.databaseSpans = 3;
+  const operations = build(input).postgresDiagnostics.operations;
+  assert.equal(operations.find(item => item.spanId === 'async-db').correlation, 'parent-chain');
+  assert.equal(operations.find(item => item.spanId === 'async-db').target.path, '/orders');
+  assert.equal(operations.find(item => item.spanId === 'trace-only-db').correlation, 'trace-only');
+  assert.equal(operations.find(item => item.spanId === 'trace-only-db').target.path, '/orders');
+  assert.equal(operations.find(item => item.spanId === 'background-db').correlation, 'unmatched');
+  assert.equal(operations.find(item => item.spanId === 'background-db').target, null);
+  const correlationCoverage = build(input).postgresDiagnostics.coverage.find(item => item.diagnostic === 'Endpoint-to-database correlation');
+  assert.match(correlationCoverage.note, /Parent-chain: 1; trace-only unique-root fallback: 1; ambiguous multiple-root: 0; unmatched\/background: 1/);
+  assert.match(renderHtml(build(input)), /trace-only/);
 });
 
 test('PostgreSQL diagnostics leave spans uncorrelated when trace has multiple request roots and mark missing status/query evidence honestly', () => {

@@ -101,14 +101,63 @@ export interface AnalysisResult {
 }
 
 export function normalizeSql(value: string): string {
-  return value.toLowerCase()
-    .replace(/--[^\n]*/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/'(?:''|[^'])*'/g, '?')
-    .replace(/\$\$[\s\S]*?\$\$/g, '?')
-    .replace(/\$[a-zA-Z_][a-zA-Z0-9_]*\$[\s\S]*?\$[a-zA-Z_][a-zA-Z0-9_]*\$/g, '?')
-    .replace(/\b\d+(?:\.\d+)?\b/g, '?')
-    .replace(/\s+/g, ' ').trim();
+  // SQL arrives from OTel as untrusted text. Use a small lexer instead of
+  // sequential regex replacements: PostgreSQL permits nested comments,
+  // escaped E-strings, and tagged dollar-quoted strings, all of which can
+  // otherwise leave literal contents behind in persisted evidence.
+  let output = '';
+  let i = 0;
+  const isWord = (char: string | undefined) => char !== undefined && /[\p{L}\p{N}_$]/u.test(char);
+  while (i < value.length) {
+    if (value.startsWith('--', i)) {
+      const newline = value.indexOf('\n', i + 2);
+      output += ' ';
+      i = newline < 0 ? value.length : newline + 1;
+      continue;
+    }
+    if (value.startsWith('/*', i)) {
+      let depth = 1;
+      i += 2;
+      while (i < value.length && depth > 0) {
+        if (value.startsWith('/*', i)) { depth++; i += 2; }
+        else if (value.startsWith('*/', i)) { depth--; i += 2; }
+        else i++;
+      }
+      output += ' ';
+      continue;
+    }
+    if (value[i] === "'") {
+      output += '?';
+      i++;
+      let closed = false;
+      while (i < value.length) {
+        if (value[i] === '\\' && i + 1 < value.length) { i += 2; continue; }
+        if (value[i] === "'" && value[i + 1] === "'") { i += 2; continue; }
+        if (value[i] === "'") { i++; closed = true; break; }
+        i++;
+      }
+      // An unterminated string is malformed/incomplete evidence. Discard its
+      // remaining text rather than risk persisting part of a sensitive value.
+      if (!closed) i = value.length;
+      continue;
+    }
+    if (value[i] === '$') {
+      const delimiter = value.slice(i).match(/^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/)?.[0];
+      if (delimiter) {
+        const end = value.indexOf(delimiter, i + delimiter.length);
+        output += '?';
+        i = end < 0 ? value.length : end + delimiter.length;
+        continue;
+      }
+    }
+    const previousIsWord = isWord(value[i - 1]) && !(value[i - 1] === '$' && !isWord(value[i - 2]));
+    if ((/[0-9]/.test(value[i]) || (value[i] === '.' && /[0-9]/.test(value[i + 1] ?? ''))) && !previousIsWord) {
+      const number = value.slice(i).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/)?.[0];
+      if (number) { output += '?'; i += number.length; continue; }
+    }
+    output += value[i++];
+  }
+  return output.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
 export function sanitizeDependency(value: string): string {

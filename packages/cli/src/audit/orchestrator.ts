@@ -165,11 +165,13 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   write('\nPOSTGRESQL DIAGNOSTICS');
   const postgres = reportModel.postgresDiagnostics ?? { operations: [], errors: [], profiles: [], coverage: [] };
   const correlatedPostgres = postgres.operations.filter(item => item.correlation === 'parent-chain' || item.correlation === 'trace-only').length;
+  const correlationCount = (kind: string) => postgres.operations.filter(item => item.correlation === kind).length;
   const slowFindings = reportModel.findings.filter(item => item.ruleId === 'database.slow-operation').length;
   const repeatedFindings = reportModel.findings.filter(item => item.ruleId === 'database.repeated-operation').length;
   const slowestPostgres = [...postgres.operations].filter(item => item.durationMs !== null).sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0))[0];
   write(`  Observed operations       ${postgres.operations.length}`);
   write(`  Endpoint-correlated ops   ${correlatedPostgres}`);
+  write(`  Correlation quality       ${correlationCount('parent-chain')} parent-chain · ${correlationCount('trace-only')} trace-only · ${correlationCount('ambiguous')} ambiguous · ${correlationCount('unmatched')} unmatched`);
   write(`  Phase 3 slow-op findings  ${slowFindings}`);
   write(`  Phase 3 repeated-query findings ${repeatedFindings}`);
   write(`  Observed DB errors        ${postgres.errors.length}`);

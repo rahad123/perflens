@@ -73,6 +73,26 @@ test('Tempo importer keeps PostgreSQL error status and parent references without
   assert.doesNotMatch(JSON.stringify(normalized), /private exception|sentinel-value|private-value/);
 });
 
+test('Tempo normalization sanitizes PostgreSQL literal syntaxes and safely handles absent SQL attributes/status', () => {
+  const sqlValues = [
+    String.raw`SELECT * FROM users WHERE note = E'private\' secret-value'`,
+    'SELECT * FROM users WHERE note = $body$secret-value$body$',
+    'SELECT * FROM users /* outer /* nested-secret */ private-comment-tail */ WHERE id = 987654321',
+    'SELECT * FROM users WHERE payload = U&\'secret-value\' AND score = 1.25e+8',
+  ];
+  const trace = { traceID: 'trace-sql-private', batches: [{ resource: { attributes: [{ key: 'service.name', value: { stringValue: 'demo' } }] }, scopeSpans: [{ spans: [
+    { spanId: 'root', kind: 'SPAN_KIND_SERVER', name: 'GET /orders', startTimeUnixNano: '1', endTimeUnixNano: '100000001', attributes: [{ key: 'perflens.audit.run_id', value: { stringValue: runId } }, { key: 'perflens.audit.profile', value: { stringValue: 'normal' } }, { key: 'http.route', value: { stringValue: '/orders' } }] },
+    ...sqlValues.map((sql, index) => ({ spanId: `db-${index}`, parentSpanId: 'root', kind: 'SPAN_KIND_CLIENT', name: 'pg.query', startTimeUnixNano: '2', endTimeUnixNano: '50000002', status: { code: 9, message: 'do-not-persist' }, attributes: [{ key: 'db.system.name', value: { stringValue: 'postgresql' } }, { key: 'db.operation.name', value: { stringValue: 'SELECT private-operation-secret' } }, { key: 'db.query.text', value: { stringValue: sql } }] })),
+    { spanId: 'db-no-query', parentSpanId: 'root', kind: 'SPAN_KIND_CLIENT', name: 'pg.query', startTimeUnixNano: '2', endTimeUnixNano: '50000002', attributes: [{ key: 'db.system.name', value: { stringValue: 'postgresql' } }] },
+  ] }] }] };
+  const normalized = normalizeTempoTrace(trace, 'normal', runId, 'demo', ['/orders']);
+  const serialized = JSON.stringify(normalized);
+  assert.doesNotMatch(serialized, /secret-value|nested-secret|private-comment-tail|private-operation-secret|987654321|1\.25e\+8|do-not-persist/);
+  for (const span of normalized.filter(item => item.spanId.startsWith('db-') && item.spanId !== 'db-no-query')) assert.equal(span.status, undefined, 'unknown status is omitted, not treated as OK');
+  assert.equal(normalized.find(item => item.spanId === 'db-no-query').attributes['db.query.sanitized'], undefined);
+  assert.doesNotMatch(normalized.find(item => item.spanId === 'db-no-query').name, /secret/i);
+});
+
 test('Tempo query is bounded by service, run, profile, and audit window', async () => {
   const originalFetch = global.fetch;
   const urls = [];
