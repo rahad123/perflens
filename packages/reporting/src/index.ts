@@ -285,9 +285,10 @@ function postgresFingerprint(span: any): string | null {
   // Query shapes must identify a relation; bare verbs are insufficient to equate operations.
   return /\bselect\b[\s\S]*\bfrom\s+[\w".]+|\binsert\s+into\s+[\w".]+|\bupdate\s+[\w".]+|\bdelete\s+from\s+[\w".]+/.test(normalized) ? normalized : null;
 }
+const SAFE_POSTGRES_OPERATIONS = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'CALL', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'BEGIN', 'COMMIT', 'ROLLBACK', 'EXPLAIN', 'EXECUTE', 'PREPARE', 'DEALLOCATE', 'SET', 'SHOW', 'COPY', 'LOCK', 'REFRESH', 'VACUUM', 'ANALYZE', 'QUERY']);
 function postgresOperation(span: any): string {
   const tagged = span.attributes?.['db.operation.name'];
-  if (typeof tagged === 'string' && /^[a-z][a-z0-9_]{0,39}$/i.test(tagged)) return tagged.toUpperCase();
+  if (typeof tagged === 'string' && SAFE_POSTGRES_OPERATIONS.has(tagged.toUpperCase())) return tagged.toUpperCase();
   const fingerprint = postgresFingerprint(span);
   const verb = fingerprint?.match(/^(select|insert|update|delete|with)\b/i)?.[1];
   if (verb) return verb.toUpperCase();

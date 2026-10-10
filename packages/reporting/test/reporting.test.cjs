@@ -699,7 +699,7 @@ test('PostgreSQL fingerprint report rejects suspicious historical raw SQL and un
   const input = fixture({ findings: [legacyFinding] });
   const base = { traceId: 'status-trace', profile: 'normal', startTimeUnixNano: '0', endTimeUnixNano: '5000000', attributes: { 'db.system': 'postgresql' } };
   const root = { ...base, spanId: 'root', parentSpanId: null, kind: 'server', name: 'GET /orders', startTimeUnixNano: '0', endTimeUnixNano: '100000000', attributes: { 'perflens.audit.run_id': runId, 'http.route': '/orders', 'http.request.method': 'GET' } };
-  const leakedLegacy = { ...base, spanId: 'db-legacy', parentSpanId: 'root', kind: 'client', name: 'pg.query', status: 'unset', attributes: { ...base.attributes, 'db.operation.name': 'SELECT secret-operation-value', 'db.query.sanitized': "select * from users where email = e'private\\'secret-value'" } };
+  const leakedLegacy = { ...base, spanId: 'db-legacy', parentSpanId: 'root', kind: 'client', name: 'pg.query', status: 'unset', attributes: { ...base.attributes, 'db.namespace': 'namespace-secret-value', 'db.operation.name': 'SELECT secret-operation-value', 'db.query.sanitized': "select * from users where email = e'private\\'secret-value'" } };
   input.evidence.traces = [root, leakedLegacy];
   input.analysis.traceSummary.requests = 1;
   input.analysis.traceSummary.databaseSpans = 1;
@@ -708,6 +708,7 @@ test('PostgreSQL fingerprint report rejects suspicious historical raw SQL and un
   for (const output of outputs) {
     assert.ok(!output.includes('secret-value'));
     assert.ok(!output.includes('secret-operation-value'));
+    assert.ok(!output.includes('namespace-secret-value'));
   }
   assert.match(JSON.stringify(model), /SQL details redacted/);
   const operation = model.postgresDiagnostics.operations[0];

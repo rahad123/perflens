@@ -101,17 +101,36 @@ export interface AnalysisResult {
 }
 
 export function normalizeSql(value: string): string {
-  // SQL arrives from OTel as untrusted text. Use a small lexer instead of
-  // sequential regex replacements: PostgreSQL permits nested comments,
-  // escaped E-strings, and tagged dollar-quoted strings, all of which can
-  // otherwise leave literal contents behind in persisted evidence.
-  let output = '';
+  // Privacy boundary: literal values and comments are always removed. We keep
+  // only bounded PostgreSQL identifier tokens in the shape because relation
+  // identity is needed for useful grouping; these can reveal schema names and
+  // must not contain customer values. Names outside this conservative grammar
+  // (including quoted identifiers with spaces/escapes) make the shape unusable.
+  // Database namespace is deliberately not part of this shape or persisted by
+  // the Tempo importer.
+  if (value.length > 16_384) return '';
+  const tokens: string[] = [];
+  const failClosed = () => '';
+  const codePointAt = (index: number) => String.fromCodePoint(value.codePointAt(index) ?? 0);
+  const stepAt = (index: number) => codePointAt(index).length;
+  const identifierStart = (char: string) => /[\p{L}_]/u.test(char);
+  const identifierPart = (char: string) => /[\p{L}\p{M}\p{N}_$]/u.test(char);
+  const operatorPart = (char: string) => /[+*/<>=~!@#%^&|`?:-]/.test(char);
+  const pushIdentifier = (identifier: string, quoted = false) => {
+    const normalized = identifier.normalize('NFC');
+    const characters = [...normalized];
+    if (Buffer.byteLength(normalized, 'utf8') > 63 || !identifierStart(characters[0] ?? '') || !characters.every(identifierPart)) return false;
+    // Unquoted identifiers fold to lower-case in PostgreSQL. A quoted,
+    // already-lowercase identifier has the same canonical form.
+    tokens.push(quoted && normalized !== normalized.toLowerCase() ? `"${normalized}"` : normalized.toLowerCase());
+    return true;
+  };
   let i = 0;
-  const isWord = (char: string | undefined) => char !== undefined && /[\p{L}\p{N}_$]/u.test(char);
   while (i < value.length) {
+    const char = value[i];
+    if (/\s/u.test(char)) { i++; continue; }
     if (value.startsWith('--', i)) {
       const newline = value.indexOf('\n', i + 2);
-      output += ' ';
       i = newline < 0 ? value.length : newline + 1;
       continue;
     }
@@ -123,11 +142,13 @@ export function normalizeSql(value: string): string {
         else if (value.startsWith('*/', i)) { depth--; i += 2; }
         else i++;
       }
-      output += ' ';
+      if (depth !== 0) return failClosed();
       continue;
     }
+    // E/N/B/X and U& string prefixes are syntax, not part of the literal shape.
+    const stringPrefix = value.slice(i).match(/^(?:[eEnNbBxX]|[uU]&)(?=')/);
+    if (stringPrefix) i += stringPrefix[0].length;
     if (value[i] === "'") {
-      output += '?';
       i++;
       let closed = false;
       while (i < value.length) {
@@ -136,28 +157,62 @@ export function normalizeSql(value: string): string {
         if (value[i] === "'") { i++; closed = true; break; }
         i++;
       }
-      // An unterminated string is malformed/incomplete evidence. Discard its
-      // remaining text rather than risk persisting part of a sensitive value.
-      if (!closed) i = value.length;
+      if (!closed) return failClosed();
+      tokens.push('?');
       continue;
     }
-    if (value[i] === '$') {
+    if (char === '"') {
+      i++;
+      let identifier = '';
+      let closed = false;
+      while (i < value.length) {
+        if (value[i] === '"' && value[i + 1] === '"') { identifier += '"'; i += 2; continue; }
+        if (value[i] === '"') { i++; closed = true; break; }
+        identifier += value[i++];
+      }
+      if (!closed || identifier.includes('"') || !pushIdentifier(identifier, true)) return failClosed();
+      continue;
+    }
+    if (char === '$') {
+      if (value.startsWith('$?', i)) { tokens.push('?'); i += 2; continue; }
       const delimiter = value.slice(i).match(/^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/)?.[0];
       if (delimiter) {
         const end = value.indexOf(delimiter, i + delimiter.length);
-        output += '?';
-        i = end < 0 ? value.length : end + delimiter.length;
-        continue;
+        if (end < 0) return failClosed();
+        tokens.push('?'); i = end + delimiter.length; continue;
+      }
+      const positional = value.slice(i).match(/^\$[0-9]+/)?.[0];
+      if (positional) {
+        i += positional.length;
+        if (i < value.length && identifierPart(codePointAt(i))) return failClosed();
+        tokens.push('?'); continue;
       }
     }
-    const previousIsWord = isWord(value[i - 1]) && !(value[i - 1] === '$' && !isWord(value[i - 2]));
-    if ((/[0-9]/.test(value[i]) || (value[i] === '.' && /[0-9]/.test(value[i + 1] ?? ''))) && !previousIsWord) {
-      const number = value.slice(i).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/)?.[0];
-      if (number) { output += '?'; i += number.length; continue; }
+    if (identifierStart(char)) {
+      const start = i;
+      i += stepAt(i);
+      while (i < value.length && identifierPart(codePointAt(i))) i += stepAt(i);
+      if (!pushIdentifier(value.slice(start, i))) return failClosed();
+      continue;
     }
-    output += value[i++];
+    if (/[0-9]/.test(char) || (char === '.' && /[0-9]/.test(value[i + 1] ?? ''))) {
+      const number = value.slice(i).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/)?.[0];
+      if (!number || identifierPart(value[i + number.length] ?? '')) return failClosed();
+      tokens.push('?'); i += number.length; continue;
+    }
+    if (operatorPart(char)) {
+      const start = i++;
+      while (i < value.length && operatorPart(value[i])) i++;
+      tokens.push(value.slice(start, i)); continue;
+    }
+    if ('(),.;[]{}'.includes(char)) { tokens.push(char); i++; continue; }
+    // Control characters and unrecognized Unicode punctuation are not safe to
+    // reinterpret with this deliberately small lexer.
+    if (char.codePointAt(0)! >= 0x20 && char.codePointAt(0)! <= 0x7e) return failClosed();
+    return failClosed();
   }
-  return output.toLowerCase().replace(/\s+/g, ' ').trim();
+  const shape = tokens.join(' ');
+  return shape.length <= 2048 ? shape : '';
 }
 
 export function sanitizeDependency(value: string): string {
