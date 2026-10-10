@@ -20,12 +20,14 @@ The audit command records what happened. The analysis command looks for specific
 - Docker-based OpenTelemetry Collector, Tempo, Prometheus, and Grafana, provisioned by the installed CLI.
 - k6-based bounded, concurrent profiles and immutable run directories.
 - Run/profile correlation headers for targets that capture the documented OpenTelemetry attributes.
-- Deterministic analysis of completed results and sanitized, correlated traces; Markdown and HTML audit reports from persisted findings.
+- Deterministic analysis of completed results and sanitized, correlated traces; Markdown and HTML audit reports from persisted findings and measured diagnostic coverage.
 - Two separate Node.js reference targets: NestJS and Express. Each has normal routes and isolated intentional slow-query, repeated-query, and external-call examples.
 
 The reference apps are integrations/test targets, not the PerfLens product or analysis architecture. The shared `@perflens/node-instrumentation` workspace package provides generic HTTP/PostgreSQL instrumentation and the PerfLens correlation contract. Express opts into its OpenTelemetry layer instrumentation. Only NestJS and Express are verified; other Node.js frameworks are not claimed as supported.
 
 Phase 3 analysis currently supports measured latency, error-rate, and throughput changes across comparable profiles, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. Profile comparison uses VUs only for the supported constant-VU model when endpoint, pacing, timeout, and test semantics match; otherwise it skips the comparison. Repeated-query detection is separate from impact severity, and dependency contribution is aggregated per request. Phase 4 formats saved findings as Markdown and HTML; it performs no new diagnosis or recommendations. See [analysis methodology](docs/analysis-methodology.md) and [reporting](docs/reporting.md).
+
+Reports also show measured HTTP status distributions by endpoint/profile and distinguish unavailable or uncollected evidence from zero observations. Prometheus scrapes supported target `/metrics` endpoints and powers the local dashboard, but these time series are not persisted as per-run snapshots; CPU, memory, container, Redis, and pool diagnostics are not claimed without saved evidence. See the [Phase 7.1 capability audit and roadmap](docs/diagnostics-capability-audit.md).
 
 ## Intended workflow
 
