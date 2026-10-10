@@ -435,11 +435,74 @@ test('resource diagnostics summarize run/profile-scoped process and container sa
   assert.match(html, /External memory peak/);
   assert.match(html, /<polyline/);
   assert.match(html, /UTC 12:00:00/);
-  assert.match(html, /Multiple process instances indicate a restart/);
+  assert.match(html, /Distinct process instances may be workers or restarts/);
+  assert.match(html, /not summed service totals/);
+  assert.match(html, /RSS window change is only available when evidence establishes one continuous process instance/);
   assert.match(html, /Process &lt;script&gt; evidence/);
   assert.doesNotMatch(html, /<script> evidence/);
   assert.match(markdown, /CPU & memory diagnostics/);
   assert.match(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process CPU').state, /available/);
+});
+
+test('resource summaries preserve process-lifetime identity, avoid cross-process growth, and label sample aggregation', () => {
+  const input = fixture();
+  const profile = input.profiles[0];
+  const baselineRunProfile = { ...profile.runProfile, name: 'baseline', result: 'results/baseline.json' };
+  const baselineResult = structuredClone(profile.result); baselineResult.profile = 'baseline';
+  input.profiles.unshift({ runProfile: baselineRunProfile, result: baselineResult });
+  input.run.profiles.unshift(baselineRunProfile);
+  const makeProcess = (name, pid, profileName, second, cpu, rss) => ({
+    schemaVersion: 1, runId, profile: profileName, timestamp: `2026-10-10T12:00:0${second}.000Z`, monotonicNs: String(second * 1e9),
+    source: 'node-process', processId: pid, processInstanceId: name, cpuUserMicros: 100, cpuSystemMicros: 100,
+    cpuPercentOneLogicalCpu: cpu, cpuNormalization: 'one-logical-cpu', rssBytes: rss, heapUsedBytes: rss / 2, heapTotalBytes: rss, externalBytes: 0,
+  });
+  input.resources = {
+    schemaVersion: 1, runId, samplingIntervalMs: 1000,
+    collection: { process: 'available', container: 'not-collected', processNote: 'samples', containerNote: 'not collected' },
+    processSamples: [
+      makeProcess('worker-a', 1, 'baseline', 0, 10, 100), makeProcess('worker-a', 1, 'baseline', 1, 20, 150),
+      makeProcess('worker-b', 2, 'baseline', 2, 20, 200), makeProcess('worker-b', 2, 'baseline', 3, 30, 250),
+      makeProcess('worker-c', 3, 'baseline', 4, 30, 300), makeProcess('worker-c', 3, 'baseline', 5, 40, 350),
+      // PID 1 is reused after a process restart; instance identity must keep the windows separate.
+      makeProcess('restarted-pid-1', 1, 'normal', 6, 40, 400), makeProcess('restarted-pid-1', 1, 'normal', 7, 50, 600),
+      makeProcess('reused-pid-1', 1, 'normal', 8, 60, 800), makeProcess('reused-pid-1', 1, 'normal', 9, 70, 1000),
+      { ...makeProcess('wrong-run', 99, 'baseline', 10, 999, 999), runId: 'pfl_20261010T120000000Z_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      makeProcess('wrong-profile', 100, 'stress', 11, 999, 999),
+    ],
+    containerSamples: [],
+  };
+  const model = build(input), html = renderHtml(model);
+  const baseline = model.resourceDiagnostics.profiles.find(item => item.profile === 'baseline');
+  const normal = model.resourceDiagnostics.profiles.find(item => item.profile === 'normal');
+  assert.equal(baseline.process.processInstances, 3);
+  assert.equal(baseline.process.cpuAveragePercent, 25);
+  assert.equal(baseline.process.cpuPeakPercent, 40);
+  assert.equal(baseline.process.rssAverageBytes, 225);
+  assert.equal(baseline.process.rssPeakBytes, 350);
+  assert.equal(baseline.process.rssGrowthBytes, null);
+  assert.equal(normal.process.processInstances, 2);
+  assert.equal(normal.process.rssAverageBytes, 700);
+  assert.equal(normal.process.rssPeakBytes, 1000);
+  assert.equal(normal.process.rssGrowthBytes, null, 'PID reuse must not be treated as process continuity');
+  assert.match(html, />3<\/td>/);
+  assert.match(html, /Unavailable \(2 process instances\)/);
+  assert.match(html, /not summed service totals/);
+  assert.match(html, /may be workers or restarts/);
+  assert.match(html, /RSS window change is only available when evidence establishes one continuous process instance/);
+  assert.match(html, /process 1 \(PID 1\)/);
+  assert.match(html, /process 2 \(PID 2\)/);
+  assert.match(html, /process 3 \(PID 3\)/);
+  assert.equal((html.match(/<polyline /g) ?? []).length, 15, 'each of five process lifetimes has separate CPU, RSS, and heap lines');
+  assert.match(html, /viewBox="0 0 900 /);
+  assert.match(html, /class="chart-legend"/);
+  assert.match(html, /resource-chart \.svg-wrap\{width:100%;min-width:0;overflow-x:auto/);
+  assert.match(html, /chart-legend li\{display:flex;align-items:flex-start;gap:7px;min-width:0;overflow-wrap:anywhere/);
+  for (const [, points] of html.matchAll(/<polyline[^>]*points="([^"]+)"/g)) {
+    for (const point of points.split(' ')) {
+      const [x, y] = point.split(',').map(Number);
+      assert.ok(x >= 54 && x <= 874 && y >= 18 && y <= 208, `SVG point ${point} remains inside the plot area`);
+    }
+  }
 });
 
 test('old runs without resources remain readable and resource coverage is not represented as zero', () => {

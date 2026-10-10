@@ -6,7 +6,7 @@ export type ProfileName = 'baseline' | 'normal' | 'peak' | 'stress';
 export type ResourceState = 'available' | 'partial' | 'unavailable' | 'not-collected' | 'insufficient-evidence';
 export interface ProcessSample {
   schemaVersion: 1; runId: string; profile: ProfileName; timestamp: string; monotonicNs: string;
-  source: 'node-process'; processId: number; cpuUserMicros: number; cpuSystemMicros: number;
+  source: 'node-process'; processId: number; processInstanceId?: string; cpuUserMicros: number | null; cpuSystemMicros: number | null;
   cpuPercentOneLogicalCpu: number | null; cpuNormalization: 'one-logical-cpu';
   rssBytes: number; heapUsedBytes: number; heapTotalBytes: number; externalBytes: number;
 }
@@ -21,7 +21,7 @@ export interface ResourceEvidence {
   processSamples: ProcessSample[]; containerSamples: ContainerSample[];
 }
 export interface ResourceProfileSummary {
-  profile: ProfileName; processSampleCount: number; processCpuAveragePercent: number | null; processCpuPeakPercent: number | null;
+  profile: ProfileName; processSampleCount: number; processInstances: number; processCpuAveragePercent: number | null; processCpuPeakPercent: number | null;
   rssAverageBytes: number | null; rssPeakBytes: number | null; rssGrowthBytes: number | null; heapUsedAverageBytes: number | null; heapUsedPeakBytes: number | null; heapTotalPeakBytes: number | null; externalPeakBytes: number | null;
   containerSampleCount: number; containerCpuAveragePercent: number | null; containerCpuPeakPercent: number | null;
   containerMemoryAverageBytes: number | null; containerMemoryPeakBytes: number | null; containerMemoryLimitBytes: number | null; containerMemoryPeakPercentOfLimit: number | null;
@@ -212,6 +212,7 @@ function validProcessSample(value: any, runId: string): value is ProcessSample {
   return value?.schemaVersion === 1 && value.runId === runId && typeof value.profile === 'string'
     && ['baseline', 'normal', 'peak', 'stress'].includes(value.profile) && typeof value.timestamp === 'string'
     && Number.isFinite(Date.parse(value.timestamp)) && Number.isInteger(value.processId)
+    && (value.processInstanceId === undefined || (typeof value.processInstanceId === 'string' && value.processInstanceId.length > 0 && value.processInstanceId.length <= 128))
     && Number.isFinite(value.rssBytes) && Number.isFinite(value.heapUsedBytes) && Number.isFinite(value.heapTotalBytes);
 }
 export function summarizeResourceProfiles(evidence: ResourceEvidence): ResourceProfileSummary[] {
@@ -224,12 +225,15 @@ export function summarizeResourceProfiles(evidence: ResourceEvidence): ResourceP
     const process = evidence.processSamples.filter(sample => sample.profile === profile);
     const container = evidence.containerSamples.filter(sample => sample.profile === profile);
     const orderedProcess = [...process].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    const processIds = new Set(process.map(sample => sample.processId));
+    // New samples identify a process lifetime, so PID reuse after a container restart
+    // cannot be mistaken for continuity. Older artifacts fall back to their recorded PID.
+    const processInstances = new Set(process.map(sample => sample.processInstanceId ?? `pid:${sample.processId}`));
     const memoryLimitRatios = container.flatMap(sample => sample.memoryUsedBytes !== null && sample.memoryLimitBytes !== null && sample.memoryLimitBytes > 0
       ? [sample.memoryUsedBytes / sample.memoryLimitBytes * 100] : []);
-    const rssGrowthBytes = processIds.size === 1 && orderedProcess.length >= 2 ? orderedProcess.at(-1)!.rssBytes - orderedProcess[0].rssBytes : null;
+    const hasProcessLifetimeIds = process.every(sample => typeof sample.processInstanceId === 'string');
+    const rssGrowthBytes = hasProcessLifetimeIds && processInstances.size === 1 && orderedProcess.length >= 2 ? orderedProcess.at(-1)!.rssBytes - orderedProcess[0].rssBytes : null;
     return {
-      profile, processSampleCount: process.length,
+      profile, processSampleCount: process.length, processInstances: processInstances.size,
       processCpuAveragePercent: cpuAverage(process.map(sample => sample.cpuPercentOneLogicalCpu)), processCpuPeakPercent: cpuMaximum(process.map(sample => sample.cpuPercentOneLogicalCpu)),
       rssAverageBytes: average(process.map(sample => sample.rssBytes)), rssPeakBytes: maximum(process.map(sample => sample.rssBytes)), rssGrowthBytes,
       heapUsedAverageBytes: average(process.map(sample => sample.heapUsedBytes)), heapUsedPeakBytes: maximum(process.map(sample => sample.heapUsedBytes)),

@@ -22,21 +22,29 @@ test('resource sampler persists timestamped process CPU and memory samples only 
   await writeFile(marker, JSON.stringify({ schemaVersion: 1, active: true, runId, profile: 'baseline', startedAt: new Date().toISOString() }));
   const stop = startProcessResourceSampler({ directory, intervalMs: 500 });
   t.after(stop);
-  await new Promise(resolve => setTimeout(resolve, 560));
+  await new Promise(resolve => setTimeout(resolve, 1100));
   await writeFile(marker, JSON.stringify({ schemaVersion: 1, active: true, runId, profile: 'normal', startedAt: new Date().toISOString() }));
-  await new Promise(resolve => setTimeout(resolve, 560));
+  await new Promise(resolve => setTimeout(resolve, 1100));
   stop();
   const rows = (await readFile(join(directory, `process-${runId}.ndjson`), 'utf8')).trim().split(/\r?\n/).map(line => JSON.parse(line));
   assert.ok(rows.some(row => row.profile === 'baseline'));
   assert.ok(rows.some(row => row.profile === 'normal'));
+  for (const profile of ['baseline', 'normal']) {
+    const profileRows = rows.filter(row => row.profile === profile);
+    assert.ok(profileRows.some(row => row.cpuPercentOneLogicalCpu === null), `${profile} boundary delta is unavailable`);
+    assert.ok(profileRows.some(row => row.cpuPercentOneLogicalCpu !== null), `${profile} has an uncontaminated CPU delta`);
+  }
   for (const row of rows) {
     assert.equal(row.runId, runId);
     assert.equal(row.source, 'node-process');
     assert.ok(Number.isFinite(Date.parse(row.timestamp)));
     assert.equal(row.cpuNormalization, 'one-logical-cpu');
     assert.ok(Number.isInteger(row.processId));
+    assert.equal(row.processId, process.pid, 'sample records the actual emitting Node process PID');
+    assert.match(row.processInstanceId, /^[0-9a-f-]{36}$/i);
     assert.ok(row.rssBytes > 0 && row.heapUsedBytes >= 0 && row.heapTotalBytes >= row.heapUsedBytes && row.externalBytes >= 0);
   }
+  assert.equal(new Set(rows.map(row => row.processInstanceId)).size, 1, 'one live Node process keeps one identity across profile markers');
 });
 
 test('maps valid PerfLens audit correlation headers without copying unrelated headers', () => {

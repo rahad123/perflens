@@ -47,6 +47,23 @@ test('resource profile summaries use persisted samples and keep absent values un
   assert.equal(summary.containerMemoryPeakPercentOfLimit, 60);
 });
 
+test('resource profile aggregation is sample-weighted and RSS continuity requires one process instance', () => {
+  const evidence = {
+    schemaVersion: 1, runId, samplingIntervalMs: 1000, collection: {},
+    processSamples: [
+      { profile: 'baseline', timestamp: '2026-10-10T12:00:00.000Z', processId: 11, processInstanceId: 'worker-a', cpuPercentOneLogicalCpu: 20, rssBytes: 100, heapUsedBytes: 50, heapTotalBytes: 80, externalBytes: 5 },
+      { profile: 'baseline', timestamp: '2026-10-10T12:00:01.000Z', processId: 12, processInstanceId: 'worker-b', cpuPercentOneLogicalCpu: 40, rssBytes: 300, heapUsedBytes: 150, heapTotalBytes: 180, externalBytes: 15 },
+    ], containerSamples: [],
+  };
+  const [summary] = summarizeResourceProfiles(evidence);
+  assert.equal(summary.processInstances, 2);
+  assert.equal(summary.processCpuAveragePercent, 30, 'CPU average is a mean of per-process samples, not a sum');
+  assert.equal(summary.processCpuPeakPercent, 40, 'peak is one observed process sample');
+  assert.equal(summary.rssAverageBytes, 200, 'RSS average is a mean of samples, not service memory total');
+  assert.equal(summary.rssPeakBytes, 300, 'RSS peak is one process sample');
+  assert.equal(summary.rssGrowthBytes, null, 'multiple process lifetimes are not joined into one growth window');
+});
+
 test('profile marker and raw resource evidence are persisted with run/profile attribution', async t => {
   const project = await mkdtemp(join(tmpdir(), 'perflens-resource-project-'));
   const runDirectory = join(project, '.perflens', 'runs', runId);
@@ -58,7 +75,7 @@ test('profile marker and raw resource evidence are persisted with run/profile at
   await collector.beginProfile('baseline');
   const marker = JSON.parse(await readFile(join(resourceDirectory, 'phase.json'), 'utf8'));
   assert.deepEqual([marker.runId, marker.profile, marker.active], [runId, 'baseline', true]);
-  const sample = { schemaVersion: 1, runId, profile: 'baseline', timestamp: new Date().toISOString(), monotonicNs: '10', source: 'node-process', processId: 42, cpuUserMicros: 500, cpuSystemMicros: 100, cpuPercentOneLogicalCpu: 12, cpuNormalization: 'one-logical-cpu', rssBytes: 1000, heapUsedBytes: 500, heapTotalBytes: 800, externalBytes: 100 };
+  const sample = { schemaVersion: 1, runId, profile: 'baseline', timestamp: new Date().toISOString(), monotonicNs: '10', source: 'node-process', processId: 42, processInstanceId: 'process-lifetime-42', cpuUserMicros: 500, cpuSystemMicros: 100, cpuPercentOneLogicalCpu: 12, cpuNormalization: 'one-logical-cpu', rssBytes: 1000, heapUsedBytes: 500, heapTotalBytes: 800, externalBytes: 100 };
   await writeFile(join(resourceDirectory, `process-${runId}.ndjson`), `${JSON.stringify(sample)}\n`);
   await collector.endProfile();
   const evidence = await collector.finalize(runDirectory);
@@ -66,6 +83,7 @@ test('profile marker and raw resource evidence are persisted with run/profile at
   assert.equal(evidence.runId, runId);
   assert.equal(evidence.collection.process, 'available');
   assert.deepEqual(evidence.processSamples.map(row => [row.runId, row.profile, row.processId]), [[runId, 'baseline', 42]]);
+  assert.equal(evidence.processSamples[0].processInstanceId, 'process-lifetime-42');
   assert.ok(JSON.parse(await readFile(join(runDirectory, 'resources', 'evidence.json'), 'utf8')));
 });
 

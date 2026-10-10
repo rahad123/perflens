@@ -170,9 +170,12 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   } else {
     write(`  Process metrics   ${resourceEvidence.collection.process}`);
     write(`  Container metrics ${resourceEvidence.collection.container}`);
+    write('  Node averages are means of process samples; peaks are single-process maxima, not summed service totals.');
+    write('  Distinct process instances may be workers or restarts; their role cannot be inferred from these samples.');
     for (const summary of summarizeResourceProfiles(resourceEvidence)) {
       if (summary.processSampleCount) {
-        write(`  Node ${summary.profile.padEnd(8)} CPU avg/peak ${cpuDisplay(summary.processCpuAveragePercent, summary.processCpuPeakPercent, summary.processSampleCount)} (one logical CPU) · RSS avg/peak ${mib(summary.rssAverageBytes)} / ${mib(summary.rssPeakBytes)} · heap used peak ${mib(summary.heapUsedPeakBytes)} · external peak ${mib(summary.externalPeakBytes)}${summary.rssGrowthBytes === null ? '' : ` · RSS window change ${mibDelta(summary.rssGrowthBytes)}`}`);
+        const growth = summary.rssGrowthBytes !== null ? ` · RSS window change ${mibDelta(summary.rssGrowthBytes)}` : summary.processSampleCount < 2 ? '' : summary.processInstances > 1 ? ' · RSS window change unavailable (multiple process instances)' : ' · RSS window change unavailable (process continuity not established)';
+        write(`  Node ${summary.profile.padEnd(8)} ${summary.processInstances} process instance(s) · CPU sample avg/peak ${cpuDisplay(summary.processCpuAveragePercent, summary.processCpuPeakPercent, summary.processSampleCount)} (one logical CPU) · RSS sample avg/per-process peak ${mib(summary.rssAverageBytes)} / ${mib(summary.rssPeakBytes)} · heap used peak ${mib(summary.heapUsedPeakBytes)} · external peak ${mib(summary.externalPeakBytes)}${growth}`);
       }
       if (summary.containerSampleCount) {
         const limit = summary.containerMemoryLimitBytes === null ? 'limit unavailable' : `limit ${mib(summary.containerMemoryLimitBytes)}`;
