@@ -1,11 +1,43 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mkdtemp, mkdir, writeFile, rm } = require('node:fs/promises');
+const { mkdtemp, mkdir, readFile, writeFile, rm } = require('node:fs/promises');
 const { join } = require('node:path');
 const { tmpdir } = require('node:os');
 const { readPerfLensCorrelation, configurePerfLensOtlpEndpoint, ProjectOtlpTraceExporter } = require('../dist/index.js');
+const { processCpuPercent, startProcessResourceSampler } = require('../dist/resources.js');
 
 const runId = 'pfl_20260930T120000000Z_123e4567-e89b-12d3-a456-426614174000';
+
+test('process CPU delta is normalized to one logical CPU and rejects invalid elapsed time', () => {
+  assert.equal(processCpuPercent(50_000, 0, 100_000_000n), 50);
+  assert.equal(processCpuPercent(25_000, 25_000, 100_000_000n), 50);
+  assert.equal(processCpuPercent(100, 0, 0n), null);
+  assert.equal(processCpuPercent(-1, 0, 10n), null);
+});
+
+test('resource sampler persists timestamped process CPU and memory samples only for active run/profile markers', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'perflens-process-resource-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const marker = join(directory, 'phase.json');
+  await writeFile(marker, JSON.stringify({ schemaVersion: 1, active: true, runId, profile: 'baseline', startedAt: new Date().toISOString() }));
+  const stop = startProcessResourceSampler({ directory, intervalMs: 500 });
+  t.after(stop);
+  await new Promise(resolve => setTimeout(resolve, 560));
+  await writeFile(marker, JSON.stringify({ schemaVersion: 1, active: true, runId, profile: 'normal', startedAt: new Date().toISOString() }));
+  await new Promise(resolve => setTimeout(resolve, 560));
+  stop();
+  const rows = (await readFile(join(directory, `process-${runId}.ndjson`), 'utf8')).trim().split(/\r?\n/).map(line => JSON.parse(line));
+  assert.ok(rows.some(row => row.profile === 'baseline'));
+  assert.ok(rows.some(row => row.profile === 'normal'));
+  for (const row of rows) {
+    assert.equal(row.runId, runId);
+    assert.equal(row.source, 'node-process');
+    assert.ok(Number.isFinite(Date.parse(row.timestamp)));
+    assert.equal(row.cpuNormalization, 'one-logical-cpu');
+    assert.ok(Number.isInteger(row.processId));
+    assert.ok(row.rssBytes > 0 && row.heapUsedBytes >= 0 && row.heapTotalBytes >= row.heapUsedBytes && row.externalBytes >= 0);
+  }
+});
 
 test('maps valid PerfLens audit correlation headers without copying unrelated headers', () => {
   assert.deepEqual(readPerfLensCorrelation({

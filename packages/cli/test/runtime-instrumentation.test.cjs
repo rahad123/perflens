@@ -28,6 +28,7 @@ async function fixture(t, { port = 4333, targetPort = 3400, services = ['api'], 
     `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://host.docker.internal:${port}/v1/traces`,
     'OTEL_SERVICE_NAME=fixture-api',
     'NODE_OPTIONS=--require /opt/perflens/runtime/perflens-preload.cjs',
+    'PERFLENS_RESOURCE_DIRECTORY=/tmp/perflens-resource',
     `PERFLENS_RUNTIME_BUNDLE_SHA256=${bundleHashOverride ?? bundleHash}`,
   ] : ['PATH=/usr/bin', ...(exporterEndpoint ? [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${exporterEndpoint}`] : [])];
   const run = async args => {
@@ -41,7 +42,7 @@ async function fixture(t, { port = 4333, targetPort = 3400, services = ['api'], 
       const overrideText = await fs.readFile(path.join(cwd, '.perflens/runtime/instrumentation.compose.yaml'), 'utf8');
       const injectedNodeOptions = /NODE_OPTIONS: "([^"]*)"/.exec(overrideText)?.[1];
       const injectedHash = /PERFLENS_RUNTIME_BUNDLE_SHA256: "([^"]+)"/.exec(overrideText)?.[1];
-      containerEnv = [`NODE_OPTIONS=${injectedNodeOptions}`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${endpoint}`, 'OTEL_SERVICE_NAME=fixture-api', `PERFLENS_RUNTIME_BUNDLE_SHA256=${injectedHash}`];
+      containerEnv = [`NODE_OPTIONS=${injectedNodeOptions}`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${endpoint}`, 'OTEL_SERVICE_NAME=fixture-api', 'PERFLENS_RESOURCE_DIRECTORY=/tmp/perflens-resource', `PERFLENS_RUNTIME_BUNDLE_SHA256=${injectedHash}`];
       return '';
     }
     return '';

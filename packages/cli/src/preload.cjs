@@ -11,3 +11,4 @@ const options = {
 };
 if (express) require('./express-instrumentation.cjs').startExpressInstrumentation(options);
 else require('./instrumentation.cjs').startNodeInstrumentation(options);
+require('./instrumentation.cjs').startProcessResourceSampler();

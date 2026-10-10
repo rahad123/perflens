@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { startExpressInstrumentation } from './express';
 import { startNodeInstrumentation } from './index';
+import { startProcessResourceSampler } from './resources';
 
 // Bundled by the CLI for temporary read-only delivery into consumer
 // containers. Resolve Express from the consumer's cwd; never bundle app deps.
@@ -16,3 +17,4 @@ const options = {
 
 if (isExpress) startExpressInstrumentation(options);
 else startNodeInstrumentation(options);
+startProcessResourceSampler({ directory: process.env.PERFLENS_RESOURCE_DIRECTORY });

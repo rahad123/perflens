@@ -310,7 +310,7 @@ function statusDistributionInput() {
 test('HTTP status diagnostics preserve per-endpoint counts for each profile and explain 429 without creating findings', () => {
   const { input, existingFinding } = statusDistributionInput();
   const model = build(input);
-  assert.equal(model.reportVersion, 3);
+  assert.equal(model.reportVersion, 4);
   assert.equal(model.diagnosticEvidence.schemaVersion, 1);
   assert.equal(model.findings.length, 1);
   assert.deepEqual(model.findings[0].evidence, existingFinding.evidence);
@@ -335,7 +335,7 @@ test('HTTP status diagnostics preserve per-endpoint counts for each profile and 
   }
   assert.match(html, /29[\s\S]*?200 OK[\s\S]*?21[\s\S]*?429 Too Many Requests/);
   assert.match(renderHtml(model), /<h2>Diagnostic coverage<\/h2>/);
-  assert.match(renderHtml(model), /CPU utilization[\s\S]*?Not collected/);
+  assert.match(renderHtml(model), /Node process CPU[\s\S]*?Not collected/);
 });
 
 test('empty, unavailable, inconsistent, and legacy status distributions are distinguished without inventing zeroes', () => {
@@ -383,6 +383,85 @@ test('diagnostic rendering escapes endpoint text and reports evidence coverage w
   assert.match(html, /analysis\/evidence\.json/);
   assert.deepEqual(model.findings, before);
   assert.equal(input.findingsArtifact.findings[0].metrics.arbitrary, 'unchanged');
+});
+
+test('resource diagnostics summarize run/profile-scoped process and container samples and render portable charts', () => {
+  const input = fixture();
+  const normalProfile = input.profiles[0];
+  const baselineRunProfile = { ...normalProfile.runProfile, name: 'baseline', result: 'results/baseline.json' };
+  const baselineResult = structuredClone(normalProfile.result);
+  baselineResult.profile = 'baseline';
+  input.profiles.unshift({ runProfile: baselineRunProfile, result: baselineResult });
+  input.run.profiles.unshift(baselineRunProfile);
+  const makeProcess = (profile, timestamp, cpu, rss, pid = 101) => ({ schemaVersion: 1, runId, profile, timestamp, monotonicNs: String(Date.parse(timestamp) * 1e6), source: 'node-process', processId: pid, cpuUserMicros: 1000, cpuSystemMicros: 500, cpuPercentOneLogicalCpu: cpu, cpuNormalization: 'one-logical-cpu', rssBytes: rss, heapUsedBytes: rss / 2, heapTotalBytes: rss * .75, externalBytes: 1024 });
+  const makeContainer = (profile, timestamp, cpu, memory, limit = null) => ({ schemaVersion: 1, runId, profile, timestamp, source: 'docker-container', container: 'api-service', dockerReportedCpuPercent: cpu, cpuNormalization: 'docker-stats-reported', hostLogicalCpus: 8, cpuQuotaCores: 1, memoryUsedBytes: memory, memoryLimitBytes: limit });
+  input.resources = {
+    schemaVersion: 1, runId, samplingIntervalMs: 1000,
+    collection: { process: 'available', container: 'available', processNote: 'Process <script> evidence', containerNote: 'Container evidence' },
+    processSamples: [
+      makeProcess('baseline', '2026-10-10T12:00:00.000Z', 10, 100 * 1024 * 1024),
+      makeProcess('baseline', '2026-10-10T12:00:01.000Z', 20, 110 * 1024 * 1024),
+      makeProcess('normal', '2026-10-10T12:00:02.000Z', 30, 120 * 1024 * 1024),
+      makeProcess('normal', '2026-10-10T12:00:03.000Z', 40, 140 * 1024 * 1024, 202),
+    ],
+    containerSamples: [
+      makeContainer('baseline', '2026-10-10T12:00:00.000Z', 5, 200 * 1024 * 1024, 512 * 1024 * 1024),
+      makeContainer('baseline', '2026-10-10T12:00:01.000Z', 7, 220 * 1024 * 1024, 512 * 1024 * 1024),
+      makeContainer('normal', '2026-10-10T12:00:02.000Z', 10, 300 * 1024 * 1024, 512 * 1024 * 1024),
+      makeContainer('normal', '2026-10-10T12:00:03.000Z', 15, 400 * 1024 * 1024, 512 * 1024 * 1024),
+    ],
+  };
+  const model = build(input), html = renderHtml(model), markdown = renderMarkdown(model);
+  assert.equal(model.resourceDiagnostics.schemaVersion, 1);
+  assert.equal(model.resourceDiagnostics.processState, 'available');
+  assert.equal(model.resourceDiagnostics.containerState, 'available');
+  const normal = model.resourceDiagnostics.profiles.find(item => item.profile === 'normal');
+  assert.equal(normal.process.cpuAveragePercent, 35);
+  assert.equal(normal.process.rssPeakBytes, 140 * 1024 * 1024);
+  assert.equal(normal.process.processInstances, 2);
+  assert.equal(normal.container.memoryPeakBytes, 400 * 1024 * 1024);
+  assert.equal(normal.container.memoryAverageBytes, 350 * 1024 * 1024);
+  assert.equal(normal.container.memoryLimitBytes, 512 * 1024 * 1024);
+  assert.equal(normal.container.memoryPeakPercentOfLimit, 78.125);
+  for (const profile of ['baseline', 'normal']) assert.match(html, new RegExp(`>${profile}<`));
+  assert.match(html, /CPU &amp; memory diagnostics/);
+  assert.match(html, /Node process CPU/);
+  assert.match(html, /Docker container memory/);
+  assert.match(html, /one logical CPU/);
+  assert.match(html, /Docker CPU is the value reported by Docker on its host logical CPU basis/);
+  assert.match(html, /Measured resource summaries by profile/);
+  assert.match(html, /78\.13%/);
+  assert.match(html, /Container memory avg/);
+  assert.match(html, /External memory peak/);
+  assert.match(html, /<polyline/);
+  assert.match(html, /UTC 12:00:00/);
+  assert.match(html, /Multiple process instances indicate a restart/);
+  assert.match(html, /Process &lt;script&gt; evidence/);
+  assert.doesNotMatch(html, /<script> evidence/);
+  assert.match(markdown, /CPU & memory diagnostics/);
+  assert.match(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process CPU').state, /available/);
+});
+
+test('old runs without resources remain readable and resource coverage is not represented as zero', () => {
+  const model = build(fixture());
+  assert.equal(model.reportVersion, 4);
+  assert.equal(model.resourceDiagnostics.state, 'not-collected');
+  assert.equal(model.resourceDiagnostics.processState, 'not-collected');
+  assert.equal(model.resourceDiagnostics.containerState, 'not-collected');
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process memory / heap').observations, null);
+  assert.match(renderHtml(model), /Process coverage: Not collected/);
+  assert.match(renderHtml(model), /not enough valid time samples to draw a chart/);
+  assert.doesNotMatch(renderHtml(model), /RSS peak[^<]*0\.0 MiB/);
+});
+
+test('one process sample reports memory observations but insufficient CPU evidence', () => {
+  const input = fixture();
+  input.resources = { schemaVersion: 1, runId, samplingIntervalMs: 1000, collection: { process: 'available', container: 'not-collected', processNote: 'one sample', containerNote: 'not collected' }, processSamples: [{ schemaVersion: 1, runId, profile: 'normal', timestamp: '2026-10-10T12:00:00.000Z', monotonicNs: '1', source: 'node-process', processId: 7, cpuUserMicros: 0, cpuSystemMicros: 0, cpuPercentOneLogicalCpu: null, cpuNormalization: 'one-logical-cpu', rssBytes: 80 * 1024 * 1024, heapUsedBytes: 30 * 1024 * 1024, heapTotalBytes: 60 * 1024 * 1024, externalBytes: 1 }], containerSamples: [] };
+  const model = build(input);
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process CPU').state, 'insufficient-evidence');
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process memory / heap').state, 'available');
+  assert.equal(model.resourceDiagnostics.profiles[0].process.rssPeakBytes, 80 * 1024 * 1024);
+  assert.equal(model.resourceDiagnostics.profiles[0].process.cpuAveragePercent, null);
 });
 
 test('HTML comparison visualizations use only measured percentiles and conditionally show component evidence', () => {
@@ -445,7 +524,7 @@ test('Markdown evidence cannot inject table rows, headings, raw HTML, or links',
   const markdown = renderMarkdown(model);
   assert.ok(markdown.includes('cell \\| injected \\| fake \\| row \\# heading \\<script\\>alert(1)\\</script\\> \\[click\\](javascript:alert(1))'));
   assert.equal((markdown.match(/^\| fake \| row$/gm) ?? []).length, 0);
-  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 2);
+  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 3);
   assert.ok(!markdown.includes('<script>alert(1)</script>'));
 });
 
