@@ -435,7 +435,7 @@ test('resource diagnostics summarize run/profile-scoped process and container sa
   assert.match(html, /External memory peak/);
   assert.match(html, /<polyline/);
   assert.match(html, /UTC 12:00:00/);
-  assert.match(html, /Distinct process instances may be workers or restarts/);
+  assert.match(html, /Distinct PIDs or process-lifetime IDs are observed identities/);
   assert.match(html, /not summed service totals/);
   assert.match(html, /RSS window change is only available when evidence establishes one continuous process instance/);
   assert.match(html, /Process &lt;script&gt; evidence/);
@@ -485,9 +485,9 @@ test('resource summaries preserve process-lifetime identity, avoid cross-process
   assert.equal(normal.process.rssPeakBytes, 1000);
   assert.equal(normal.process.rssGrowthBytes, null, 'PID reuse must not be treated as process continuity');
   assert.match(html, />3<\/td>/);
-  assert.match(html, /Unavailable \(2 process instances\)/);
+  assert.match(html, /Unavailable \(2 process identities\)/);
   assert.match(html, /not summed service totals/);
-  assert.match(html, /may be workers or restarts/);
+  assert.match(html, /may represent workers or restarts/);
   assert.match(html, /RSS window change is only available when evidence establishes one continuous process instance/);
   assert.match(html, /process 1 \(PID 1\)/);
   assert.match(html, /process 2 \(PID 2\)/);
