@@ -56,6 +56,8 @@ export interface SanitizedSpan {
   kind: 'server' | 'client' | 'internal' | 'producer' | 'consumer' | 'unknown';
   startTimeUnixNano: string;
   endTimeUnixNano: string;
+  /** Optional for compatibility with historical evidence; message text is never persisted. */
+  status?: 'error' | 'ok' | 'unset';
   attributes: Record<string, string | number | boolean>;
 }
 
@@ -99,14 +101,118 @@ export interface AnalysisResult {
 }
 
 export function normalizeSql(value: string): string {
-  return value.toLowerCase()
-    .replace(/--[^\n]*/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/'(?:''|[^'])*'/g, '?')
-    .replace(/\$\$[\s\S]*?\$\$/g, '?')
-    .replace(/\$[a-zA-Z_][a-zA-Z0-9_]*\$[\s\S]*?\$[a-zA-Z_][a-zA-Z0-9_]*\$/g, '?')
-    .replace(/\b\d+(?:\.\d+)?\b/g, '?')
-    .replace(/\s+/g, ' ').trim();
+  // Privacy boundary: literal values and comments are always removed. We keep
+  // only bounded PostgreSQL identifier tokens in the shape because relation
+  // identity is needed for useful grouping; these can reveal schema names and
+  // must not contain customer values. Names outside this conservative grammar
+  // (including quoted identifiers with spaces/escapes) make the shape unusable.
+  // Database namespace is deliberately not part of this shape or persisted by
+  // the Tempo importer.
+  if (value.length > 16_384) return '';
+  const tokens: string[] = [];
+  const failClosed = () => '';
+  const codePointAt = (index: number) => String.fromCodePoint(value.codePointAt(index) ?? 0);
+  const stepAt = (index: number) => codePointAt(index).length;
+  const identifierStart = (char: string) => /[\p{L}_]/u.test(char);
+  const identifierPart = (char: string) => /[\p{L}\p{M}\p{N}_$]/u.test(char);
+  const operatorPart = (char: string) => /[+*/<>=~!@#%^&|`?:-]/.test(char);
+  const pushIdentifier = (identifier: string, quoted = false) => {
+    const normalized = identifier.normalize('NFC');
+    const characters = [...normalized];
+    if (Buffer.byteLength(normalized, 'utf8') > 63 || !identifierStart(characters[0] ?? '') || !characters.every(identifierPart)) return false;
+    // Unquoted identifiers fold to lower-case in PostgreSQL. A quoted,
+    // already-lowercase identifier has the same canonical form.
+    tokens.push(quoted && normalized !== normalized.toLowerCase() ? `"${normalized}"` : normalized.toLowerCase());
+    return true;
+  };
+  let i = 0;
+  while (i < value.length) {
+    const char = value[i];
+    if (/\s/u.test(char)) { i++; continue; }
+    if (value.startsWith('--', i)) {
+      const newline = value.indexOf('\n', i + 2);
+      i = newline < 0 ? value.length : newline + 1;
+      continue;
+    }
+    if (value.startsWith('/*', i)) {
+      let depth = 1;
+      i += 2;
+      while (i < value.length && depth > 0) {
+        if (value.startsWith('/*', i)) { depth++; i += 2; }
+        else if (value.startsWith('*/', i)) { depth--; i += 2; }
+        else i++;
+      }
+      if (depth !== 0) return failClosed();
+      continue;
+    }
+    // E/N/B/X and U& string prefixes are syntax, not part of the literal shape.
+    const stringPrefix = value.slice(i).match(/^(?:[eEnNbBxX]|[uU]&)(?=')/);
+    if (stringPrefix) i += stringPrefix[0].length;
+    if (value[i] === "'") {
+      i++;
+      let closed = false;
+      while (i < value.length) {
+        if (value[i] === '\\' && i + 1 < value.length) { i += 2; continue; }
+        if (value[i] === "'" && value[i + 1] === "'") { i += 2; continue; }
+        if (value[i] === "'") { i++; closed = true; break; }
+        i++;
+      }
+      if (!closed) return failClosed();
+      tokens.push('?');
+      continue;
+    }
+    if (char === '"') {
+      i++;
+      let identifier = '';
+      let closed = false;
+      while (i < value.length) {
+        if (value[i] === '"' && value[i + 1] === '"') { identifier += '"'; i += 2; continue; }
+        if (value[i] === '"') { i++; closed = true; break; }
+        identifier += value[i++];
+      }
+      if (!closed || identifier.includes('"') || !pushIdentifier(identifier, true)) return failClosed();
+      continue;
+    }
+    if (char === '$') {
+      if (value.startsWith('$?', i)) { tokens.push('?'); i += 2; continue; }
+      const delimiter = value.slice(i).match(/^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/)?.[0];
+      if (delimiter) {
+        const end = value.indexOf(delimiter, i + delimiter.length);
+        if (end < 0) return failClosed();
+        tokens.push('?'); i = end + delimiter.length; continue;
+      }
+      const positional = value.slice(i).match(/^\$[0-9]+/)?.[0];
+      if (positional) {
+        i += positional.length;
+        if (i < value.length && identifierPart(codePointAt(i))) return failClosed();
+        tokens.push('?'); continue;
+      }
+    }
+    if (identifierStart(char)) {
+      const start = i;
+      i += stepAt(i);
+      while (i < value.length && identifierPart(codePointAt(i))) i += stepAt(i);
+      if (!pushIdentifier(value.slice(start, i))) return failClosed();
+      continue;
+    }
+    if (/[0-9]/.test(char) || (char === '.' && /[0-9]/.test(value[i + 1] ?? ''))) {
+      const number = value.slice(i).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/)?.[0];
+      if (!number || identifierPart(value[i + number.length] ?? '')) return failClosed();
+      tokens.push('?'); i += number.length; continue;
+    }
+    if (operatorPart(char)) {
+      const start = i++;
+      while (i < value.length && operatorPart(value[i])) i++;
+      tokens.push(value.slice(start, i)); continue;
+    }
+    if ('(),.;[]{}'.includes(char)) { tokens.push(char); i++; continue; }
+    // Control characters and unrecognized Unicode punctuation are not safe to
+    // reinterpret with this deliberately small lexer.
+    if (char.codePointAt(0)! >= 0x20 && char.codePointAt(0)! <= 0x7e) return failClosed();
+    return failClosed();
+  }
+  const shape = tokens.join(' ');
+  return shape.length <= 2048 ? shape : '';
 }
 
 export function sanitizeDependency(value: string): string {
@@ -452,6 +558,7 @@ export function validateEvidence(evidence: AnalysisEvidence): void {
     if (!span || !span.traceId || !span.spanId || !span.profile || !evidence.profiles.some(profile => profile.profile === span.profile) || !['server', 'client', 'internal', 'producer', 'consumer', 'unknown'].includes(span.kind)) throw new Error('Malformed normalized trace span evidence.');
     try { if (BigInt(span.endTimeUnixNano) < BigInt(span.startTimeUnixNano)) throw new Error(); } catch { throw new Error('Malformed normalized trace span timestamps.'); }
     if (!span.attributes || typeof span.attributes !== 'object') throw new Error('Malformed normalized trace span attributes.');
+    if (span.status !== undefined && !['error', 'ok', 'unset'].includes(span.status)) throw new Error('Malformed normalized trace span status.');
     if (span.kind === 'server' && span.attributes['perflens.audit.run_id'] !== undefined && span.attributes['perflens.audit.run_id'] !== evidence.runId) throw new Error('Trace snapshot contains server spans from another audit run.');
   }
 }

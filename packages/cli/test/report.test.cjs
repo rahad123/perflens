@@ -41,7 +41,7 @@ test('report integration loads finalized artifacts and writes normalized JSON, M
     const json = JSON.parse(await fs.readFile(path.join(dir, 'report/report.json'), 'utf8'));
     const md = await fs.readFile(path.join(dir, 'report/report.md'), 'utf8');
     const html = await fs.readFile(path.join(dir, 'report/report.html'), 'utf8');
-    assert.equal(json.reportVersion, 4);
+    assert.equal(json.reportVersion, 5);
     assert.equal(json.diagnosticEvidence.schemaVersion, 1);
     assert.match(html, /Diagnostic coverage/);
     assert.match(md, /Repeated database operation/);

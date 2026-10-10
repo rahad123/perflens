@@ -25,6 +25,33 @@ export interface DiagnosticEvidence {
   httpStatusProfiles: HttpStatusEvidence[];
   coverage: { diagnostic: string; state: DiagnosticCoverageState; observations: number | null; source: string | null; note: string }[];
 }
+export interface PostgresOperationEvidence {
+  profile: string; target: { method: string; path: string } | null;
+  traceId: string; spanId: string; parentSpanId: string | null;
+  correlation: 'parent-chain' | 'trace-only' | 'ambiguous' | 'unmatched';
+  operation: string; fingerprint: string | null; durationMs: number | null;
+  status: 'error' | 'ok' | 'unset' | 'unknown';
+}
+export interface PostgresRepeatedPattern {
+  fingerprint: string; traces: number; maxExecutionsPerTrace: number; sampleTraceIds: string[];
+}
+export interface PostgresOperationSummary {
+  operation: string; fingerprint: string | null; count: number; averageDurationMs: number | null; p95DurationMs: number | null; maxDurationMs: number | null; traces: number;
+}
+export interface PostgresEndpointDiagnostics {
+  target: { method: string; path: string }; requests: number; requestsWithPostgres: number; operations: number;
+  averageOperationsPerRequest: number | null; maxOperationsPerRequest: number | null; summedSpanDurationMs: number | null;
+  overlappingSpansPossible: true; operationSummaries: PostgresOperationSummary[]; slowest: PostgresOperationEvidence[];
+  repeatedPatterns: PostgresRepeatedPattern[];
+}
+export interface PostgresDiagnostics {
+  schemaVersion: 1;
+  operations: PostgresOperationEvidence[];
+  profiles: { profile: string; endpoints: PostgresEndpointDiagnostics[] }[];
+  errors: PostgresOperationEvidence[];
+  coverage: { diagnostic: string; state: DiagnosticCoverageState; observations: number | null; source: string | null; note: string }[];
+  recommendations: string[];
+}
 export interface ResourceSample {
   profile: string; timestamp: string; source: 'node-process' | 'docker-container';
   processId: number | null; processInstanceId: string | null;
@@ -42,7 +69,7 @@ export interface ResourceDiagnostics {
   samplingIntervalMs: number | null; profiles: ResourceProfileSummary[]; samples: ResourceSample[]; processNote: string; containerNote: string;
 }
 export interface ReportModel {
-  schemaVersion: 1; perflensVersion: string; reportVersion: 4; generatedAt: string;
+  schemaVersion: 1; perflensVersion: string; reportVersion: 5; generatedAt: string;
   run: { id: string; target: string; method: string; path: string; endpoints: { method: string; path: string }[]; startedAt: string; completedAt: string; serviceName: string; loadEngine: { name: string | null; version: string | null } };
   workload: { profiles: ReportProfile[] };
   performanceSummary: { profiles: ReportProfile[] };
@@ -51,6 +78,7 @@ export interface ReportModel {
   findings: ReportFinding[];
   evidenceSummary: { requestTraces: number | null; databaseSpans: number | null; externalHttpSpans: number | null; traceAvailable: boolean; snapshotTraceCount: number | null; snapshotSpanCount: number | null; snapshotTruncated: boolean | null; profiles: string[] };
   diagnosticEvidence: DiagnosticEvidence;
+  postgresDiagnostics: PostgresDiagnostics;
   resourceDiagnostics: ResourceDiagnostics;
   limitations: string[];
 }
@@ -65,7 +93,13 @@ function safeText(value: unknown): string {
     .replace(/\b((?:https?|postgres(?:ql)?|redis|rediss):\/\/)([^/\s?#@]*:[^/\s?#@]*@)/gi, '$1[REDACTED]@')
     .replace(/([?&](?:api[_-]?key|access[_-]?token|password|passwd|secret|token|client[_-]?secret|auth(?:orization)?)=)[^&#\s"'<>]*/gi, '$1[REDACTED]')
     .replace(/\b(password|passwd|token|secret|api[_-]?key)\s*[=:]\s*(['"])[^'"]*\2/gi, '$1=[REDACTED]')
-    .replace(/\b(?:select|insert|update|delete)\b[\s\S]*/i, match => match.replace(/'(?:''|[^'])*'|\$[A-Za-z_0-9]*\$[\s\S]*?\$[A-Za-z_0-9]*\$/g, '?'));
+    .replace(/\b(?:select|insert|update|delete)\b[\s\S]*/i, match => {
+      // Historical findings may contain query fingerprints produced before
+      // the SQL lexer was hardened. If literal/comment delimiters remain,
+      // suppress the query text rather than risk leaking an unparsed tail.
+      if (match.includes("'") || match.includes('--') || match.includes('/*') || match.includes('*/') || /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.test(match)) return '[SQL details redacted]';
+      return match.replace(/(?<![\p{L}\p{N}_$])(?:\$\d+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)(?![\p{L}\p{N}_$])/giu, '?');
+    });
 }
 function sanitize(value: unknown): any {
   if (Array.isArray(value)) return value.map(sanitize);
@@ -216,7 +250,6 @@ function buildDiagnosticEvidence(profiles: ReportProfile[], endpoints: { method:
   });
   const traceAvailable = Boolean(analysis.availability?.traces);
   const traces = traceAvailable ? finiteOrNull(analysis.traceSummary?.requests) : null;
-  const db = traceAvailable ? finiteOrNull(analysis.traceSummary?.databaseSpans) : null;
   const external = traceAvailable ? finiteOrNull(analysis.traceSummary?.externalClientSpans) : null;
   const redisSpans = traceAvailable && Array.isArray(evidence.traces) ? evidence.traces.filter((span: any) => String(span.attributes?.['db.system'] ?? '').toLowerCase() === 'redis').length : null;
   const observedState = (count: number | null): DiagnosticCoverageState => count === null ? 'unavailable' : count > 0 ? 'available' : 'no-observations';
@@ -224,16 +257,173 @@ function buildDiagnosticEvidence(profiles: ReportProfile[], endpoints: { method:
     { diagnostic: 'HTTP status distribution', state: statusState, observations: statusRows.some(row => row.statusCount !== null) ? statusRows.reduce((total, row) => total + (row.statusCount ?? 0), 0) : null, source: statusRows.length ? 'results/<profile>.json' : null, note: statusState === 'not-persisted' ? 'This run does not contain persisted status counts.' : statusState === 'incomplete' || statusState === 'partial' ? 'Some profile or endpoint status counts are missing or do not match request totals.' : 'Counts come from k6 HTTP response samples; status 0 represents a transport failure.' },
     { diagnostic: 'Endpoint request measurements', state: endpointMeasurementsComplete ? 'available' : profiles.length && profiles.every(profile => Array.isArray((profile.metrics as any).endpointResults)) ? 'partial' : 'not-persisted', observations: endpointMeasurementsComplete ? profiles.length * endpoints.length : null, source: 'results/<profile>.json', note: endpointMeasurementsComplete ? 'Counts, status distributions, and latency percentiles are scoped to each endpoint/profile.' : 'Some older runs contain only profile-aggregate measurements; aggregate values are not assigned to individual endpoints.' },
     { diagnostic: 'Correlated request spans', state: observedState(traces), observations: traces, source: 'analysis/evidence.json', note: traces === null ? 'Trace evidence was unavailable for analysis.' : traces > 0 ? 'Run/profile-correlated server spans were persisted.' : 'No correlated request spans were observed in the persisted snapshot.' },
-    { diagnostic: 'PostgreSQL operation spans', state: observedState(db), observations: db, source: 'analysis/evidence.json', note: db === null ? 'Trace evidence was unavailable.' : db > 0 ? 'PostgreSQL spans were observed in correlated traces.' : 'No PostgreSQL spans were observed; this does not establish whether the endpoint used a database.' },
     { diagnostic: 'External HTTP spans', state: observedState(external), observations: external, source: 'analysis/evidence.json', note: external === null ? 'Trace evidence was unavailable.' : external > 0 ? 'External HTTP client spans were observed in correlated traces.' : 'No external HTTP spans were observed in the persisted snapshot.' },
     { diagnostic: 'Redis operation spans', state: redisSpans === null ? 'unavailable' : redisSpans > 0 ? 'available' : 'no-observations', observations: redisSpans, source: traceAvailable ? 'analysis/evidence.json' : null, note: redisSpans === null ? 'Trace evidence was unavailable.' : redisSpans > 0 ? 'Spans with db.system=redis were found; they are not analyzed by current Phase 3 rules.' : 'No spans declaring db.system=redis were found; PerfLens does not infer that Redis was not used.' },
     { diagnostic: 'Node process CPU', state: resourceStateFor(resources, 'node-process', 'cpu'), observations: resources.samples.filter(sample => sample.source === 'node-process' && sample.cpuPercent !== null).length || null, source: 'resources/evidence.json', note: resources.processNote || 'Process CPU is normalized to one logical CPU, not host-wide utilization.' },
     { diagnostic: 'Node process memory / heap', state: resourceStateFor(resources, 'node-process', 'memory'), observations: resources.samples.filter(sample => sample.source === 'node-process' && sample.rssBytes !== null).length || null, source: 'resources/evidence.json', note: resources.processNote || 'RSS, heap, and external memory are Node process measurements.' },
     { diagnostic: 'Docker container CPU', state: resourceStateFor(resources, 'docker-container', 'cpu'), observations: resources.samples.filter(sample => sample.source === 'docker-container' && sample.cpuPercent !== null).length || null, source: 'resources/evidence.json', note: resources.containerNote || 'Docker stats CPU is reported on its host logical CPU basis; it is not compared directly with process CPU.' },
     { diagnostic: 'Docker container memory', state: resourceStateFor(resources, 'docker-container', 'memory'), observations: resources.samples.filter(sample => sample.source === 'docker-container' && sample.memoryUsedBytes !== null).length || null, source: 'resources/evidence.json', note: resources.containerNote || 'Memory limit is shown only when Docker reports a configured limit.' },
-    { diagnostic: 'Connection-pool metrics', state: 'not-collected', observations: null, source: null, note: 'Pool metrics are not part of the persisted audit evidence.' },
   ];
   return { schemaVersion: 1, httpStatusProfiles, coverage };
+}
+function postgresDuration(span: any): number | null {
+  try {
+    const start = BigInt(span.startTimeUnixNano), end = BigInt(span.endTimeUnixNano);
+    if (end < start) return null;
+    const duration = Number(end - start) / 1e6;
+    return Number.isFinite(duration) ? duration : null;
+  } catch { return null; }
+}
+function postgresFingerprint(span: any): string | null {
+  const raw = span.attributes?.['db.query.sanitized'];
+  if (typeof raw !== 'string' || raw.length > 2048) return null;
+  // Older persisted evidence may contain tails left by regex redaction around
+  // escaped strings or nested comments. Refuse suspicious fingerprints rather
+  // than exposing questionable text in a report.
+  if (raw.includes("'") || raw.includes('--') || raw.includes('/*') || raw.includes('*/') || /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.test(raw)) return null;
+  const normalized = safeText(raw).replace(/\s+/g, ' ').trim().toLowerCase();
+  // Query shapes must identify a relation; bare verbs are insufficient to equate operations.
+  return /\bselect\b[\s\S]*\bfrom\s+[\w".]+|\binsert\s+into\s+[\w".]+|\bupdate\s+[\w".]+|\bdelete\s+from\s+[\w".]+/.test(normalized) ? normalized : null;
+}
+const SAFE_POSTGRES_OPERATIONS = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'CALL', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'BEGIN', 'COMMIT', 'ROLLBACK', 'EXPLAIN', 'EXECUTE', 'PREPARE', 'DEALLOCATE', 'SET', 'SHOW', 'COPY', 'LOCK', 'REFRESH', 'VACUUM', 'ANALYZE', 'QUERY']);
+function postgresOperation(span: any): string {
+  const tagged = span.attributes?.['db.operation.name'];
+  if (typeof tagged === 'string' && SAFE_POSTGRES_OPERATIONS.has(tagged.toUpperCase())) return tagged.toUpperCase();
+  const fingerprint = postgresFingerprint(span);
+  const verb = fingerprint?.match(/^(select|insert|update|delete|with)\b/i)?.[1];
+  if (verb) return verb.toUpperCase();
+  const name = typeof span.name === 'string' ? span.name : '';
+  if (/^pg\.query:/i.test(name)) return 'QUERY';
+  return 'DATABASE OPERATION';
+}
+function percentileMs(values: number[], p: number): number | null {
+  if (values.length < 5) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)] ?? null;
+}
+function buildPostgresDiagnostics(profiles: ReportProfile[], endpoints: { method: string; path: string }[], evidence: any, analysis: any): PostgresDiagnostics {
+  const traceAvailable = Boolean(analysis.availability?.traces) && Array.isArray(evidence.traces);
+  const spans: any[] = traceAvailable ? evidence.traces : [];
+  const roots = spans.filter(span => span.kind === 'server' && span.attributes?.['perflens.audit.run_id'] === evidence.runId && typeof span.attributes?.['http.route'] === 'string');
+  const rootsByTrace = new Map<string, any[]>();
+  for (const root of roots) rootsByTrace.set(root.traceId, [...(rootsByTrace.get(root.traceId) ?? []), root]);
+  const spanMaps = new Map<string, Map<string, any>>();
+  for (const span of spans) {
+    const map = spanMaps.get(span.traceId) ?? new Map<string, any>();
+    if (span.spanId) map.set(span.spanId, span);
+    spanMaps.set(span.traceId, map);
+  }
+  const matchesEndpoint = (root: any, endpoint: { method: string; path: string }) => {
+    const route = safeEndpointPath(root.attributes?.['http.route']);
+    const method = String(root.attributes?.['http.request.method'] ?? root.attributes?.['http.method'] ?? 'GET').toUpperCase();
+    return route === endpoint.path && method === endpoint.method;
+  };
+  const dbSpans = spans.filter(span => span.kind !== 'server' && (String(span.attributes?.['db.system'] ?? '').toLowerCase() === 'postgresql' || String(span.attributes?.['db.system'] ?? '').toLowerCase() === 'postgres' || /^pg\./i.test(String(span.name ?? ''))));
+  const operations: PostgresOperationEvidence[] = dbSpans.map(span => {
+    const traceRoots = (rootsByTrace.get(span.traceId) ?? []).filter(root => root.profile === span.profile);
+    let ancestor: any = null, parentId = span.parentSpanId, depth = 0;
+    const seen = new Set<string>(); const byId = spanMaps.get(span.traceId);
+    while (parentId && byId?.has(parentId) && !seen.has(parentId)) {
+      seen.add(parentId); depth++;
+      const parent = byId.get(parentId);
+      if (parent.kind === 'server' && parent.attributes?.['perflens.audit.run_id'] === evidence.runId && parent.profile === span.profile) { ancestor = parent; break; }
+      parentId = parent.parentSpanId;
+    }
+    let root = ancestor;
+    let correlation: PostgresOperationEvidence['correlation'] = ancestor ? 'parent-chain' : 'unmatched';
+    if (!ancestor && traceRoots.length === 1) { root = traceRoots[0]; correlation = 'trace-only'; }
+    else if (!ancestor && traceRoots.length > 1) correlation = 'ambiguous';
+    const target = root ? endpoints.find(endpoint => matchesEndpoint(root, endpoint)) ?? null : null;
+    const durationMs = postgresDuration(span);
+    const fingerprint = postgresFingerprint(span);
+    return {
+      profile: safeText(span.profile), target, traceId: safeText(span.traceId), spanId: safeText(span.spanId),
+      parentSpanId: typeof span.parentSpanId === 'string' ? safeText(span.parentSpanId) : null,
+      correlation: target ? correlation : correlation === 'unmatched' ? 'unmatched' : correlation,
+      operation: safeText(postgresOperation(span)), fingerprint, durationMs,
+      status: ['error', 'ok', 'unset'].includes(span.status) ? span.status : 'unknown',
+    };
+  });
+  const profileRows: PostgresDiagnostics['profiles'] = [];
+  for (const profile of profiles) {
+    const endpointRows: PostgresEndpointDiagnostics[] = [];
+    for (const endpoint of endpoints) {
+    const requestRoots = roots.filter(root => root.profile === profile.name && matchesEndpoint(root, endpoint));
+    const perRequest = requestRoots.map(root => {
+      const related = operations.filter(operation => operation.profile === profile.name && operation.target?.method === endpoint.method && operation.target.path === endpoint.path && operation.traceId === root.traceId && (operation.correlation === 'parent-chain' || operation.correlation === 'trace-only'));
+      return { root, related };
+    });
+    const selected = operations.filter(operation => operation.profile === profile.name && operation.target?.method === endpoint.method && operation.target.path === endpoint.path);
+    const counts = new Map<string, Map<string, number>>();
+    for (const request of perRequest) for (const operation of request.related) if (operation.fingerprint) {
+      const current = counts.get(operation.fingerprint) ?? new Map<string, number>();
+      current.set(request.root.traceId, (current.get(request.root.traceId) ?? 0) + 1);
+      counts.set(operation.fingerprint, current);
+    }
+    const patternByFingerprint = new Map<string, { traces: Set<string>; max: number; traceIds: Set<string> }>();
+    for (const [fingerprint, traceCounts] of counts) {
+      const item = patternByFingerprint.get(fingerprint) ?? { traces: new Set<string>(), max: 0, traceIds: new Set<string>() };
+      for (const [traceId, count] of traceCounts) if (count >= 5) {
+        item.traces.add(traceId); item.traceIds.add(traceId); item.max = Math.max(item.max, count);
+      }
+      if (item.traces.size) patternByFingerprint.set(fingerprint, item);
+    }
+    const repeatedPatterns = [...patternByFingerprint].map(([fingerprint, item]) => ({
+      fingerprint, traces: item.traces.size, maxExecutionsPerTrace: item.max,
+      sampleTraceIds: [...item.traceIds].sort().slice(0, 5),
+    })).sort((a, b) => b.traces - a.traces || b.maxExecutionsPerTrace - a.maxExecutionsPerTrace || a.fingerprint.localeCompare(b.fingerprint));
+    const durations = selected.map(item => item.durationMs).filter((item): item is number => item !== null);
+    const operationGroups = new Map<string, PostgresOperationEvidence[]>();
+    for (const operation of selected) {
+      const groupKey = operation.fingerprint ?? `operation:${operation.operation}`;
+      operationGroups.set(groupKey, [...(operationGroups.get(groupKey) ?? []), operation]);
+    }
+    const operationSummaries = [...operationGroups].map(([key, items]) => {
+      const sampleDurations = items.map(item => item.durationMs).filter((item): item is number => item !== null);
+      return { operation: items[0]?.operation ?? 'DATABASE OPERATION', fingerprint: key.startsWith('operation:') ? null : key,
+        count: items.length, averageDurationMs: sampleDurations.length ? sampleDurations.reduce((sum, value) => sum + value, 0) / sampleDurations.length : null,
+        p95DurationMs: percentileMs(sampleDurations, .95), maxDurationMs: sampleDurations.length ? Math.max(...sampleDurations) : null,
+        traces: new Set(items.map(item => item.traceId)).size };
+    }).sort((a, b) => (b.maxDurationMs ?? -1) - (a.maxDurationMs ?? -1));
+    const slowest = [...selected].sort((a, b) => (b.durationMs ?? -1) - (a.durationMs ?? -1)).slice(0, 5);
+    endpointRows.push({
+        target: endpoint, requests: requestRoots.length, requestsWithPostgres: perRequest.filter(row => row.related.length > 0).length,
+        operations: selected.length, averageOperationsPerRequest: requestRoots.length ? selected.length / requestRoots.length : null,
+        maxOperationsPerRequest: perRequest.length ? Math.max(...perRequest.map(row => row.related.length)) : null,
+        summedSpanDurationMs: durations.length ? durations.reduce((sum, value) => sum + value, 0) : null,
+        overlappingSpansPossible: true, operationSummaries, slowest, repeatedPatterns,
+      });
+    }
+    profileRows.push({ profile: profile.name, endpoints: endpointRows });
+  }
+  const correlated = operations.filter(item => item.correlation === 'parent-chain' || item.correlation === 'trace-only').length;
+  const parentChainCorrelated = operations.filter(item => item.correlation === 'parent-chain').length;
+  const traceOnlyCorrelated = operations.filter(item => item.correlation === 'trace-only').length;
+  const ambiguousCorrelations = operations.filter(item => item.correlation === 'ambiguous').length;
+  const unmatchedCorrelations = operations.filter(item => item.correlation === 'unmatched').length;
+  const fingerprints = operations.filter(item => item.fingerprint !== null).length;
+  const explicitSuccesses = operations.filter(item => item.status === 'ok').length;
+  const durationsAvailable = operations.filter(item => item.durationMs !== null).length;
+  const failedOperations = operations.filter(item => item.status === 'error');
+  const state = (count: number, anyObserved: boolean): DiagnosticCoverageState => !traceAvailable ? 'unavailable' : !anyObserved ? 'no-observations' : count ? 'available' : 'insufficient-evidence';
+  const repeatedCount = profileRows.reduce((sum, row) => sum + row.endpoints.reduce((n, endpoint) => n + endpoint.repeatedPatterns.length, 0), 0);
+  const slowCount = operations.filter(item => (item.durationMs ?? 0) >= 100).length;
+  const coverage: PostgresDiagnostics['coverage'] = [
+    { diagnostic: 'PostgreSQL operation spans', state: state(operations.length, true), observations: traceAvailable ? operations.length : null, source: traceAvailable ? 'analysis/evidence.json' : null, note: evidence.telemetry?.truncated ? 'Persisted trace snapshot is truncated; counts describe the available bounded sample.' : 'Count of persisted PostgreSQL spans in this run.' },
+    { diagnostic: 'Endpoint-to-database correlation', state: !traceAvailable ? 'unavailable' : !operations.length ? 'no-observations' : correlated === operations.length ? 'available' : correlated ? 'partial' : 'insufficient-evidence', observations: traceAvailable ? correlated : null, source: traceAvailable ? 'analysis/evidence.json' : null, note: `Parent-chain: ${parentChainCorrelated}; trace-only unique-root fallback: ${traceOnlyCorrelated}; ambiguous multiple-root: ${ambiguousCorrelations}; unmatched/background: ${unmatchedCorrelations}. Trace-only is weaker than a parent-chain relationship.` },
+    { diagnostic: 'Query fingerprints', state: !traceAvailable ? 'unavailable' : !operations.length ? 'no-observations' : fingerprints === operations.length ? 'available' : fingerprints ? 'partial' : 'insufficient-evidence', observations: traceAvailable ? fingerprints : null, source: traceAvailable ? 'analysis/evidence.json' : null, note: 'Only sanitized SQL shapes naming a relation are fingerprinted; missing query text is not inferred.' },
+    { diagnostic: 'Slow PostgreSQL operations', state: !traceAvailable ? 'unavailable' : !operations.length ? 'no-observations' : durationsAvailable === 0 ? 'insufficient-evidence' : 'available', observations: traceAvailable ? slowCount : null, source: traceAvailable ? 'analysis/evidence.json' : null, note: 'Slowest measured operations are descriptive. Phase 3 findings require repeated operation evidence and its existing sample thresholds; 100 ms is the existing median threshold.' },
+    { diagnostic: 'Repeated-query evidence', state: !traceAvailable ? 'unavailable' : !operations.length ? 'no-observations' : repeatedCount ? 'available' : fingerprints ? 'no-observations' : 'insufficient-evidence', observations: traceAvailable ? repeatedCount : null, source: traceAvailable ? 'analysis/evidence.json' : null, note: 'A pattern is listed when one sanitized fingerprint occurs at least five times within a single correlated request trace; this is not by itself a Phase 3 finding or proof of ORM-level N+1.' },
+    { diagnostic: 'PostgreSQL error status', state: !traceAvailable ? 'unavailable' : !operations.length ? 'no-observations' : failedOperations.length ? 'available' : explicitSuccesses === operations.length ? 'no-observations' : 'insufficient-evidence', observations: traceAvailable ? failedOperations.length : null, source: traceAvailable ? 'analysis/evidence.json' : null, note: explicitSuccesses === operations.length || failedOperations.length ? 'Only explicit OpenTelemetry status codes are counted; exception messages are intentionally omitted.' : 'Some spans have unset or missing status; these are not counted as successful operations.' },
+    { diagnostic: 'Connection-pool metrics', state: 'not-collected', observations: null, source: null, note: 'Generic PostgreSQL instrumentation does not expose active/idle/waiting pool metrics in the current consumer integration.' },
+  ];
+  const recommendations: string[] = analysis.findings.filter((finding: any) => finding.category === 'database').flatMap((finding: any): string[] => {
+    if (finding.ruleId === 'database.repeated-operation') return ['For repeated-query evidence, verify the repeated lookup is intentional; if it is related-record loading, investigate batching or eager loading.'];
+    if (finding.ruleId === 'database.slow-operation') return ['For consistently slow query evidence, inspect the query plan with EXPLAIN (ANALYZE, BUFFERS) in a safe environment; review indexes only if the measured plan supports that investigation.'];
+    if (finding.ruleId === 'database.time-dominance') return ['Database spans occupy a substantial measured portion of request windows; inspect the associated traces and query timings before selecting a database change.'];
+    return [];
+  });
+  return { schemaVersion: 1, operations, profiles: profileRows, errors: failedOperations, coverage, recommendations: [...new Set(recommendations)] };
 }
 function resourceStateFor(resources: ResourceDiagnostics, source: ResourceSample['source'], metric: 'cpu' | 'memory'): DiagnosticCoverageState {
   const rows = resources.samples.filter(sample => sample.source === source);
@@ -278,6 +468,7 @@ export function buildReportModel(input: { run: any; profiles: { runProfile: any;
   if (input.profiles.some(item => !Array.isArray(item.result?.target?.endpoints) || endpointKey(item.result.target.endpoints) !== expectedEndpoints)) fail('Audit profile endpoint sets differ; report model does not currently support mixed targets.');
   const profiles = input.profiles.map(item => makeProfile(item.runProfile, item.result));
   const resourceDiagnostics = buildResourceDiagnostics(input.resources, run.runId, profiles);
+  const postgresDiagnostics = buildPostgresDiagnostics(profiles, safeEndpoints, evidence, analysis);
   const endpointEvidence = safeEndpoints.map((endpoint: { method: string; path: string }) => {
     if (!analysis.availability.traces) return { ...endpoint, requestTraces: null, databaseSpans: null, externalHttpSpans: null };
     const roots = evidence.traces.filter((span: any) => span.kind === 'server'
@@ -302,13 +493,13 @@ export function buildReportModel(input: { run: any; profiles: { runProfile: any;
   const hasResourceSamples = resourceDiagnostics.samples.length > 0;
   const limitations = [...new Set([...(Array.isArray(analysis.unsupported) ? analysis.unsupported.map(safeText).map((item: string) => hasResourceSamples && /CPU and memory saturation:/.test(item) ? 'CPU/memory measurements are available, but no Phase 3 resource pressure rules are implemented.' : item) : []), ...(analysis.availability.traces ? [] : ['Trace evidence was unavailable for this analysis.']), 'This report contains only configured audit targets and does not represent untested production traffic.'])].sort();
   return {
-    schemaVersion: 1, perflensVersion: safeText(input.perflensVersion ?? 'unknown'), reportVersion: 4, generatedAt: validDate(input.generatedAt ?? new Date().toISOString(), 'report generation timestamp'),
+    schemaVersion: 1, perflensVersion: safeText(input.perflensVersion ?? 'unknown'), reportVersion: 5, generatedAt: validDate(input.generatedAt ?? new Date().toISOString(), 'report generation timestamp'),
     run: { id: run.runId, target: safeBaseUrl(run.target?.baseUrl), method: target.method, path: target.path, endpoints: safeEndpoints, startedAt: validDate(run.startedAt, 'audit start time'), completedAt: validDate(run.endedAt, 'audit completion time'), serviceName: safeText(run.serviceName ?? analysis.target?.serviceName ?? 'unknown'), loadEngine: { name: typeof run.engine?.name === 'string' ? safeText(run.engine.name) : null, version: typeof run.engine?.version === 'string' ? safeText(run.engine.version) : null } },
     workload: { profiles }, performanceSummary: { profiles }, endpointEvidence,
     findingsSummary: { total: findings.length, bySeverity }, findings,
     evidenceSummary: { requestTraces: finiteOrNull(analysis.traceSummary.requests), databaseSpans: finiteOrNull(analysis.traceSummary.databaseSpans), externalHttpSpans: finiteOrNull(analysis.traceSummary.externalClientSpans), traceAvailable: Boolean(analysis.availability.traces), snapshotTraceCount: finiteOrNull(evidence.telemetry.traceCount), snapshotSpanCount: finiteOrNull(evidence.telemetry.spanCount), snapshotTruncated: typeof evidence.telemetry.truncated === 'boolean' ? evidence.telemetry.truncated : null, profiles: profiles.map(profile => profile.name) },
-    diagnosticEvidence: buildDiagnosticEvidence(profiles, safeEndpoints, evidence, analysis, resourceDiagnostics),
-    resourceDiagnostics, limitations,
+    diagnosticEvidence: (() => { const diagnostic = buildDiagnosticEvidence(profiles, safeEndpoints, evidence, analysis, resourceDiagnostics); diagnostic.coverage.push(...postgresDiagnostics.coverage); return diagnostic; })(),
+    postgresDiagnostics, resourceDiagnostics, limitations,
   };
 }
 
@@ -434,6 +625,26 @@ export function renderMarkdown(model: ReportModel): string {
   lines.push('', '## CPU & memory diagnostics', '', 'Process CPU, RSS, and heap summaries are arithmetic averages and maxima of individual process samples; they are not summed service totals. Distinct PIDs or process-lifetime IDs are observed identities; they may represent workers or restarts, but these samples do not establish their roles. Process CPU is normalized to one logical CPU; Docker CPU uses the Docker-reported host logical CPU basis and is not quota-normalized.', '', '| Profile | Process sample CPU avg / peak | Observed process identities | RSS sample avg / per-process peak | RSS window change | Heap sample avg / peak | External memory peak | Container CPU avg / peak | Container memory avg / peak | Configured limit | Peak of limit |', '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
   for (const item of model.resourceDiagnostics.profiles) lines.push(`| ${escMd(item.profile)} | ${item.process.cpuAveragePercent === null ? 'Insufficient evidence' : `${formattedNumber(item.process.cpuAveragePercent)}% / ${formattedNumber(item.process.cpuPeakPercent)}%`} | ${item.process.processInstances || 'Not available'} | ${mebibytes(item.process.rssAverageBytes)} / ${mebibytes(item.process.rssPeakBytes)} | ${rssWindowChange(item.process)} | ${mebibytes(item.process.heapUsedAverageBytes)} / ${mebibytes(item.process.heapUsedPeakBytes)} | ${mebibytes(item.process.externalPeakBytes)} | ${item.container.cpuAveragePercent === null ? 'Insufficient evidence' : `${formattedNumber(item.container.cpuAveragePercent)}% / ${formattedNumber(item.container.cpuPeakPercent)}%`} (Docker stats basis; ${item.container.cpuQuotaCores === null ? 'quota unavailable' : `${formattedNumber(item.container.cpuQuotaCores)} quota cores`}) | ${mebibytes(item.container.memoryAverageBytes)} / ${mebibytes(item.container.memoryPeakBytes)} | ${mebibytes(item.container.memoryLimitBytes)} | ${percent(item.container.memoryPeakPercentOfLimit === null ? null : item.container.memoryPeakPercentOfLimit / 100)} |`);
   lines.push('', 'RSS window change is only available when samples establish one continuous process instance; it is a measured first-to-last difference, not a memory-leak diagnosis.', '', `Process resource coverage: ${coverageText(model.resourceDiagnostics.processState)}. ${escMd(model.resourceDiagnostics.processNote)}`, `Container resource coverage: ${coverageText(model.resourceDiagnostics.containerState)}. ${escMd(model.resourceDiagnostics.containerNote)}`);
+  lines.push('', '## PostgreSQL diagnostics', '', 'Operation durations are measured from persisted OpenTelemetry span intervals. Per-request summed span duration may exceed wall-clock request time when operations overlap; it is not exclusive database contribution.', '', '| Profile | Endpoint | Request traces | Requests with PostgreSQL | Operations | Avg ops/request | Max ops/request | Sum of span durations (ms; overlap possible) | Slowest measured operation |', '|---|---|---:|---:|---:|---:|---:|---:|---|');
+  for (const row of model.postgresDiagnostics.profiles) for (const endpoint of row.endpoints) {
+    const slowest = endpoint.slowest[0];
+    lines.push(`| ${escMd(row.profile)} | ${escMd(endpoint.target.method)} ${escMd(endpoint.target.path)} | ${endpoint.requests} | ${endpoint.requestsWithPostgres} | ${endpoint.operations} | ${formattedNumber(endpoint.averageOperationsPerRequest)} | ${endpoint.maxOperationsPerRequest ?? 'Not available'} | ${formattedNumber(endpoint.summedSpanDurationMs)} | ${slowest ? `${escMd(slowest.operation)} · ${formattedNumber(slowest.durationMs)} ms · trace ${escMd(slowest.traceId)}` : 'Not observed'} |`);
+  }
+  lines.push('', '### PostgreSQL operation latency by query shape', '', '| Profile | Endpoint | Operation | Sanitized query fingerprint | Count | Average ms | p95 ms | Max ms | Traces |', '|---|---|---|---|---:|---:|---:|---:|---:|');
+  const operationSummaries = model.postgresDiagnostics.profiles.flatMap(row => row.endpoints.flatMap(endpoint => endpoint.operationSummaries.map(summary => ({ profile: row.profile, target: endpoint.target, ...summary }))));
+  if (operationSummaries.length) for (const item of operationSummaries) lines.push(`| ${escMd(item.profile)} | ${escMd(item.target.method)} ${escMd(item.target.path)} | ${escMd(item.operation)} | ${item.fingerprint ? escMd(item.fingerprint) : 'Query shape unavailable'} | ${item.count} | ${formattedNumber(item.averageDurationMs)} | ${formattedNumber(item.p95DurationMs)} | ${formattedNumber(item.maxDurationMs)} | ${item.traces} |`);
+  else lines.push('| — | — | — | No PostgreSQL operations | — | — | — | — | — |');
+  lines.push('', '### Slowest observed PostgreSQL spans', '', '| Profile | Endpoint | Operation | Duration (ms) | Status | Correlation | Trace ID | Span ID |', '|---|---|---|---:|---|---|---|---|');
+  const allDbOperations = model.postgresDiagnostics.operations.filter(item => item.durationMs !== null).sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0)).slice(0, 10);
+  if (allDbOperations.length) for (const item of allDbOperations) lines.push(`| ${escMd(item.profile)} | ${item.target ? `${escMd(item.target.method)} ${escMd(item.target.path)}` : 'Uncorrelated'} | ${escMd(item.operation)}${item.fingerprint ? ` · ${escMd(item.fingerprint)}` : ' · query shape unavailable'} | ${formattedNumber(item.durationMs)} | ${item.status === 'unknown' ? 'Unknown' : escMd(item.status)} | ${escMd(item.correlation)} | ${escMd(item.traceId)} | ${escMd(item.spanId)} |`);
+  else lines.push('| — | — | No measured PostgreSQL spans | — | — | — | — | — |');
+  lines.push('', '### Repeated query evidence', '', 'A repeated fingerprint is listed when the same sanitized query shape occurs at least five times within one request trace. This is descriptive repetition evidence, not a confirmed N+1 diagnosis. Only the separate Phase 3 findings section reports analyzer findings; this table does not assert that a particular fingerprint caused one.', '', '| Profile | Endpoint | Sanitized query fingerprint | Traces with ≥5 executions | Max executions in one trace | Trace references |', '|---|---|---|---:|---:|---|');
+  const patterns = model.postgresDiagnostics.profiles.flatMap(row => row.endpoints.flatMap(endpoint => endpoint.repeatedPatterns.map(pattern => ({ profile: row.profile, endpoint: endpoint.target, ...pattern }))));
+  if (patterns.length) for (const pattern of patterns) lines.push(`| ${escMd(pattern.profile)} | ${escMd(pattern.endpoint.method)} ${escMd(pattern.endpoint.path)} | ${escMd(pattern.fingerprint)} | ${pattern.traces} | ${pattern.maxExecutionsPerTrace} | ${pattern.sampleTraceIds.map(escMd).join(', ')} |`);
+  else lines.push('| — | — | No per-trace repeated query pattern met the five-execution evidence threshold | — | — | — |');
+  lines.push('', '### PostgreSQL errors and coverage', '', `Observed failed operations: ${model.postgresDiagnostics.errors.length}. Exception text is not persisted.`, '', '| Diagnostic | Coverage | Observations | Notes |', '|---|---|---:|---|');
+  for (const item of model.postgresDiagnostics.coverage) lines.push(`| ${escMd(item.diagnostic)} | ${coverageText(item.state)} | ${value(item.observations)} | ${escMd(item.note)} |`);
+  lines.push('', '### Investigation notes', '', ...(model.postgresDiagnostics.recommendations.length ? model.postgresDiagnostics.recommendations.map(note => `- ${escMd(note)}`) : ['No Phase 3 PostgreSQL finding was recorded; no query-specific optimization action is inferred.']), '', 'PostgreSQL span duration totals can include overlapping operations. HTTP 429 responses are not attributed to PostgreSQL without failed database-span evidence.');
   if (model.run.endpoints.length > 1) {
     lines.push('', '## Endpoint comparison', '', '| Profile | Endpoint | Requests | RPS | Error rate | p50 (ms) | p95 (ms) | p99 (ms) | Request traces | PostgreSQL spans | External HTTP spans | Findings |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|');
     for (const profile of model.performanceSummary.profiles) for (const endpoint of (profile.metrics as any).endpointResults ?? []) {
@@ -516,6 +727,15 @@ export function renderHtml(model: ReportModel): string {
   const processMemoryChart = resourceSeriesChart(model, 'Node process memory (MiB)', 'node-process', [{ label: 'RSS', get: sample => sample.rssBytes === null ? null : sample.rssBytes / 1024 / 1024 }, { label: 'Heap used', get: sample => sample.heapUsedBytes === null ? null : sample.heapUsedBytes / 1024 / 1024 }]);
   const containerCpuChart = resourceSeriesChart(model, 'Docker-reported container CPU (%) · host logical CPU basis', 'docker-container', [{ label: 'CPU', get: sample => sample.cpuPercent }]);
   const containerMemoryChart = resourceSeriesChart(model, 'Docker container memory (MiB)', 'docker-container', [{ label: 'Memory used', get: sample => sample.memoryUsedBytes === null ? null : sample.memoryUsedBytes / 1024 / 1024 }]);
+  const postgresEndpointRows = model.postgresDiagnostics.profiles.flatMap(row => row.endpoints.map(endpoint => `<tr><th scope="row">${h(row.profile)}</th><td class="endpoint-cell">${h(endpoint.target.method)} ${h(endpoint.target.path)}</td><td>${h(endpoint.requests)}</td><td>${h(endpoint.requestsWithPostgres)}</td><td>${h(endpoint.operations)}</td><td>${h(formattedNumber(endpoint.averageOperationsPerRequest))}</td><td>${h(value(endpoint.maxOperationsPerRequest))}</td><td>${h(formattedNumber(endpoint.summedSpanDurationMs))}</td></tr>`)).join('');
+  const postgresOperationSummaries = model.postgresDiagnostics.profiles.flatMap(row => row.endpoints.flatMap(endpoint => endpoint.operationSummaries.map(summary => `<tr><th scope="row">${h(row.profile)}</th><td class="endpoint-cell">${h(endpoint.target.method)} ${h(endpoint.target.path)}</td><td>${h(summary.operation)}</td><td>${h(summary.fingerprint ?? 'Query shape unavailable')}</td><td>${h(summary.count)}</td><td>${h(formattedNumber(summary.averageDurationMs))}</td><td>${h(formattedNumber(summary.p95DurationMs))}</td><td>${h(formattedNumber(summary.maxDurationMs))}</td><td>${h(summary.traces)}</td></tr>`))).join('');
+  const postgresOperations = model.postgresDiagnostics.operations.filter(item => item.durationMs !== null).sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0)).slice(0, 10);
+  const postgresSlowRows = postgresOperations.map(item => `<tr><th scope="row">${h(item.profile)}</th><td class="endpoint-cell">${h(item.target ? `${item.target.method} ${item.target.path}` : 'Uncorrelated')}</td><td>${h(item.operation)}</td><td>${h(item.fingerprint ?? 'Query shape unavailable')}</td><td>${h(formattedNumber(item.durationMs))}</td><td>${h(item.status)}</td><td>${h(item.correlation)}</td><td><code>${h(item.traceId)}</code> / <code>${h(item.spanId)}</code></td></tr>`).join('');
+  const postgresMaxDuration = Math.max(0, ...postgresOperations.map(item => item.durationMs ?? 0));
+  const postgresLatencyChart = postgresMaxDuration > 0 ? `<div class="table-wrap postgres-chart-wrap"><svg class="postgres-chart" viewBox="0 0 900 ${Math.max(100, postgresOperations.length * 40 + 44)}" role="img" aria-label="Durations of the ten slowest observed PostgreSQL spans in milliseconds"><text x="0" y="18" class="axis">Slowest PostgreSQL span durations (milliseconds)</text>${postgresOperations.map((item, index) => { const y = 30 + index * 40; const width = Math.max(1, (item.durationMs ?? 0) / postgresMaxDuration * 660); return `<g><text x="0" y="${y + 12}" class="axis">${h(item.profile)} · ${h(item.operation)}</text><rect x="0" y="${y + 17}" width="${width.toFixed(2)}" height="8" rx="2"/><text x="${Math.min(690, width + 8).toFixed(2)}" y="${y + 25}" class="value">${h(formattedNumber(item.durationMs))} ms</text></g>`; }).join('')}</svg></div>` : '<p class="subtle">No measured PostgreSQL span durations are available for charting.</p>';
+  const postgresPatterns = model.postgresDiagnostics.profiles.flatMap(row => row.endpoints.flatMap(endpoint => endpoint.repeatedPatterns.map(pattern => `<tr><th scope="row">${h(row.profile)}</th><td class="endpoint-cell">${h(endpoint.target.method)} ${h(endpoint.target.path)}</td><td>${h(pattern.fingerprint)}</td><td>${h(pattern.traces)}</td><td>${h(pattern.maxExecutionsPerTrace)}</td><td>${pattern.sampleTraceIds.map(id => `<code>${h(id)}</code>`).join(', ')}</td></tr>`))).join('');
+  const postgresCoverageRows = model.postgresDiagnostics.coverage.map(item => `<tr><th scope="row">${h(item.diagnostic)}</th><td>${h(coverageText(item.state))}</td><td>${h(value(item.observations))}</td><td class="coverage-note">${h(item.note)}</td></tr>`).join('');
+  const postgresRecommendationList = model.postgresDiagnostics.recommendations.length ? `<ul>${model.postgresDiagnostics.recommendations.map(note => `<li>${h(note)}</li>`).join('')}</ul>` : '<p>No Phase 3 PostgreSQL finding was recorded; no query-specific optimization action is inferred.</p>';
   const count = (severity: Severity) => model.findingsSummary.bySeverity[severity];
   const failedAssessment = allRequestsFailed(model);
   const assessmentNotice = failedAssessment ? `<aside class="assessment-warning" role="alert"><strong>${h(inconclusiveAssessment)}</strong><p>Audit execution completed and measured evidence is preserved. ${h(inconclusiveGuidance)}</p><p>Measured request counts, latency, error rates, telemetry, and any Phase 3 findings remain shown below. Failed requests alone do not establish a backend root cause.</p></aside>` : '';
@@ -523,7 +743,7 @@ export function renderHtml(model: ReportModel): string {
     ? model.findings.length ? `Phase 3 recorded ${h(model.findings.length)} evidence-backed finding(s); see the detailed findings below.` : ''
     : model.findings.length ? `${h(model.findings.length)} evidence-backed finding(s) were identified.` : 'No evidence-backed performance bottleneck met the configured detection thresholds for this audit run.';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PerfLens Backend Performance Audit</title><style>
- .latency-chart{display:block;width:100%;min-width:0;margin:12px 0 20px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}.chart{display:block;width:900px;min-width:900px;max-width:none;height:auto;max-height:none}.chart .axis{font:12px system-ui;fill:var(--muted)}.chart .profile-label{font:12px system-ui;fill:var(--ink)}.chart .value{font:12px system-ui;fill:var(--ink)}.chart rect{fill:var(--blue)}.chart rect.p95{fill:#3682ad}.chart rect.p99{fill:#82b4cc}.latency-by-profile{max-width:640px;margin:10px 0}.latency-by-profile caption{text-align:left;font-weight:700;padding:8px}.supporting-measurements{max-width:640px}.supporting-measurements th,.supporting-measurements td{white-space:normal;overflow-wrap:anywhere}.http-status-table{min-width:900px}.status-list{display:grid;gap:3px;min-width:220px}.status-entry{display:flex;justify-content:space-between;gap:12px;white-space:nowrap}.coverage-note{min-width:240px;max-width:420px;white-space:normal;overflow-wrap:anywhere}.assessment-warning{margin:14px 0;padding:16px 18px;border:1px solid #d6a247;border-left:6px solid #986000;background:#fff8e9;color:#573900;overflow-wrap:anywhere}.assessment-warning p{margin:8px 0 0}.evidence-card{background:var(--wash);border-left:4px solid var(--blue);padding:12px 16px;margin:12px 0}.evidence-card p{margin:6px 0}.evidence-card li{margin:4px 0}.resource-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:18px}.resource-chart{min-width:0;margin:0;padding:14px;border:1px solid var(--line);border-radius:5px}.resource-chart figcaption{font-weight:700;margin-bottom:8px;overflow-wrap:anywhere}.resource-chart .svg-wrap{width:100%;min-width:0;overflow-x:auto;overscroll-behavior-x:contain}.resource-chart svg{display:block;width:100%;min-width:600px;height:auto;overflow:visible}.resource-chart svg text{font:11px system-ui}.resource-chart .chart-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));gap:6px;margin:10px 0 0;padding:0;list-style:none}.resource-chart .chart-legend li{display:flex;align-items:flex-start;gap:7px;min-width:0;overflow-wrap:anywhere}.chart-swatch{flex:0 0 12px;height:3px;margin-top:8px;border-radius:2px}.resource-numerical-table{min-width:900px}.resource-note{margin:8px 0;color:var(--muted);overflow-wrap:anywhere}
+ .latency-chart{display:block;width:100%;min-width:0;margin:12px 0 20px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}.chart{display:block;width:900px;min-width:900px;max-width:none;height:auto;max-height:none}.chart .axis{font:12px system-ui;fill:var(--muted)}.chart .profile-label{font:12px system-ui;fill:var(--ink)}.chart .value{font:12px system-ui;fill:var(--ink)}.chart rect{fill:var(--blue)}.chart rect.p95{fill:#3682ad}.chart rect.p99{fill:#82b4cc}.latency-by-profile{max-width:640px;margin:10px 0}.latency-by-profile caption{text-align:left;font-weight:700;padding:8px}.supporting-measurements{max-width:640px}.supporting-measurements th,.supporting-measurements td{white-space:normal;overflow-wrap:anywhere}.http-status-table{min-width:900px}.status-list{display:grid;gap:3px;min-width:220px}.status-entry{display:flex;justify-content:space-between;gap:12px;white-space:nowrap}.coverage-note{min-width:240px;max-width:420px;white-space:normal;overflow-wrap:anywhere}.assessment-warning{margin:14px 0;padding:16px 18px;border:1px solid #d6a247;border-left:6px solid #986000;background:#fff8e9;color:#573900;overflow-wrap:anywhere}.assessment-warning p{margin:8px 0 0}.evidence-card{background:var(--wash);border-left:4px solid var(--blue);padding:12px 16px;margin:12px 0}.evidence-card p{margin:6px 0}.evidence-card li{margin:4px 0}.resource-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:18px}.resource-chart{min-width:0;margin:0;padding:14px;border:1px solid var(--line);border-radius:5px}.resource-chart figcaption{font-weight:700;margin-bottom:8px;overflow-wrap:anywhere}.resource-chart .svg-wrap{width:100%;min-width:0;overflow-x:auto;overscroll-behavior-x:contain}.resource-chart svg{display:block;width:100%;min-width:600px;height:auto;overflow:visible}.resource-chart svg text{font:11px system-ui}.resource-chart .chart-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));gap:6px;margin:10px 0 0;padding:0;list-style:none}.resource-chart .chart-legend li{display:flex;align-items:flex-start;gap:7px;min-width:0;overflow-wrap:anywhere}.chart-swatch{flex:0 0 12px;height:3px;margin-top:8px;border-radius:2px}.resource-numerical-table{min-width:900px}.resource-note{margin:8px 0;color:var(--muted);overflow-wrap:anywhere}.postgres-chart-wrap{max-width:100%;overflow-x:auto;overscroll-behavior-x:contain}.postgres-chart{display:block;width:900px;min-width:900px;height:auto}.postgres-chart text{font:12px system-ui;fill:var(--muted)}.postgres-chart rect{fill:var(--blue)}.postgres-endpoint-table,.postgres-operation-table,.postgres-repeat-table,.postgres-coverage-table{min-width:900px}.postgres-operation-table td,.postgres-operation-table th,.postgres-repeat-table td,.postgres-repeat-table th{white-space:normal;overflow-wrap:anywhere;max-width:360px}.postgres-operation-table code,.postgres-repeat-table code{white-space:normal;overflow-wrap:anywhere}
 :root{color-scheme:light;--ink:#17212b;--muted:#5d6a76;--line:#d8e0e6;--paper:#fff;--wash:#f3f6f8;--blue:#175b8e;--p0:#a62b2b;--p1:#986000;--p2:#315d75}*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1100px;margin:36px auto;background:var(--paper);padding:42px 52px;box-shadow:0 8px 32px #17212b12}header{border-bottom:3px solid var(--blue);padding-bottom:22px}header .brand{font-weight:800;letter-spacing:.08em;color:var(--blue);text-transform:uppercase;font-size:13px}h1{font-size:30px;margin:8px 0}h2{font-size:21px;margin-top:34px;border-bottom:1px solid var(--line);padding-bottom:8px}h3{font-size:18px;margin:0}h4{font-size:14px;margin:16px 0 4px}.meta,.subtle,.source{color:var(--muted)}.metadata{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:22px}.metadata div{background:var(--wash);padding:12px;border-radius:5px}.metadata strong{display:block;font-size:12px;color:var(--muted);text-transform:uppercase}.counts{display:flex;gap:10px;flex-wrap:wrap}.counts span{border:1px solid var(--line);padding:7px 12px;border-radius:4px}.counts b{margin-right:5px}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}thead{background:var(--wash)}.finding{border:1px solid var(--line);border-left:5px solid var(--p2);padding:20px;margin:16px 0}.finding.p0{border-left-color:var(--p0)}.finding.p1{border-left-color:var(--p1)}.finding-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.severity{font-weight:800;color:var(--p2)}.p0 .severity{color:var(--p0)}.p1 .severity{color:var(--p1)}.confidence{margin-left:auto;color:var(--muted);font-size:13px}.finding li{margin:7px 0}code{overflow-wrap:anywhere;background:var(--wash);padding:2px 4px}footer{margin-top:40px;padding-top:14px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}@media(max-width:700px){main{margin:0;padding:25px 18px}h1{font-size:25px}}@media print{body{background:#fff}main{margin:0;max-width:none;box-shadow:none;padding:0}.finding{break-inside:avoid}h2{break-after:avoid}}
 :root{--error:#a32121;--error-wash:#fff0ef}main{width:calc(100% - 32px);min-width:0}h1,.metadata div,.endpoint-list,.finding,.finding p,.finding li,.finding pre,.evidence-card,.evidence-card p,.evidence-card li,code,footer{overflow-wrap:anywhere;word-break:break-word}.metadata{grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr))}.metadata div{min-width:0}.table-wrap{max-width:100%;overscroll-behavior-x:contain}.endpoint-comparison .endpoint-cell,.endpoint-comparison .finding-cell{min-width:120px;max-width:260px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.endpoint-comparison td.endpoint-cell{text-align:left}.error-rate.nonzero{color:var(--error);background:var(--error-wash);font-weight:800}.error-notice{margin:14px 0;padding:12px 16px;border:1px solid #e6aaa5;border-left:5px solid var(--error);background:var(--error-wash);color:#641b18;overflow-wrap:anywhere}.finding{min-width:0}.finding-head{align-items:flex-start;min-width:0}.finding-head>*{min-width:0;max-width:100%;overflow-wrap:anywhere}.finding-head h3{flex:1 1 300px}.finding pre{white-space:pre-wrap;max-width:100%;overflow-x:auto}@media(min-width:701px) and (max-width:900px){main{padding:34px 28px}}@media(max-width:700px){main{width:100%;margin:0;padding:25px 18px}.metadata{grid-template-columns:minmax(0,1fr)}.finding{padding:16px}.confidence{margin-left:0}}@media print{main{width:100%;max-width:none}}
 </style></head><body><main><header><div class="brand">PerfLens</div><h1>Backend Performance Audit</h1><p class="subtle">A factual report generated from persisted audit measurements and Phase 3 findings.</p><div class="metadata"><div><strong>Run</strong>${h(model.run.id)}</div><div><strong>Target</strong>${h(model.run.target)}</div><div><strong>Endpoint</strong>${h(model.run.method)} ${h(model.run.path)}</div><div><strong>Audit period</strong>${h(model.run.startedAt)} – ${h(model.run.completedAt)}</div><div><strong>Report generated</strong>${h(model.generatedAt)}</div><div><strong>Service</strong>${h(model.run.serviceName)}</div></div></header>
@@ -531,6 +751,7 @@ export function renderHtml(model: ReportModel): string {
 <section><h2>Test scope and performance overview</h2><p>Load engine: ${h(model.run.loadEngine.name ?? 'Not available')} ${h(model.run.loadEngine.version ?? '')}. Configured endpoints: <strong class="endpoint-list">${h(model.run.endpoints.map(endpoint => `${endpoint.method} ${endpoint.path}`).join(', '))}</strong>. Configured workload values describe test setup; measurements describe observed results.</p>${errorNotice}<div class="table-wrap"><table><thead><tr><th>Profile</th><th>Configured VUs</th><th>Configured duration ms</th><th>Observed duration ms</th><th>Max in-flight</th><th>Requests</th><th>Success</th><th>Failed</th><th>Error rate</th><th>RPS</th><th>min ms</th><th>p50 ms</th><th>p90 ms</th><th>p95 ms</th><th>p99 ms</th><th>max ms</th></tr></thead><tbody>${profileRows}</tbody></table></div><h3>Latency by profile</h3>${latencyChart}${latencyTable}</section>
 <section><h2>HTTP response status diagnostics</h2><p>Status counts are measured by k6 for each profile and endpoint where persisted endpoint evidence is available. A recorded status total that differs from requests is labeled incomplete.</p>${status429Note}<div class="table-wrap"><table class="http-status-table"><thead><tr><th>Profile</th><th>Endpoint</th><th>Requests</th><th>Successful</th><th>Failed</th><th>Error rate</th><th>RPS</th><th>HTTP status counts</th><th>Status coverage</th></tr></thead><tbody>${httpStatusRows}</tbody></table></div></section>
 <section><h2>CPU &amp; memory diagnostics</h2><p>Samples are correlated with the audit run and profile. Process CPU is normalized to one logical CPU; it is not host-wide utilization. Process CPU/RSS/heap averages are arithmetic means of per-process sample observations; peaks are the maximum observation from one process. These values are not summed service totals. Distinct PIDs or process-lifetime IDs are observed identities; they may represent workers or restarts, but these samples do not establish their roles. Docker CPU is the value reported by Docker on its host logical CPU basis and is not quota-normalized. These measurements describe resource use during the audit and do not alone prove saturation or causation.</p><div class="table-wrap"><table class="resource-numerical-table"><caption>Measured resource summaries by profile</caption><thead><tr><th>Profile</th><th>Process CPU sample avg / peak</th><th>Observed process identities</th><th>Process samples</th><th>RSS sample avg</th><th>Per-process RSS peak</th><th>RSS window change</th><th>Heap used sample avg</th><th>Heap used peak</th><th>Heap total peak</th><th>External memory peak</th><th>Docker CPU avg / peak</th><th>CPU quota</th><th>Container samples</th><th>Container memory avg</th><th>Container memory peak</th><th>Configured memory limit</th><th>Peak of limit</th></tr></thead><tbody>${resourceRows}</tbody></table></div><div class="resource-charts">${processCpuChart}${processMemoryChart}${containerCpuChart}${containerMemoryChart}</div><p class="resource-note">Process coverage: ${h(coverageText(model.resourceDiagnostics.processState))}. ${h(model.resourceDiagnostics.processNote)}</p><p class="resource-note">Container coverage: ${h(coverageText(model.resourceDiagnostics.containerState))}. ${h(model.resourceDiagnostics.containerNote)}</p><p class="resource-note">A CPU average requires at least two valid samples per profile. Docker CPU is not quota-normalized even when a quota is known. Memory limit is only shown when Docker reports a finite configured limit. RSS window change is only available when evidence establishes one continuous process instance; it is a measured first-to-last difference, not a memory-leak diagnosis. No CPU or memory findings are added by this report.</p></section>
+<section><h2>PostgreSQL diagnostics</h2><p>Operations are correlated to request spans through their parent chain where possible; a unique request span in the same trace is labeled trace-only. Duration totals below sum measured span intervals and can include overlapping operations, so they are not exclusive request time or a direct wall-clock contribution. Query shapes are sanitized; raw SQL and exception messages are not included.</p><div class="table-wrap"><table class="postgres-endpoint-table"><caption>PostgreSQL activity by endpoint and profile</caption><thead><tr><th>Profile</th><th>Endpoint</th><th>Request traces</th><th>Requests with PostgreSQL</th><th>Operations</th><th>Average operations/request</th><th>Max operations/request</th><th>Summed span duration ms (overlap possible)</th></tr></thead><tbody>${postgresEndpointRows}</tbody></table></div><h3>Operation latency by sanitized query shape</h3><div class="table-wrap"><table class="postgres-operation-table"><thead><tr><th>Profile</th><th>Endpoint</th><th>Operation</th><th>Sanitized fingerprint</th><th>Count</th><th>Average ms</th><th>p95 ms (≥5 samples)</th><th>Max ms</th><th>Traces</th></tr></thead><tbody>${postgresOperationSummaries || '<tr><td colspan="9">No PostgreSQL operations were observed.</td></tr>'}</tbody></table></div><h3>Slowest observed PostgreSQL spans</h3>${postgresLatencyChart}<div class="table-wrap"><table class="postgres-operation-table"><caption>Slowest measured PostgreSQL operations</caption><thead><tr><th>Profile</th><th>Endpoint</th><th>Operation</th><th>Sanitized query fingerprint</th><th>Duration ms</th><th>Span status</th><th>Correlation</th><th>Trace / span reference</th></tr></thead><tbody>${postgresSlowRows || '<tr><td colspan="8">No measured PostgreSQL spans were observed.</td></tr>'}</tbody></table></div><h3>Repeated-query evidence</h3><p>A repeated fingerprint is descriptive repetition evidence, not a confirmed N+1 diagnosis. Only the separate Phase 3 findings section reports analyzer findings; this table does not assert that a particular fingerprint caused one.</p><div class="table-wrap"><table class="postgres-repeat-table"><thead><tr><th>Profile</th><th>Endpoint</th><th>Sanitized fingerprint</th><th>Traces with ≥5 executions</th><th>Max executions/trace</th><th>Trace references</th></tr></thead><tbody>${postgresPatterns || '<tr><td colspan="6">No within-request repeated fingerprint met the five-execution threshold, or query fingerprints were unavailable.</td></tr>'}</tbody></table></div><h3>PostgreSQL errors and diagnostic coverage</h3><p>Observed failed PostgreSQL operations: <strong>${h(model.postgresDiagnostics.errors.length)}</strong>. Error messages are deliberately omitted. HTTP 429 responses are not attributed to PostgreSQL without failed database-span evidence.</p><div class="table-wrap"><table class="postgres-coverage-table"><thead><tr><th>Diagnostic</th><th>Coverage</th><th>Observations</th><th>Notes</th></tr></thead><tbody>${postgresCoverageRows}</tbody></table></div><h3>Investigation notes</h3>${postgresRecommendationList}</section>
 <section><h2>Diagnostic coverage</h2><p>Coverage describes evidence present in this run’s persisted artifacts. “No observations” does not prove that a component was unused or uninstrumented.</p><div class="table-wrap"><table><thead><tr><th>Diagnostic</th><th>Coverage</th><th>Observations</th><th>Source</th><th>Notes</th></tr></thead><tbody>${diagnosticCoverageRows}</tbody></table></div></section>
 ${model.run.endpoints.length > 1 ? `<section><h2>Endpoint comparison</h2><p>Endpoint latency percentiles are calculated from raw per-request k6 samples for each route. Trace counts use only persisted spans correlated to this run and matching the route template. Aggregate profile metrics above cover the full selected endpoint set.</p><div class="table-wrap"><table class="endpoint-comparison"><thead><tr><th>Profile</th><th>Endpoint</th><th>Requests</th><th>RPS</th><th>Error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Request traces</th><th>PostgreSQL spans</th><th>External HTTP spans</th><th>Phase 3 finding</th></tr></thead><tbody>${endpointRows}</tbody></table></div></section>` : ''}
 ${databaseFindings.length ? `<section><h2>Database evidence</h2><p>PostgreSQL spans analyzed: ${h(value(model.evidenceSummary.databaseSpans))}. The following evidence is carried from Phase 3 findings.</p>${evidenceCards(databaseFindings)}</section>` : ''}${dependencyFindings.length ? `<section><h2>External dependency evidence</h2><p>External HTTP spans analyzed: ${h(value(model.evidenceSummary.externalHttpSpans))}. The following evidence is carried from Phase 3 findings.</p>${evidenceCards(dependencyFindings)}</section>` : ''}<section><h2>Detailed findings</h2>${findings}</section><section><h2>Evidence coverage</h2><ul><li>Request traces analyzed: ${h(value(model.evidenceSummary.requestTraces))}</li><li>PostgreSQL spans analyzed: ${h(value(model.evidenceSummary.databaseSpans))}</li><li>External HTTP spans analyzed: ${h(value(model.evidenceSummary.externalHttpSpans))}</li><li>Persisted snapshot: ${h(value(model.evidenceSummary.snapshotTraceCount))} traces / ${h(value(model.evidenceSummary.snapshotSpanCount))} spans</li><li>Snapshot truncated: ${h(value(model.evidenceSummary.snapshotTruncated))}</li><li>Trace evidence available: ${model.evidenceSummary.traceAvailable ? 'Yes' : 'No'}</li><li>Profiles: ${h(model.evidenceSummary.profiles.join(', ') || 'None')}</li></ul></section><section><h2>Limitations</h2><ul>${model.limitations.map(item => `<li>${h(item)}</li>`).join('')}</ul></section><footer>Generated by PerfLens ${h(model.perflensVersion)} · Report version ${model.reportVersion}. Findings, severity, and confidence are carried from the persisted Phase 3 analysis. This report does not perform additional diagnosis.</footer></main></body></html>`;

@@ -29,6 +29,13 @@ function kind(raw: Json): SanitizedSpan['kind'] {
   if (value === 'SPAN_KIND_CONSUMER' || value === 5) return 'consumer';
   return 'unknown';
 }
+function spanStatus(raw: Json): SanitizedSpan['status'] {
+  const code = raw?.status?.code;
+  if (code === 2 || code === '2' || code === 'STATUS_CODE_ERROR' || String(code).toUpperCase() === 'ERROR') return 'error';
+  if (code === 1 || code === '1' || code === 'STATUS_CODE_OK' || String(code).toUpperCase() === 'OK') return 'ok';
+  if (code === 0 || code === '0' || code === 'STATUS_CODE_UNSET' || String(code).toUpperCase() === 'UNSET') return 'unset';
+  return undefined;
+}
 function endpointPath(path: string, allowed: string[]): string {
   if (allowed.includes(path)) return path;
   const prefix = [...allowed].sort((a, b) => b.length - a.length).find(candidate => path.startsWith(`${candidate}/`));
@@ -42,15 +49,39 @@ function endpointPath(path: string, allowed: string[]): string {
     /^\d+$/.test(segment) || /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) ? ':id' : ':segment',
   ).join('/');
 }
+const SAFE_DB_SYSTEMS: Record<string, string> = {
+  postgres: 'postgresql', postgresql: 'postgresql', redis: 'redis', mysql: 'mysql',
+  mariadb: 'mariadb', sqlite: 'sqlite', mongodb: 'mongodb', db2: 'db2', oracle: 'oracle',
+};
+const SAFE_DB_OPERATIONS = new Set([
+  'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'CALL', 'CREATE', 'ALTER', 'DROP',
+  'TRUNCATE', 'BEGIN', 'COMMIT', 'ROLLBACK', 'EXPLAIN', 'EXECUTE', 'PREPARE',
+  'DEALLOCATE', 'SET', 'SHOW', 'COPY', 'LOCK', 'REFRESH', 'VACUUM', 'ANALYZE', 'QUERY',
+]);
+const SAFE_PG_SPAN_NAMES = new Set(['pg.query', 'pg.connect']);
+const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE', 'CONNECT', 'TRACE']);
 function safeAttributes(raw: Record<string, string | number | boolean>, endpoints: string[]): Record<string, string | number | boolean> {
   const safe: Record<string, string | number | boolean> = {};
-  for (const key of ['perflens.audit.run_id', 'perflens.audit.profile', 'db.system', 'db.operation.name', 'db.namespace', 'http.request.method', 'http.method', 'http.response.status_code', 'http.status_code']) {
-    if (raw[key] !== undefined) safe[key] = raw[key];
+  for (const key of ['http.request.method', 'http.method']) {
+    const method = raw[key];
+    if (typeof method === 'string' && method.length <= 10 && SAFE_HTTP_METHODS.has(method.toUpperCase())) safe[key] = method.toUpperCase();
+  }
+  for (const key of ['http.response.status_code', 'http.status_code']) {
+    const status = raw[key];
+    if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) safe[key] = status;
+  }
+  const operation = raw['db.operation.name'];
+  if (typeof operation === 'string' && operation.length <= 40) {
+    const normalized = operation.toUpperCase();
+    if (SAFE_DB_OPERATIONS.has(normalized)) safe['db.operation.name'] = normalized;
   }
   const databaseSystem = raw['db.system'] ?? raw['db.system.name'];
-  if (databaseSystem !== undefined) safe['db.system'] = databaseSystem;
+  if (typeof databaseSystem === 'string' && databaseSystem.length <= 16 && SAFE_DB_SYSTEMS[databaseSystem.toLowerCase()]) safe['db.system'] = SAFE_DB_SYSTEMS[databaseSystem.toLowerCase()];
   const statement = raw['db.query.text'] ?? raw['db.statement'];
-  if (typeof statement === 'string') safe['db.query.sanitized'] = normalizeSql(statement);
+  if (typeof statement === 'string') {
+    const normalized = normalizeSql(statement);
+    if (normalized) safe['db.query.sanitized'] = normalized;
+  }
   const route = raw['http.route'];
   const urlPath = raw['url.path'];
   if (typeof route === 'string') safe['http.route'] = endpointPath(route, endpoints);
@@ -82,14 +113,17 @@ export function normalizeTempoTrace(trace: Json, profile: string, runId: string,
           name = String(attrSafe['http.request.method'] ?? attrSafe['http.method'] ?? (/^pg\.query:/i.test(name) ? name : 'HTTP client'));
         } else if (isDatabaseSpan && /^\s*(select|insert|update|delete|with)\b/i.test(name)) {
           name = normalizeSql(name);
-        } else if (isDatabaseSpan && !/^pg\.[a-z_.]+$/i.test(name) && !/^pg\.query:/i.test(name)) {
-          name = 'database operation';
+        } else if (isDatabaseSpan && !/^pg\.query:/i.test(name)) {
+          name = SAFE_PG_SPAN_NAMES.has(name.toLowerCase()) ? name.toLowerCase() : 'database operation';
         } else if (!isDatabaseSpan && spanKind !== 'client') {
           name = `${spanKind} span`;
         }
-        if (spanKind === 'server' && rawAttrs['perflens.audit.run_id'] === runId) {
+        if (spanKind === 'server' && rawAttrs['perflens.audit.run_id'] === runId
+          && (rawAttrs['perflens.audit.profile'] === undefined || rawAttrs['perflens.audit.profile'] === profile)) {
           attrSafe['perflens.audit.run_id'] = runId;
-          attrSafe['perflens.audit.profile'] = String(rawAttrs['perflens.audit.profile'] ?? profile);
+          // Only the queried profile is valid for this evidence snapshot. Do
+          // not persist arbitrary exporter-supplied correlation metadata.
+          attrSafe['perflens.audit.profile'] = profile;
         } else {
           delete attrSafe['perflens.audit.run_id'];
           delete attrSafe['perflens.audit.profile'];
@@ -99,6 +133,7 @@ export function normalizeTempoTrace(trace: Json, profile: string, runId: string,
           spanId: String(raw.spanId ?? ''), parentSpanId: raw.parentSpanId ? String(raw.parentSpanId) : null,
           profile: spanKind === 'server' ? String(attrSafe['perflens.audit.profile'] ?? profile) : profile,
           name, kind: spanKind, startTimeUnixNano: String(raw.startTimeUnixNano ?? ''), endTimeUnixNano: String(raw.endTimeUnixNano ?? ''),
+          ...(spanStatus(raw) === undefined ? {} : { status: spanStatus(raw) }),
           attributes: attrSafe,
         });
       }

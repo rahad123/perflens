@@ -37,6 +37,57 @@ test('normalizes SQL literals and numeric parameters without retaining secrets',
   assert.equal(sanitizeDependency('not a URL'), 'external dependency');
 });
 
+test('SQL fingerprint normalization removes escaped strings, dollar quotes, nested comments, and numeric literals', () => {
+  const sql = String.raw`SELECT * FROM users WHERE note = E'private\' value -- not a comment' AND payload = $tag$customer-secret$tag$ AND id = 42.50e+2 /* outer /* nested-comment-secret */ trailing-comment-secret */ AND flags = B'101'`;
+  const normalized = normalizeSql(sql);
+  for (const secret of ['private', 'value -- not a comment', 'customer-secret', 'nested-comment-secret', 'trailing-comment-secret', '42.50e+2', '101']) assert.ok(!normalized.includes(secret), `normalized fingerprint leaked ${secret}`);
+  assert.match(normalized, /select \* from users/);
+  assert.match(normalized, /payload = \?/);
+  assert.match(normalized, /id = \?/);
+  assert.match(normalized, /flags = \?/);
+  assert.match(normalizeSql('SELECT * FROM users WHERE id = $1'), /id = \?/);
+  assert.match(normalizeSql("SELECT data ? 'private-key' FROM records WHERE score > .25 AND ratio < 1e-6"), /data \? \? from records where score > \? and ratio < \?/);
+});
+
+test('SQL fingerprints canonicalize whitespace, literals, and positional PostgreSQL parameters', () => {
+  const first = normalizeSql("SELECT * FROM orders WHERE id=17 AND note=E'private\\' value'");
+  const second = normalizeSql(" select /* removed */ *  from orders where id = 992 and note = $body$another secret$body$ ");
+  assert.equal(first, second);
+  assert.equal(normalizeSql('SELECT * FROM orders WHERE id = $1'), normalizeSql('SELECT * FROM orders WHERE id=$2'));
+  assert.equal(normalizeSql(normalizeSql('SELECT * FROM orders WHERE id = $1')), normalizeSql('SELECT * FROM orders WHERE id=$2'));
+  assert.equal(normalizeSql('SELECT data ?| array[$1,$2] FROM records'), 'select data ?| array [ ? , ? ] from records');
+  assert.equal(normalizeSql(`SELECT payload #>> '{a}' FROM records WHERE payload @> '{"a":1}' AND payload ? $1`), 'select payload #>> ? from records where payload @> ? and payload ? ?');
+  assert.equal(normalizeSql('SELECT * FROM "orders" WHERE "id"=$1'), normalizeSql('select * from orders where id = $2'));
+  assert.equal(normalizeSql('SELECT * FROM "Orders" WHERE id=1'), 'select * from "Orders" where id = ?');
+});
+
+test('SQL fingerprinting accepts normalized Unicode identifiers and fails closed on malformed or unsafe identifiers', () => {
+  assert.equal(normalizeSql('SELECT * FROM café WHERE id=1'), normalizeSql('SELECT * FROM cafe\u0301 WHERE id = 2'));
+  assert.equal(normalizeSql('SELECT * FROM "bad name" WHERE id=1'), '');
+  assert.equal(normalizeSql('SELECT * FROM "quoted""identifier" WHERE id=1'), '');
+  assert.equal(normalizeSql('SELECT * FROM users WHERE note = \'unterminated-secret'), '');
+  assert.equal(normalizeSql('SELECT /* unterminated private-comment'), '');
+  assert.equal(normalizeSql('SELECT $tag$unterminated-secret'), '');
+  assert.equal(normalizeSql('SELECT * FROM users WHERE id = $1suffix'), '');
+  assert.equal(normalizeSql(`SELECT * FROM users WHERE note = '${'x'.repeat(16_400)}'`), '');
+});
+
+test('repeated-query grouping is stable across literal and whitespace variations', () => {
+  const traces = [];
+  for (let request = 0; request < 12; request++) {
+    const traceId = `canonical-${request}`;
+    traces.push(root(traceId, request));
+    for (let query = 0; query < 10; query++) {
+      const sql = request % 2
+        ? `SELECT * FROM order_items WHERE order_id=$${query + 1} AND note='value-${request}-${query}'`
+        : ` select  * from order_items where order_id = ${request * 100 + query} and note = E'value-${request}-${query}' `;
+      traces.push(span(traceId, `q-${request}-${query}`, `root${request}`, 'client', 2 + query, 3 + query, 'pg.query', { 'db.system': 'postgresql', 'db.query.sanitized': sql }));
+    }
+  }
+  const result = analyzeEvidence(evidence({ traces }));
+  assert.ok(result.findings.some(item => item.ruleId === 'database.repeated-operation'));
+});
+
 test('positive repeated database operation rule requires repeated equivalent SQL across many requests', () => {
   const result = analyzeEvidence(evidence({ traces: nplusTraces() }));
   const finding = result.findings.find(item => item.ruleId === 'database.repeated-operation');
