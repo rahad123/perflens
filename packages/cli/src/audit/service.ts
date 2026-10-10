@@ -9,7 +9,8 @@ import { K6Runner, Plan } from './k6';
 import { checkCancelled, checkInfrastructure, checkInstrumentation, checkTarget } from './preflight';
 import { completedEvidenceError, normalize, readSamples } from './results';
 import { RunStatus, RunStore } from './storage';
-export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[]; approveApplicationRestart?: (service: string) => Promise<boolean>; approveLoad?: () => Promise<boolean>; selectApplicationService?: (services: string[]) => Promise<string | undefined> }
+import { AuditResourceCollector, ResourceEvidence, ResourceRuntime } from './resources';
+export interface AuditOptions { config?: string; infraDir?: string; profile?: string; confirmMultipleEndpoints?: boolean; endpoints?: Endpoint[]; approveApplicationRestart?: (service: string) => Promise<boolean>; approveLoad?: () => Promise<boolean>; selectApplicationService?: (services: string[]) => Promise<string | undefined>; resourceRuntime?: ResourceRuntime }
 interface ProfileState { name: ProfileName; status: RunStatus; startedAt: string | null; endedAt: string | null; error: string | null; result: string | null }
 export interface AuditDependencies {
   runner: Pick<K6Runner, 'version' | 'prepare' | 'profile'>;
@@ -27,13 +28,15 @@ export async function audit(options: AuditOptions, signal = new AbortController(
   const endpoints = options.endpoints ? validateAudit({ ...config.audit, endpoints: options.endpoints }).endpoints : config.audit.endpoints;
   if (endpoints.length > 1 && !options.confirmMultipleEndpoints) throw new CliError('Multiple endpoints require explicit load-test approval.', 'Review the selected GET endpoints and rerun interactively, or pass --yes to explicitly authorize this local endpoint set.', 2);
   resolveTargetHeaders(config.target.headers);
-  return withAuditLock(dirname(loaded.path), () => executeAudit({ ...config, audit: { ...config.audit!, endpoints } }, loaded.path, selected, signal, dependencies, options.infraDir));
+  return withAuditLock(dirname(loaded.path), () => executeAudit({ ...config, audit: { ...config.audit!, endpoints } }, loaded.path, selected, signal, dependencies, options.infraDir, options.resourceRuntime));
 }
-async function executeAudit(config: ProjectConfig, configPath: string, selected: ProfileName[], signal: AbortSignal, dependencies: AuditDependencies, infraDir?: string) {
+async function executeAudit(config: ProjectConfig, configPath: string, selected: ProfileName[], signal: AbortSignal, dependencies: AuditDependencies, infraDir?: string, resourceRuntime?: ResourceRuntime) {
   const auditConfig = config.audit!;
   const requestHeaders = resolveTargetHeaders(config.target.headers);
   const requestHeaderEnv = Object.keys(requestHeaders).map((name, index) => ({ name, envName: `PERFLENS_REQUEST_HEADER_${index}` }));
   const store = await RunStore.create(dirname(configPath));
+  const resourceCollector = new AuditResourceCollector(dirname(configPath), store.id, resourceRuntime);
+  await resourceCollector.prepare(store.directory);
   const profiles: ProfileState[] = selected.map(name => ({ name, status: 'created', startedAt: null, endedAt: null, error: null, result: null }));
   const run = {
     schemaVersion: 1, runId: store.id, status: 'created' as RunStatus, startedAt: new Date().toISOString(), endedAt: null as string | null,
@@ -56,6 +59,8 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
   await store.write('config.json', { schemaVersion: 1, ...config });
   await save();
   let currentPlan: Plan | undefined;
+  let resourceEvidence: ResourceEvidence | undefined;
+  let resourcesFinalized = false;
   try {
     run.status = 'preflight'; await save(); checkCancelled(signal);
     run.engine.version = await dependencies.runner.version(signal); checkCancelled(signal);
@@ -80,7 +85,10 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       };
       await save();
       dependencies.write(`Running ${profile.name}...`);
-      const execution = await dependencies.runner.profile(store.directory, currentPlan, signal, requestHeaders);
+      await resourceCollector.beginProfile(profile.name);
+      let execution;
+      try { execution = await dependencies.runner.profile(store.directory, currentPlan, signal, requestHeaders); }
+      finally { await resourceCollector.endProfile(); }
       profile.endedAt = new Date().toISOString();
       profile.status = signal.aborted || execution.cancelled ? 'cancelled' : execution.code !== 0 || execution.timedOut ? 'failed' : 'completed';
       await store.write(`raw/${profile.name}.execution.json`, { schemaVersion: 1, code: execution.code, signal: execution.signal, timedOut: execution.timedOut, cancelled: execution.cancelled });
@@ -100,6 +108,8 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
       currentPlan = undefined;
     }
     checkCancelled(signal);
+    resourceEvidence = await resourceCollector.finalize(store.directory);
+    resourcesFinalized = true;
     run.status = 'completed';
   } catch (error) {
     run.status = signal.aborted || (error instanceof CliError && error.exitCode === 130) ? 'cancelled' : 'failed';
@@ -117,9 +127,13 @@ async function executeAudit(config: ProjectConfig, configPath: string, selected:
     if (failed && !failed.error) failed.error = message;
     throw new CliError(`Audit ${run.status}. ${message}`, `Evidence: ${store.directory}`, run.status === 'cancelled' ? 130 : 1);
   } finally {
+    if (!resourcesFinalized) {
+      try { resourceEvidence = await resourceCollector.finalize(store.directory); }
+      catch { /* Preserve the audit's primary error; resource coverage is reported unavailable when no artifact exists. */ }
+    }
     run.endedAt = new Date().toISOString(); metadata.auditEndedAt = run.endedAt;
     await store.write('telemetry/metadata.json', metadata);
     await store.finalize(run);
   }
-  return { directory: store.directory, run };
+  return { directory: store.directory, run, resourceEvidence };
 }

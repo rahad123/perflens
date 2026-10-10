@@ -8,6 +8,7 @@ import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+export { startProcessResourceSampler } from './resources';
 
 export interface PerfLensCorrelation {
   runId?: string;

@@ -310,7 +310,7 @@ function statusDistributionInput() {
 test('HTTP status diagnostics preserve per-endpoint counts for each profile and explain 429 without creating findings', () => {
   const { input, existingFinding } = statusDistributionInput();
   const model = build(input);
-  assert.equal(model.reportVersion, 3);
+  assert.equal(model.reportVersion, 4);
   assert.equal(model.diagnosticEvidence.schemaVersion, 1);
   assert.equal(model.findings.length, 1);
   assert.deepEqual(model.findings[0].evidence, existingFinding.evidence);
@@ -335,7 +335,7 @@ test('HTTP status diagnostics preserve per-endpoint counts for each profile and 
   }
   assert.match(html, /29[\s\S]*?200 OK[\s\S]*?21[\s\S]*?429 Too Many Requests/);
   assert.match(renderHtml(model), /<h2>Diagnostic coverage<\/h2>/);
-  assert.match(renderHtml(model), /CPU utilization[\s\S]*?Not collected/);
+  assert.match(renderHtml(model), /Node process CPU[\s\S]*?Not collected/);
 });
 
 test('empty, unavailable, inconsistent, and legacy status distributions are distinguished without inventing zeroes', () => {
@@ -383,6 +383,148 @@ test('diagnostic rendering escapes endpoint text and reports evidence coverage w
   assert.match(html, /analysis\/evidence\.json/);
   assert.deepEqual(model.findings, before);
   assert.equal(input.findingsArtifact.findings[0].metrics.arbitrary, 'unchanged');
+});
+
+test('resource diagnostics summarize run/profile-scoped process and container samples and render portable charts', () => {
+  const input = fixture();
+  const normalProfile = input.profiles[0];
+  const baselineRunProfile = { ...normalProfile.runProfile, name: 'baseline', result: 'results/baseline.json' };
+  const baselineResult = structuredClone(normalProfile.result);
+  baselineResult.profile = 'baseline';
+  input.profiles.unshift({ runProfile: baselineRunProfile, result: baselineResult });
+  input.run.profiles.unshift(baselineRunProfile);
+  const makeProcess = (profile, timestamp, cpu, rss, pid = 101) => ({ schemaVersion: 1, runId, profile, timestamp, monotonicNs: String(Date.parse(timestamp) * 1e6), source: 'node-process', processId: pid, cpuUserMicros: 1000, cpuSystemMicros: 500, cpuPercentOneLogicalCpu: cpu, cpuNormalization: 'one-logical-cpu', rssBytes: rss, heapUsedBytes: rss / 2, heapTotalBytes: rss * .75, externalBytes: 1024 });
+  const makeContainer = (profile, timestamp, cpu, memory, limit = null) => ({ schemaVersion: 1, runId, profile, timestamp, source: 'docker-container', container: 'api-service', dockerReportedCpuPercent: cpu, cpuNormalization: 'docker-stats-reported', hostLogicalCpus: 8, cpuQuotaCores: 1, memoryUsedBytes: memory, memoryLimitBytes: limit });
+  input.resources = {
+    schemaVersion: 1, runId, samplingIntervalMs: 1000,
+    collection: { process: 'available', container: 'available', processNote: 'Process <script> evidence', containerNote: 'Container evidence' },
+    processSamples: [
+      makeProcess('baseline', '2026-10-10T12:00:00.000Z', 10, 100 * 1024 * 1024),
+      makeProcess('baseline', '2026-10-10T12:00:01.000Z', 20, 110 * 1024 * 1024),
+      makeProcess('normal', '2026-10-10T12:00:02.000Z', 30, 120 * 1024 * 1024),
+      makeProcess('normal', '2026-10-10T12:00:03.000Z', 40, 140 * 1024 * 1024, 202),
+    ],
+    containerSamples: [
+      makeContainer('baseline', '2026-10-10T12:00:00.000Z', 5, 200 * 1024 * 1024, 512 * 1024 * 1024),
+      makeContainer('baseline', '2026-10-10T12:00:01.000Z', 7, 220 * 1024 * 1024, 512 * 1024 * 1024),
+      makeContainer('normal', '2026-10-10T12:00:02.000Z', 10, 300 * 1024 * 1024, 512 * 1024 * 1024),
+      makeContainer('normal', '2026-10-10T12:00:03.000Z', 15, 400 * 1024 * 1024, 512 * 1024 * 1024),
+    ],
+  };
+  const model = build(input), html = renderHtml(model), markdown = renderMarkdown(model);
+  assert.equal(model.resourceDiagnostics.schemaVersion, 1);
+  assert.equal(model.resourceDiagnostics.processState, 'available');
+  assert.equal(model.resourceDiagnostics.containerState, 'available');
+  const normal = model.resourceDiagnostics.profiles.find(item => item.profile === 'normal');
+  assert.equal(normal.process.cpuAveragePercent, 35);
+  assert.equal(normal.process.rssPeakBytes, 140 * 1024 * 1024);
+  assert.equal(normal.process.processInstances, 2);
+  assert.equal(normal.container.memoryPeakBytes, 400 * 1024 * 1024);
+  assert.equal(normal.container.memoryAverageBytes, 350 * 1024 * 1024);
+  assert.equal(normal.container.memoryLimitBytes, 512 * 1024 * 1024);
+  assert.equal(normal.container.memoryPeakPercentOfLimit, 78.125);
+  for (const profile of ['baseline', 'normal']) assert.match(html, new RegExp(`>${profile}<`));
+  assert.match(html, /CPU &amp; memory diagnostics/);
+  assert.match(html, /Node process CPU/);
+  assert.match(html, /Docker container memory/);
+  assert.match(html, /one logical CPU/);
+  assert.match(html, /Docker CPU is the value reported by Docker on its host logical CPU basis/);
+  assert.match(html, /Measured resource summaries by profile/);
+  assert.match(html, /78\.13%/);
+  assert.match(html, /Container memory avg/);
+  assert.match(html, /External memory peak/);
+  assert.match(html, /<polyline/);
+  assert.match(html, /UTC 12:00:00/);
+  assert.match(html, /Distinct PIDs or process-lifetime IDs are observed identities/);
+  assert.match(html, /not summed service totals/);
+  assert.match(html, /RSS window change is only available when evidence establishes one continuous process instance/);
+  assert.match(html, /Process &lt;script&gt; evidence/);
+  assert.doesNotMatch(html, /<script> evidence/);
+  assert.match(markdown, /CPU & memory diagnostics/);
+  assert.match(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process CPU').state, /available/);
+});
+
+test('resource summaries preserve process-lifetime identity, avoid cross-process growth, and label sample aggregation', () => {
+  const input = fixture();
+  const profile = input.profiles[0];
+  const baselineRunProfile = { ...profile.runProfile, name: 'baseline', result: 'results/baseline.json' };
+  const baselineResult = structuredClone(profile.result); baselineResult.profile = 'baseline';
+  input.profiles.unshift({ runProfile: baselineRunProfile, result: baselineResult });
+  input.run.profiles.unshift(baselineRunProfile);
+  const makeProcess = (name, pid, profileName, second, cpu, rss) => ({
+    schemaVersion: 1, runId, profile: profileName, timestamp: `2026-10-10T12:00:0${second}.000Z`, monotonicNs: String(second * 1e9),
+    source: 'node-process', processId: pid, processInstanceId: name, cpuUserMicros: 100, cpuSystemMicros: 100,
+    cpuPercentOneLogicalCpu: cpu, cpuNormalization: 'one-logical-cpu', rssBytes: rss, heapUsedBytes: rss / 2, heapTotalBytes: rss, externalBytes: 0,
+  });
+  input.resources = {
+    schemaVersion: 1, runId, samplingIntervalMs: 1000,
+    collection: { process: 'available', container: 'not-collected', processNote: 'samples', containerNote: 'not collected' },
+    processSamples: [
+      makeProcess('worker-a', 1, 'baseline', 0, 10, 100), makeProcess('worker-a', 1, 'baseline', 1, 20, 150),
+      makeProcess('worker-b', 2, 'baseline', 2, 20, 200), makeProcess('worker-b', 2, 'baseline', 3, 30, 250),
+      makeProcess('worker-c', 3, 'baseline', 4, 30, 300), makeProcess('worker-c', 3, 'baseline', 5, 40, 350),
+      // PID 1 is reused after a process restart; instance identity must keep the windows separate.
+      makeProcess('restarted-pid-1', 1, 'normal', 6, 40, 400), makeProcess('restarted-pid-1', 1, 'normal', 7, 50, 600),
+      makeProcess('reused-pid-1', 1, 'normal', 8, 60, 800), makeProcess('reused-pid-1', 1, 'normal', 9, 70, 1000),
+      { ...makeProcess('wrong-run', 99, 'baseline', 10, 999, 999), runId: 'pfl_20261010T120000000Z_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      makeProcess('wrong-profile', 100, 'stress', 11, 999, 999),
+    ],
+    containerSamples: [],
+  };
+  const model = build(input), html = renderHtml(model);
+  const baseline = model.resourceDiagnostics.profiles.find(item => item.profile === 'baseline');
+  const normal = model.resourceDiagnostics.profiles.find(item => item.profile === 'normal');
+  assert.equal(baseline.process.processInstances, 3);
+  assert.equal(baseline.process.cpuAveragePercent, 25);
+  assert.equal(baseline.process.cpuPeakPercent, 40);
+  assert.equal(baseline.process.rssAverageBytes, 225);
+  assert.equal(baseline.process.rssPeakBytes, 350);
+  assert.equal(baseline.process.rssGrowthBytes, null);
+  assert.equal(normal.process.processInstances, 2);
+  assert.equal(normal.process.rssAverageBytes, 700);
+  assert.equal(normal.process.rssPeakBytes, 1000);
+  assert.equal(normal.process.rssGrowthBytes, null, 'PID reuse must not be treated as process continuity');
+  assert.match(html, />3<\/td>/);
+  assert.match(html, /Unavailable \(2 process identities\)/);
+  assert.match(html, /not summed service totals/);
+  assert.match(html, /may represent workers or restarts/);
+  assert.match(html, /RSS window change is only available when evidence establishes one continuous process instance/);
+  assert.match(html, /process 1 \(PID 1\)/);
+  assert.match(html, /process 2 \(PID 2\)/);
+  assert.match(html, /process 3 \(PID 3\)/);
+  assert.equal((html.match(/<polyline /g) ?? []).length, 15, 'each of five process lifetimes has separate CPU, RSS, and heap lines');
+  assert.match(html, /viewBox="0 0 900 /);
+  assert.match(html, /class="chart-legend"/);
+  assert.match(html, /resource-chart \.svg-wrap\{width:100%;min-width:0;overflow-x:auto/);
+  assert.match(html, /chart-legend li\{display:flex;align-items:flex-start;gap:7px;min-width:0;overflow-wrap:anywhere/);
+  for (const [, points] of html.matchAll(/<polyline[^>]*points="([^"]+)"/g)) {
+    for (const point of points.split(' ')) {
+      const [x, y] = point.split(',').map(Number);
+      assert.ok(x >= 54 && x <= 874 && y >= 18 && y <= 208, `SVG point ${point} remains inside the plot area`);
+    }
+  }
+});
+
+test('old runs without resources remain readable and resource coverage is not represented as zero', () => {
+  const model = build(fixture());
+  assert.equal(model.reportVersion, 4);
+  assert.equal(model.resourceDiagnostics.state, 'not-collected');
+  assert.equal(model.resourceDiagnostics.processState, 'not-collected');
+  assert.equal(model.resourceDiagnostics.containerState, 'not-collected');
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process memory / heap').observations, null);
+  assert.match(renderHtml(model), /Process coverage: Not collected/);
+  assert.match(renderHtml(model), /not enough valid time samples to draw a chart/);
+  assert.doesNotMatch(renderHtml(model), /RSS peak[^<]*0\.0 MiB/);
+});
+
+test('one process sample reports memory observations but insufficient CPU evidence', () => {
+  const input = fixture();
+  input.resources = { schemaVersion: 1, runId, samplingIntervalMs: 1000, collection: { process: 'available', container: 'not-collected', processNote: 'one sample', containerNote: 'not collected' }, processSamples: [{ schemaVersion: 1, runId, profile: 'normal', timestamp: '2026-10-10T12:00:00.000Z', monotonicNs: '1', source: 'node-process', processId: 7, cpuUserMicros: 0, cpuSystemMicros: 0, cpuPercentOneLogicalCpu: null, cpuNormalization: 'one-logical-cpu', rssBytes: 80 * 1024 * 1024, heapUsedBytes: 30 * 1024 * 1024, heapTotalBytes: 60 * 1024 * 1024, externalBytes: 1 }], containerSamples: [] };
+  const model = build(input);
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process CPU').state, 'insufficient-evidence');
+  assert.equal(model.diagnosticEvidence.coverage.find(item => item.diagnostic === 'Node process memory / heap').state, 'available');
+  assert.equal(model.resourceDiagnostics.profiles[0].process.rssPeakBytes, 80 * 1024 * 1024);
+  assert.equal(model.resourceDiagnostics.profiles[0].process.cpuAveragePercent, null);
 });
 
 test('HTML comparison visualizations use only measured percentiles and conditionally show component evidence', () => {
@@ -445,7 +587,7 @@ test('Markdown evidence cannot inject table rows, headings, raw HTML, or links',
   const markdown = renderMarkdown(model);
   assert.ok(markdown.includes('cell \\| injected \\| fake \\| row \\# heading \\<script\\>alert(1)\\</script\\> \\[click\\](javascript:alert(1))'));
   assert.equal((markdown.match(/^\| fake \| row$/gm) ?? []).length, 0);
-  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 2);
+  assert.equal((markdown.match(/^\| Profile \|/gm) ?? []).length, 3);
   assert.ok(!markdown.includes('<script>alert(1)</script>'));
 });
 

@@ -176,7 +176,7 @@ test('init keeps successful onboarding product-facing and points to automatic au
 });
 test('installed infrastructure assets are package-relative, project-local, secret-free, and target the configured local metrics port', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'perflens-assets-')); t.after(() => rm(dir, { recursive: true, force: true }));
-  const root = await installInfrastructureAssets(dir, 'http://localhost:4567');
+  const root = await installInfrastructureAssets(dir, 'http://localhost:4567', async () => true);
   assert.equal(root, join(dir, '.perflens', 'infra'));
   const composeText = await readFile(join(root, 'docker-compose.yml'), 'utf8');
   assert.match(composeText, /name: perflens-[a-f0-9]{10}/);
@@ -186,7 +186,7 @@ test('installed infrastructure assets are package-relative, project-local, secre
   assert.ok(!prometheus.includes('__PERFLENS_'));
   assert.match(await readFile(join(root, 'grafana/dashboards/perflens-performance.json'), 'utf8'), /histogram_quantile/);
   assert.doesNotMatch(await readFile(join(root, '.env'), 'utf8'), /PASSWORD|TOKEN|SECRET/i);
-  await installInfrastructureAssets(dir, 'http://localhost:4568');
+  await installInfrastructureAssets(dir, 'http://localhost:4568', async () => true);
   assert.match(await readFile(join(root, 'prometheus.yml'), 'utf8'), /host\.docker\.internal:4568/);
   assert.equal(await infrastructureRoot(root), root);
 });

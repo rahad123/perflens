@@ -12,6 +12,10 @@ async function readJson(file: string, label: string): Promise<any> {
   try { return JSON.parse(await readFile(file, 'utf8')); }
   catch (error) { throw new CliError(`Could not read ${label}.`, error instanceof SyntaxError ? 'The artifact is malformed; preserve the run for review.' : 'Verify that the selected completed audit run contains the required artifacts.'); }
 }
+async function readOptionalJson(file: string): Promise<any | undefined> {
+  try { return JSON.parse(await readFile(file, 'utf8')); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw new CliError('Could not read optional resource evidence.', 'The resource artifact is malformed; preserve the run for review.'); }
+}
 async function latestEligible(projectDirectory: string): Promise<string> {
   const root = join(projectDirectory, '.perflens', 'runs');
   let entries;
@@ -61,7 +65,8 @@ export async function loadReportModel(projectDirectory: string, id: string, gene
     if (error instanceof CliError) throw new CliError(`Analysis artifacts are incomplete for run ${id}.`, `Run "perflens analyze ${id}" first.`);
     throw error;
   }
-  try { return buildReportModel({ run, profiles, analysis, findingsArtifact: findings, evidence, generatedAt, perflensVersion }); }
+  const resources = await readOptionalJson(join(directory, 'resources/evidence.json'));
+  try { return buildReportModel({ run, profiles, analysis, findingsArtifact: findings, evidence, resources, generatedAt, perflensVersion }); }
   catch (error) { throw new CliError(`Cannot build a valid report for run ${id}.`, error instanceof Error ? error.message : 'Check the persisted run and analysis schemas.'); }
 }
 export async function report(options: ReportOptions, requestedId?: string, write: (line: string) => void = console.log): Promise<ReportModel> {

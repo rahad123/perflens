@@ -9,6 +9,7 @@ import { infrastructureRoot, otlpTracesEndpoint } from '../services/workspace';
 import { CliError } from '../utils/errors';
 import { audit, AuditOptions } from './service';
 import { activateComposeInstrumentation, ApplicationReadinessError, RuntimeActivationResult } from '../services/runtime-instrumentation';
+import { ResourceRuntime, summarizeResourceProfiles } from './resources';
 
 function stageError(stage: string, error: unknown): CliError {
   const detail = error instanceof Error ? error.message : String(error);
@@ -37,6 +38,10 @@ function completedLoadStageError(stage: string, error: unknown, next: 'analysis'
 function display(value: unknown, digits = 2): string {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : 'unavailable';
 }
+function mib(value: number | null): string { return value === null ? 'unavailable' : `${(value / (1024 * 1024)).toFixed(1)} MiB`; }
+function mibDelta(value: number | null): string { return value === null ? 'unavailable' : `${value >= 0 ? '+' : ''}${(value / (1024 * 1024)).toFixed(1)} MiB`; }
+function memoryLimitPercent(value: number | null): string { return value === null ? 'limit utilization unavailable' : `${display(value)}% of limit`; }
+function cpuDisplay(average: number | null, peak: number | null, count: number): string { return average === null || peak === null ? `insufficient samples (${count})` : `${display(average)}% / ${display(peak)}%`; }
 export interface CompleteAuditDependencies {
   infrastructureRoot(projectDirectory: string, baseUrl: string): Promise<string>;
   assertLocalDocker(): Promise<void>;
@@ -73,6 +78,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   write(`PerfLens Performance Audit\nProject   ${project.config.project.name}\nTarget    ${project.config.target.baseUrl}\nEndpoints ${selectedEndpoints.length} selected GET route${selectedEndpoints.length === 1 ? '' : 's'}`);
   write('✓ Configuration valid');
   let otlpEndpoint = '';
+  let resourceRuntime: ResourceRuntime | undefined;
   try {
     await dependencies.assertLocalDocker();
     let states: Awaited<ReturnType<Infrastructure['status']>>;
@@ -97,6 +103,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
         approveRestart: options.approveApplicationRestart ?? (async () => false),
         selectService: options.selectApplicationService, write,
       });
+      resourceRuntime = activation.resourceRuntime;
       if (activation.mode === 'docker') write(`✓ PerfLens instrumentation active${activation.service ? ` for ${activation.service}` : ''}`);
     } catch (error) { throw preLoadStageError(error instanceof ApplicationReadinessError ? 'Application readiness' : 'Instrumentation activation', error); }
   }
@@ -109,7 +116,7 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   }
 
   let executed;
-  try { executed = await dependencies.audit({ ...options, endpoints: selectedEndpoints }, signal); }
+  try { executed = await dependencies.audit({ ...options, endpoints: selectedEndpoints, resourceRuntime }, signal); }
   catch (error) { throw auditStageError(error); }
 
   let analysis;
@@ -155,6 +162,30 @@ export async function runCompleteAudit(options: AuditOptions, signal: AbortSigna
   write(`  Request traces    ${analysis.traceSummary.requests}`);
   write(`  PostgreSQL spans  ${analysis.traceSummary.databaseSpans}`);
   write(`  External HTTP     ${analysis.traceSummary.externalClientSpans}`);
+  write('\nRESOURCES');
+  const resourceEvidence = executed.resourceEvidence;
+  if (!resourceEvidence) {
+    write('  Process metrics   Unavailable');
+    write('  Container metrics Unavailable');
+  } else {
+    write(`  Process metrics   ${resourceEvidence.collection.process}`);
+    write(`  Container metrics ${resourceEvidence.collection.container}`);
+    write('  Node averages are means of process samples; peaks are single-process maxima, not summed service totals.');
+    write('  Distinct PIDs or process-lifetime IDs are observed identities; they may represent workers or restarts, but their roles cannot be inferred from these samples.');
+    for (const summary of summarizeResourceProfiles(resourceEvidence)) {
+      if (summary.processSampleCount) {
+        const identityLabel = summary.processInstances === 1 ? 'process identity' : 'process identities';
+        const growth = summary.rssGrowthBytes !== null ? ` · RSS window change ${mibDelta(summary.rssGrowthBytes)}` : summary.processSampleCount < 2 ? '' : summary.processInstances > 1 ? ' · RSS window change unavailable (multiple process identities)' : ' · RSS window change unavailable (process continuity not established)';
+        write(`  Node ${summary.profile.padEnd(8)} ${summary.processInstances} ${identityLabel} · CPU sample avg/peak ${cpuDisplay(summary.processCpuAveragePercent, summary.processCpuPeakPercent, summary.processSampleCount)} (one logical CPU) · RSS sample avg/per-process peak ${mib(summary.rssAverageBytes)} / ${mib(summary.rssPeakBytes)} · heap used peak ${mib(summary.heapUsedPeakBytes)} · external peak ${mib(summary.externalPeakBytes)}${growth}`);
+      }
+      if (summary.containerSampleCount) {
+        const limit = summary.containerMemoryLimitBytes === null ? 'limit unavailable' : `limit ${mib(summary.containerMemoryLimitBytes)}`;
+        write(`  Docker ${summary.profile.padEnd(7)} CPU avg/peak ${cpuDisplay(summary.containerCpuAveragePercent, summary.containerCpuPeakPercent, summary.containerSampleCount)} (Docker stats basis) · memory avg/peak ${mib(summary.containerMemoryAverageBytes)} / ${mib(summary.containerMemoryPeakBytes)} · ${limit} · ${memoryLimitPercent(summary.containerMemoryPeakPercentOfLimit)}`);
+      }
+    }
+    if (resourceEvidence.collection.process !== 'available') write(`  Process note      ${resourceEvidence.collection.processNote}`);
+    if (resourceEvidence.collection.container !== 'available') write(`  Container note    ${resourceEvidence.collection.containerNote}`);
+  }
   write('\nFINDINGS');
   if (!analysis.findings.length) write(failedAssessment ? '  No root cause is inferred from failed requests alone.' : '  No evidence-backed bottlenecks met the configured thresholds.');
   for (const finding of analysis.findings) {

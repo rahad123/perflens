@@ -28,7 +28,7 @@ export interface RuntimeActivationOptions {
   now?: () => number;
   wait?: (milliseconds: number) => Promise<void>;
 }
-export interface RuntimeActivationResult { mode: 'host' | 'docker'; service?: string; restarted: boolean; endpoint: string }
+export interface RuntimeActivationResult { mode: 'host' | 'docker'; service?: string; restarted: boolean; endpoint: string; resourceRuntime?: { directory: string; container?: string } }
 
 export class ApplicationReadinessError extends CliError {}
 
@@ -194,7 +194,7 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
   const containerEndpoint = await otlpTracesEndpoint(join(cwd, '.perflens', 'infra'), 'container');
   const hostPort = Number(new URL(containerEndpoint).port);
   const files = await findComposeFiles(cwd);
-  if (!files) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')) };
+  if (!files) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')), resourceRuntime: { directory: join(cwd, '.perflens', 'runtime', 'resources') } };
   const args = ['compose', ...(files.flatMap(file => ['-f', file])), '--project-directory', cwd];
   const config = parseJson(await run([...args, 'config', '--format', 'json'], { cwd }), 'Compose project') as Compose;
   if (!config.name || !config.services || typeof config.services !== 'object') throw new CliError('Consumer Compose project identity is unavailable.', 'Set a valid project name in the consumer Compose configuration. PerfLens will not select services by name alone.');
@@ -210,13 +210,13 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
   // No Compose service publishes this port: the target is host-run (or managed
   // by another runtime). Leave it untouched; telemetry preflight will accept
   // an already-instrumented process and otherwise provide the host preload path.
-  if (!candidates.length) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')) };
+  if (!candidates.length) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')), resourceRuntime: { directory: join(cwd, '.perflens', 'runtime', 'resources') } };
   let serviceName = candidates[0];
   if (candidates.length > 1) {
     serviceName = await options.selectService?.(candidates) ?? '';
     if (!candidates.includes(serviceName)) throw new CliError('More than one running Node service could serve the configured target.', `Candidates: ${candidates.join(', ')}. Select the backend service for the configured target; no service was restarted.`);
   }
-  if (!serviceName) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')) };
+  if (!serviceName) return { mode: 'host', restarted: false, endpoint: await otlpTracesEndpoint(join(cwd, '.perflens', 'infra')), resourceRuntime: { directory: join(cwd, '.perflens', 'runtime', 'resources') } };
   const service = config.services[serviceName];
   const serviceIdRaw = await run([...args, 'ps', '-q', serviceName], { cwd });
   const containerId = serviceIdRaw.trim().split(/\r?\n/)[0];
@@ -237,14 +237,16 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
     throw new CliError(`PerfLens will not restart ${serviceName} because its runtime environment is marked production or staging.`, 'Use a clearly local development Compose project. PerfLens did not modify or restart the service.');
   }
   const endpoint = containerEndpoint;
+  const resourceDirectory = join(cwd, '.perflens', 'runtime', 'resources');
   // Reuse only when the current package bundle, dynamic exporter endpoint,
   // service identity, and mounted preload are all present in the running app.
   const nodeOptions = actual.get('NODE_OPTIONS') ?? environmentValue(service, 'NODE_OPTIONS') ?? '';
   const active = actual.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT') === endpoint
     && actual.get('OTEL_SERVICE_NAME') === options.serviceName
     && nodeOptions.includes(CONTAINER_PRELOAD)
+    && actual.get('PERFLENS_RESOURCE_DIRECTORY') === '/tmp/perflens-resource'
     && actual.get('PERFLENS_RUNTIME_BUNDLE_SHA256') === runtimeHash;
-  if (active) return { mode: 'docker', service: serviceName, restarted: false, endpoint };
+  if (active) return { mode: 'docker', service: serviceName, restarted: false, endpoint, resourceRuntime: { directory: resourceDirectory, container: containerId } };
   const currentExporterEndpoint = actual.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT') ?? environmentValue(service, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT');
   if (currentExporterEndpoint && !isSupportedLocalTraceEndpoint(currentExporterEndpoint)) {
     throw new CliError(`The ${serviceName} service has an explicit non-local OTLP traces endpoint.`, 'PerfLens will not replace an external telemetry destination. Configure the consumer to use the project-local PerfLens Collector endpoint, then rerun audit.');
@@ -257,6 +259,7 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
     NODE_OPTIONS: desiredNodeOptions,
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: endpoint,
     OTEL_SERVICE_NAME: options.serviceName,
+    PERFLENS_RESOURCE_DIRECTORY: '/tmp/perflens-resource',
     PERFLENS_RUNTIME_BUNDLE_SHA256: runtimeHash,
   };
   const yamlText = `services:\n  ${JSON.stringify(serviceName)}:\n    environment:\n${Object.entries(environment).map(([key, value]) => `      ${key}: ${yaml(value)}\n`).join('')}    volumes:\n      - type: bind\n        source: ${yaml(runtimeAsset)}\n        target: ${CONTAINER_PRELOAD}\n        read_only: true\n`;
@@ -265,6 +268,7 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
   if (!await options.approveRestart(serviceName)) throw new CliError(`Instrumentation activation requires restarting ${serviceName}.`, `Rerun interactively and approve restarting only this local service. No other Compose service was changed.`);
   const activationArgs = [...args, '-f', override, '--project-name', config.name, 'up', '-d', '--no-deps', '--force-recreate', serviceName];
   await run(activationArgs, { cwd, stream: true, timeout: 600000 });
+  const activeContainerId = (await run([...args, 'ps', '-q', serviceName], { cwd })).trim().split(/\r?\n/)[0];
   const target = new URL(options.probePath ?? '/', options.baseUrl).toString();
   const probe = options.probeTarget ?? (async (url: string, timeoutMs = 1500) => {
     try {
@@ -289,5 +293,5 @@ export async function activateComposeInstrumentation(options: RuntimeActivationO
     wait: options.wait,
   });
   write('✓ Application ready');
-  return { mode: 'docker', service: serviceName, restarted: true, endpoint };
+  return { mode: 'docker', service: serviceName, restarted: true, endpoint, resourceRuntime: { directory: resourceDirectory, ...(activeContainerId ? { container: activeContainerId } : {}) } };
 }

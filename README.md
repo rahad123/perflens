@@ -27,7 +27,9 @@ The reference apps are integrations/test targets, not the PerfLens product or an
 
 Phase 3 analysis currently supports measured latency, error-rate, and throughput changes across comparable profiles, database time contribution, repeated database operation patterns, recurring slow database operations, and recurring external HTTP latency. Profile comparison uses VUs only for the supported constant-VU model when endpoint, pacing, timeout, and test semantics match; otherwise it skips the comparison. Repeated-query detection is separate from impact severity, and dependency contribution is aggregated per request. Phase 4 formats saved findings as Markdown and HTML; it performs no new diagnosis or recommendations. See [analysis methodology](docs/analysis-methodology.md) and [reporting](docs/reporting.md).
 
-Reports also show measured HTTP status distributions by endpoint/profile and distinguish unavailable or uncollected evidence from zero observations. Prometheus scrapes supported target `/metrics` endpoints and powers the local dashboard, but these time series are not persisted as per-run snapshots; CPU, memory, container, Redis, and pool diagnostics are not claimed without saved evidence. See the [Phase 7.1 capability audit and roadmap](docs/diagnostics-capability-audit.md).
+Reports also show measured HTTP status distributions by endpoint/profile and distinguish unavailable or uncollected evidence from zero observations. Prometheus scrapes supported target `/metrics` endpoints and powers the local dashboard, but these time series are not persisted as per-run snapshots. See the [diagnostic capability audit and roadmap](docs/diagnostics-capability-audit.md).
+
+For supported Node.js applications using the PerfLens preload, Phase 7.2 also records process CPU and memory samples per run/profile; Docker Compose audits separately sample the selected application container when Docker stats are available. Reports label CPU normalization and unavailable coverage explicitly. These measurements are descriptive and do not by themselves diagnose saturation. See [CPU and memory diagnostics](docs/resource-diagnostics.md).
 
 ## Intended workflow
 
@@ -170,7 +172,7 @@ Findings include stable rule IDs, category, target/profile, severity (`P0`/`P1`/
 - PostgreSQL contribution uses the union of child-span time intervals clipped to the request span, so overlapping spans are not double counted.
 - A repeated-query pattern can remain a P2 candidate when the measured database time contribution is small; repetition alone does not establish a major latency impact. External dependency severity uses per-request interval contribution rather than call-weighted durations.
 - Similar query detection uses conservative literal-free SQL normalization. Without a safe query shape, it will not infer repetition from generic `SELECT` labels.
-- CPU, memory, connection-pool saturation, index recommendations, and root-cause scoring are unsupported.
+- CPU and memory samples are descriptive; resource-pressure findings, connection-pool saturation analysis, index recommendations, and root-cause scoring are unsupported.
 
 Severity thresholds are explicit local defaults, not universal SLOs. A result is an evidence-backed candidate for engineering review, not a guarantee about production behavior.
 
